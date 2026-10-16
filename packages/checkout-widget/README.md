@@ -44,6 +44,12 @@ VITE_STELLAR_NETWORK_PASSPHRASE=Test SDF Network ; September 2015
 | `tokenContractId` | `VITE_USDC_CONTRACT_ID` | USDC SAC address. |
 | `rpcUrl` | Stellar testnet RPC | Soroban JSON-RPC endpoint. |
 | `networkPassphrase` | Stellar testnet | Network used for signing. |
+| `theme` | `auto` | `dark`, `light`, or `auto`. |
+| `accentColor` | `#6366f1` | Hex color for buttons and active states. |
+| `borderRadius` | `md` | `none`, `sm`, `md`, `lg`, or `full`. |
+| `fontFamily` | `inherit` | CSS font family or font stack. |
+| `customClasses` | `{}` | Optional `{ modal, header, button }` class names. |
+| `allowedOrigins` | `[]` | Trusted parent origins for lifecycle `postMessage` events. Empty permits same-origin parent only. |
 
 ```jsx
 <OrbitCheckout
@@ -54,3 +60,23 @@ VITE_STELLAR_NETWORK_PASSPHRASE=Test SDF Network ; September 2015
 ```
 
 The allowance covers 12 billing cycles and expires after those cycles plus a ledger safety margin. If either wallet transaction fails or is rejected, `POST /subscriptions` is not called and the error remains visible in the widget.
+
+Before signatures, the widget simulates the USDC `approve` and Orbit `create_vault` transactions, reads USDC/XLM balances, and displays estimated fees. In-flight hashes are backed up in local storage and can be checked again after a refresh or a long network delay.
+
+## Lifecycle events
+
+Events are sent to the embedding parent with `window.postMessage`. Set explicit `allowedOrigins` values for cross-origin embeds.
+
+| Event | Payload |
+|---|---|
+| `orbit:ready` | `{ type, planId }` |
+| `orbit:wallet_connected` | `{ type, address }` |
+| `orbit:subscribed` | `{ type, subscriptionId, planId, txHash }` |
+| `orbit:error` | `{ type, message }` |
+| `orbit:close` | `{ type }` |
+
+```js
+window.addEventListener('message', ({ data, origin }) => {
+  if (data.type === 'orbit:subscribed') provisionCustomer(data.planId, data.txHash, origin);
+});
+```
