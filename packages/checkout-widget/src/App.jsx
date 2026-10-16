@@ -28,6 +28,9 @@ const PRESET_PLANS = [
 function App() {
   const [selectedPlanIndex, setSelectedPlanIndex] = useState(0);
   const [showWidget, setShowWidget] = useState(true);
+  const [theme, setTheme] = useState('dark');
+  const [accentColor, setAccentColor] = useState('#6366f1');
+  const [borderRadius, setBorderRadius] = useState('md');
 
   const activePlan = PRESET_PLANS[selectedPlanIndex];
 
@@ -112,6 +115,11 @@ function App() {
       </div>
 
       {/* Embedded Widget */}
+      <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '16px', color: '#a1a1aa', fontSize: '12px' }}>
+        <label>Theme <select value={theme} onChange={(event) => setTheme(event.target.value)}><option value="dark">Dark</option><option value="light">Light</option><option value="auto">Auto</option></select></label>
+        <label>Accent <input type="color" value={accentColor} onChange={(event) => setAccentColor(event.target.value)} /></label>
+        <label>Radius <select value={borderRadius} onChange={(event) => setBorderRadius(event.target.value)}><option value="none">None</option><option value="sm">Small</option><option value="md">Medium</option><option value="lg">Large</option><option value="full">Full</option></select></label>
+      </div>
       {showWidget && (
         <div style={{
           padding: '8px',
@@ -119,7 +127,7 @@ function App() {
           background: 'linear-gradient(180deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.02) 100%)',
           boxShadow: '0 20px 50px rgba(0,0,0,0.6)'
         }}>
-          <OrbitCheckout planId={activePlan.id} planData={activePlan} />
+          <OrbitCheckout planId={activePlan.id} planData={activePlan} demo theme={theme} accentColor={accentColor} borderRadius={borderRadius} allowedOrigins={[window.location.origin]} />
         </div>
       )}
 
