@@ -45,10 +45,49 @@ describe('Database Schema & Row Level Security (RLS) Policies', () => {
     expect(table).toMatch(/UNIQUE\s*\(\s*merchant_id\s*,\s*key\s*\)/i);
   });
 
-  it('keeps idempotency and lock tables private to the backend', () => {
+  it('defines subscriptions table with dunning schedule columns', () => {
+    const table = schemaSql.match(/CREATE\s+TABLE\s+subscriptions\s*\(([\s\S]*?)\n\);/i)?.[1];
+    expect(table).toBeDefined();
+    expect(table).toMatch(/retry_count\s+INTEGER\s+NOT\s+NULL\s+DEFAULT\s+0/i);
+    expect(table).toMatch(/next_dunning_retry_at\s+TIMESTAMP\s+WITH\s+TIME\s+ZONE/i);
+    expect(table).toMatch(/dunning_status\s+VARCHAR\(50\)/i);
+  });
+
+  it('defines audit_logs table for financial mutations and administrative actions', () => {
+    const table = schemaSql.match(/CREATE\s+TABLE\s+audit_logs\s*\(([\s\S]*?)\n\);/i)?.[1];
+    expect(table).toBeDefined();
+    expect(table).toMatch(/merchant_id\s+UUID\s+REFERENCES\s+merchants\(id\)\s+ON\s+DELETE\s+CASCADE/i);
+    expect(table).toMatch(/actor_address\s+VARCHAR\(255\)/i);
+    expect(table).toMatch(/action\s+VARCHAR\(100\)\s+NOT\s+NULL/i);
+    expect(table).toMatch(/resource_type\s+VARCHAR\(100\)\s+NOT\s+NULL/i);
+    expect(table).toMatch(/resource_id\s+VARCHAR\(255\)/i);
+    expect(table).toMatch(/ip_address\s+VARCHAR\(100\)/i);
+    expect(table).toMatch(/changes_before\s+JSONB/i);
+    expect(table).toMatch(/changes_after\s+JSONB/i);
+  });
+
+  it('defines webhooks and webhook_deliveries tables', () => {
+    const webhooksTable = schemaSql.match(/CREATE\s+TABLE\s+webhooks\s*\(([\s\S]*?)\n\);/i)?.[1];
+    expect(webhooksTable).toBeDefined();
+    expect(webhooksTable).toMatch(/url\s+TEXT\s+NOT\s+NULL/i);
+    expect(webhooksTable).toMatch(/signing_secret\s+VARCHAR\(255\)\s+NOT\s+NULL/i);
+    expect(webhooksTable).toMatch(/events\s+JSONB\s+NOT\s+NULL/i);
+
+    const deliveriesTable = schemaSql.match(/CREATE\s+TABLE\s+webhook_deliveries\s*\(([\s\S]*?)\n\);/i)?.[1];
+    expect(deliveriesTable).toBeDefined();
+    expect(deliveriesTable).toMatch(/event_type\s+VARCHAR\(100\)\s+NOT\s+NULL/i);
+    expect(deliveriesTable).toMatch(/payload\s+JSONB\s+NOT\s+NULL/i);
+    expect(deliveriesTable).toMatch(/response_status\s+INTEGER/i);
+    expect(deliveriesTable).toMatch(/attempt_count\s+INTEGER/i);
+  });
+
+  it('keeps idempotency, lock, audit, and webhook tables private to the backend', () => {
     expect(schemaSql).toMatch(/ALTER\s+TABLE\s+idempotency_keys\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
     expect(schemaSql).toMatch(/ALTER\s+TABLE\s+billing_locks\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
-    expect(schemaSql).not.toMatch(/CREATE\s+POLICY\s+.*ON\s+(idempotency_keys|billing_locks)\b/i);
+    expect(schemaSql).toMatch(/ALTER\s+TABLE\s+audit_logs\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
+    expect(schemaSql).toMatch(/ALTER\s+TABLE\s+webhooks\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
+    expect(schemaSql).toMatch(/ALTER\s+TABLE\s+webhook_deliveries\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
+    expect(schemaSql).not.toMatch(/CREATE\s+POLICY\s+.*ON\s+(idempotency_keys|billing_locks|audit_logs|webhooks|webhook_deliveries)\b/i);
     for (const fn of ['claim_idempotency_key', 'acquire_billing_lock', 'release_billing_lock']) {
       expect(schemaSql).toMatch(new RegExp(`REVOKE\\s+EXECUTE\\s+ON\\s+FUNCTION\\s+${fn}\\(`, 'i'));
     }
