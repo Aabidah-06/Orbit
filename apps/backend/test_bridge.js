@@ -12,8 +12,6 @@ async function testBridge() {
     try {
         // 1. Get Alice's public key from the Stellar CLI
         const aliceAddress = execSync('stellar keys address alice').toString().trim();
-        const aliceSecret = execSync('stellar keys show alice').toString().trim();
-
         console.log(`\nFound Alice: ${aliceAddress}`);
         
         // Let's create a brand new customer (Dave) so the smart contract doesn't block us for double-billing
@@ -70,22 +68,20 @@ async function testBridge() {
 
         console.log(`Created Subscription ID: ${sub.id}`);
 
-        // 5. Trigger the Pull via the Express API (Simulating Cron/Manual Trigger)
-        console.log("\nHitting POST /trigger-pull API to execute smart contract...");
+        // 5. Prepare the pull. Sign pullData.transaction_xdr with Alice's wallet,
+        // then send it to POST /submit-pull; the API never reads Alice's secret.
+        console.log("\nHitting POST /trigger-pull API to prepare the smart contract call...");
         const pullResponse = await fetch('http://localhost:3001/trigger-pull', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                subscription_id: sub.id,
-                merchant_secret: aliceSecret
-            })
+            body: JSON.stringify({ subscription_id: sub.id })
         });
         
         const pullData = await pullResponse.json();
         console.log("API Response:", pullData);
 
         if (pullResponse.ok) {
-            console.log("\nCHECKPOINT 2 SUCCESS! The Bridge is working perfectly.");
+            console.log("\nCHECKPOINT 2 SUCCESS! Unsigned XDR is ready for wallet signing.");
         } else {
             console.log("\nAPI returned an error.");
         }

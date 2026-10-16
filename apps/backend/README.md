@@ -40,7 +40,8 @@ The service runs at `http://localhost:3001`.
 | `POST` | `/plans` | Create a new recurring pricing plan |
 | `GET` | `/plans/:id` | Fetch plan and merchant details |
 | `GET` | `/subscribers` | List active subscribers for a merchant |
-| `POST` | `/trigger-pull` | Execute on-chain pull payment on Soroban |
+| `POST` | `/trigger-pull` | Prepare an unsigned merchant pull transaction |
+| `POST` | `/submit-pull` | Verify and submit a wallet-signed pull transaction |
 | `POST` | `/subscriptions` | Record a customer subscription after handshake |
 
 ---
@@ -232,14 +233,14 @@ Status: `200 OK`
 ### 4. POST /trigger-pull
 
 #### Purpose
-Executes an on-chain pull payment on the Stellar Soroban network for a given subscription.
+Prepares an unsigned on-chain pull payment for the merchant's registered public address. Orbit never receives a merchant secret key.
 
 The flow:
 1. Loads subscription, plan terms, and merchant wallet address from Supabase.
-2. Derives the merchant Keypair from `merchant_secret` and verifies it matches the plan owner.
-3. Builds the Soroban transaction invoking `pull_funds(user, merchant)` on the Orbit contract.
-4. Prepares (simulates), signs, and submits the transaction to Soroban RPC.
-5. Updates `next_billing_date` in Supabase to `pull_time + interval_seconds`.
+2. Builds and simulates `pull_funds(user, merchant)`.
+3. Returns the transaction XDR and network passphrase for signing in the merchant wallet.
+4. The client sends the signed envelope to `POST /submit-pull`.
+5. The API verifies the merchant signature, submits it, and updates billing state after confirmation.
 
 #### Request Body
 Content-Type: `application/json`
@@ -247,7 +248,6 @@ Content-Type: `application/json`
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `subscription_id` | `string` (UUID) | Yes | Unique ID of the subscription to pull funds for. |
-| `merchant_secret` | `string` | Yes | Stellar secret key (`S...`) of the merchant owning the plan. |
 
 #### Example Request
 
@@ -255,8 +255,7 @@ Content-Type: `application/json`
 curl -X POST http://localhost:3001/trigger-pull \
   -H "Content-Type: application/json" \
   -d '{
-    "subscription_id": "c1f7b9e0-1234-5678-9abc-def012345678",
-    "merchant_secret": "SCZANGBA5YHTNYVVV4C3U252E2B6P6F5T3U6MM63WBSBZVYAYE6XYZTEST"
+    "subscription_id": "c1f7b9e0-1234-5678-9abc-def012345678"
   }'
 ```
 
@@ -265,26 +264,27 @@ Status: `200 OK`
 
 ```json
 {
-  "message": "Successfully pulled funds on-chain!",
-  "txHash": "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0"
+  "transaction_xdr": "AAAAAg...",
+  "network_passphrase": "Test SDF Network ; September 2015",
+  "merchant_address": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+  "subscription_id": "c1f7b9e0-1234-5678-9abc-def012345678"
 }
 ```
 
 #### Error Responses
 
 - `400 Bad Request`
-  Returned when `subscription_id` or `merchant_secret` is missing.
+  Returned when `subscription_id` is missing, malformed, or an unexpected secret field is supplied.
   ```json
   {
-    "error": "Missing subscription_id or merchant_secret"
+    "error": "Invalid input on subscription_id: subscription_id must be a valid UUID"
   }
   ```
 
-- `401 Unauthorized`
-  Returned when the provided `merchant_secret` does not match the merchant wallet registered for the plan.
+- `POST /submit-pull` accepts `{ "subscription_id": "...", "signed_xdr": "..." }`. It returns `401` unless the envelope source and a valid signature match the merchant wallet registered for the plan.
   ```json
   {
-    "error": "Merchant secret does not match the plan owner's address"
+    "error": "A valid merchant wallet signature is required"
   }
   ```
 

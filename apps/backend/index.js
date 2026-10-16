@@ -3,7 +3,7 @@ const cors = require('cors');
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const { z } = require('zod');
-const { StrKey, Keypair, rpc, Networks, TransactionBuilder, Contract, xdr } = require('@stellar/stellar-sdk');
+const { StrKey, Keypair, rpc, Networks, TransactionBuilder, Contract, Address } = require('@stellar/stellar-sdk');
 
 const app = express();
 app.use(cors());
@@ -75,8 +75,12 @@ const createSubscriptionSchema = z.object({
 
 const triggerPullSchema = z.object({
     subscription_id: z.string().uuid("subscription_id must be a valid UUID"),
-    merchant_secret: z.string().min(1, "merchant_secret is required"),
-});
+}).strict();
+
+const submitPullSchema = z.object({
+    subscription_id: z.string().uuid("subscription_id must be a valid UUID"),
+    signed_xdr: z.string().min(1, "signed_xdr is required"),
+}).strict();
 
 // PostgREST reports a .single() lookup that matched no rows as an error, not as empty data
 const isNoRowsError = (error) => error?.code === 'PGRST116';
@@ -185,6 +189,30 @@ app.get('/subscribers', async (req, res) => {
 // ==========================================
 // ROUTE 4: POST /trigger-pull (The Blockchain Bridge)
 // ==========================================
+const loadPullContext = async (supabase, subscriptionId) => {
+    const { data: sub, error: subError } = await supabase
+        .from('subscriptions')
+        .select(`
+            *,
+            plans ( merchant_id, usdc_amount, interval_seconds )
+        `)
+        .eq('id', subscriptionId)
+        .single();
+
+    if (isNoRowsError(subError) || !sub) return { status: 404, error: "Subscription not found" };
+    if (subError) throw subError;
+
+    const { data: merchant, error: merchantError } = await supabase
+        .from('merchants')
+        .select('wallet_address')
+        .eq('id', sub.plans.merchant_id)
+        .single();
+
+    if (isNoRowsError(merchantError) || !merchant) return { status: 404, error: "Merchant not found" };
+    if (merchantError) throw merchantError;
+    return { sub, merchant };
+};
+
 app.post('/trigger-pull', async (req, res) => {
     const parseResult = triggerPullSchema.safeParse(req.body);
     if (!parseResult.success) {
@@ -192,46 +220,13 @@ app.post('/trigger-pull', async (req, res) => {
     }
 
     try {
-        const { subscription_id, merchant_secret } = parseResult.data;
+        const { subscription_id } = parseResult.data;
         const supabase = getSupabase();
         if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
 
-        // 1. Fetch Subscription and Plan data from Supabase
-        const { data: sub, error: subError } = await supabase
-            .from('subscriptions')
-            .select(`
-                *,
-                plans ( merchant_id, usdc_amount, interval_seconds )
-            `)
-            .eq('id', subscription_id)
-            .single();
-
-        if (isNoRowsError(subError)) return res.status(404).json({ error: "Subscription not found" });
-        if (subError) throw subError;
-        if (!sub) return res.status(404).json({ error: "Subscription not found" });
-
-        // We also need the merchant's public address to match against the secret
-        const { data: merchant, error: merchantError } = await supabase
-            .from('merchants')
-            .select('wallet_address')
-            .eq('id', sub.plans.merchant_id)
-            .single();
-
-        if (isNoRowsError(merchantError)) return res.status(404).json({ error: "Merchant not found" });
-        if (merchantError) throw merchantError;
-
-        // 2. Setup Stellar SDK (Testnet)
-        let merchantKeypair;
-        try {
-            merchantKeypair = Keypair.fromSecret(merchant_secret);
-        } catch {
-            return res.status(400).json({ error: "Invalid merchant_secret: not a valid Stellar secret key" });
-        }
-        
-        // Verify the provided secret matches the merchant in the database
-        if (merchantKeypair.publicKey() !== merchant.wallet_address) {
-            return res.status(401).json({ error: "Merchant secret does not match the plan owner's address" });
-        }
+        const context = await loadPullContext(supabase, subscription_id);
+        if (context.error) return res.status(context.status).json({ error: context.error });
+        const { sub, merchant } = context;
 
         const ORBIT_CONTRACT_ID = process.env.ORBIT_CONTRACT_ID; 
         if (!ORBIT_CONTRACT_ID) {
@@ -243,25 +238,77 @@ app.post('/trigger-pull', async (req, res) => {
         const contract = new Contract(ORBIT_CONTRACT_ID);
         
         // 3. Build the Soroban Transaction
-        const account = await server.getAccount(merchantKeypair.publicKey());
+        const account = await server.getAccount(merchant.wallet_address);
         
         const tx = new TransactionBuilder(account, {
             fee: "1000000",
             networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET
         })
         .addOperation(contract.call("pull_funds", 
-            xdr.ScVal.scvAddress(xdr.ScAddress.scAddressTypeAccount(Keypair.fromPublicKey(sub.customer_wallet_address).xdrPublicKey())), // User
-            xdr.ScVal.scvAddress(xdr.ScAddress.scAddressTypeAccount(merchantKeypair.xdrPublicKey())) // Merchant
+            Address.fromString(sub.customer_wallet_address).toScVal(),
+            Address.fromString(merchant.wallet_address).toScVal()
         ))
         .setTimeout(30)
         .build();
 
-        // 4. Simulate & Sign & Submit
+        // Simulate and return an unsigned envelope. The merchant signs it in their wallet.
         const preparedTx = await server.prepareTransaction(tx);
-        preparedTx.sign(merchantKeypair);
+        return res.status(200).json({
+            transaction_xdr: preparedTx.toXDR(),
+            network_passphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+            merchant_address: merchant.wallet_address,
+            subscription_id,
+        });
+    } catch (err) {
+        console.error("Error preparing pull:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
 
-        console.log("Submitting 'pull_funds' to Soroban testnet...");
-        const submitResponse = await server.sendTransaction(preparedTx);
+// Accept only a wallet-signed envelope, verify the merchant signature, then submit it.
+app.post('/submit-pull', async (req, res) => {
+    const parseResult = submitPullSchema.safeParse(req.body);
+    if (!parseResult.success) return res.status(400).json({ error: formatZodError(parseResult.error) });
+
+    try {
+        const { subscription_id, signed_xdr } = parseResult.data;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+        const context = await loadPullContext(supabase, subscription_id);
+        if (context.error) return res.status(context.status).json({ error: context.error });
+        const { sub, merchant } = context;
+        const networkPassphrase = process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET;
+        let signedTx;
+        try {
+            signedTx = TransactionBuilder.fromXDR(signed_xdr, networkPassphrase);
+        } catch {
+            return res.status(400).json({ error: "signed_xdr is not a valid Stellar transaction envelope" });
+        }
+        if (signedTx.source !== merchant.wallet_address) {
+            return res.status(401).json({ error: "Transaction source does not match the plan owner's address" });
+        }
+        const invocation = signedTx.operations.length === 1 && signedTx.operations[0].type === 'invokeHostFunction'
+            ? signedTx.operations[0].func?.invokeContract
+            : null;
+        const isExpectedPull = invocation
+            && invocation.functionName.toString() === 'pull_funds'
+            && StrKey.encodeContract(invocation.contractAddress.contractId.value) === process.env.ORBIT_CONTRACT_ID
+            && invocation.args.length === 2
+            && Address.fromScVal(invocation.args[0]).toString() === sub.customer_wallet_address
+            && Address.fromScVal(invocation.args[1]).toString() === merchant.wallet_address;
+        if (!isExpectedPull) {
+            return res.status(400).json({ error: "Signed transaction does not match this subscription's pull" });
+        }
+        const merchantKey = Keypair.fromPublicKey(merchant.wallet_address);
+        const hasMerchantSignature = signedTx.signatures.some(({ signature }) =>
+            merchantKey.verify(signedTx.hash(), signature.value)
+        );
+        if (!hasMerchantSignature) {
+            return res.status(401).json({ error: "A valid merchant wallet signature is required" });
+        }
+
+        const server = getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org');
+        const submitResponse = await server.sendTransaction(signedTx);
 
         if (submitResponse.status !== "PENDING" && submitResponse.status !== "SUCCESS") {
              throw new Error(`Transaction submission failed: ${JSON.stringify(submitResponse)}`);
@@ -309,7 +356,7 @@ app.post('/trigger-pull', async (req, res) => {
         });
 
     } catch (err) {
-        console.error("Error triggering pull:", err);
+        console.error("Error submitting pull:", err);
         res.status(500).json({ error: err.message });
     }
 });

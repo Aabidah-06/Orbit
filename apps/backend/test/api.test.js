@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
-import { Keypair, StrKey, Account } from '@stellar/stellar-sdk';
+import { Keypair, StrKey, Account, Networks, TransactionBuilder } from '@stellar/stellar-sdk';
 import app from '../index.js';
 
 describe('Merchant API Route Validation & Responses', () => {
@@ -275,27 +275,20 @@ describe('Merchant API Route Validation & Responses', () => {
   // POST /trigger-pull
   // ==========================================
   describe('POST /trigger-pull', () => {
-    it('returns 400 when required fields are missing', async () => {
-      const res = await request(app)
-        .post('/trigger-pull')
-        .send({
-          subscription_id: validSubscriptionId,
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.error).toContain('merchant_secret');
-    });
-
-    it('returns 400 when subscription_id is not a UUID', async () => {
-      const res = await request(app)
-        .post('/trigger-pull')
-        .send({
-          subscription_id: 'not-a-uuid',
-          merchant_secret: 'some-secret',
-        });
+    it('returns 400 when subscription_id is missing', async () => {
+      const res = await request(app).post('/trigger-pull').send({});
 
       expect(res.status).toBe(400);
       expect(res.body.error).toContain('subscription_id');
+    });
+
+    it('rejects merchant secrets instead of accepting or storing them', async () => {
+      const res = await request(app)
+        .post('/trigger-pull')
+        .send({ subscription_id: validSubscriptionId, merchant_secret: 'must-never-leave-the-wallet' });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('input');
     });
 
     it('returns 404 when the subscription does not exist', async () => {
@@ -306,16 +299,13 @@ describe('Merchant API Route Validation & Responses', () => {
 
       const res = await request(app)
         .post('/trigger-pull')
-        .send({
-          subscription_id: validSubscriptionId,
-          merchant_secret: 'some-secret',
-        });
+        .send({ subscription_id: validSubscriptionId });
 
       expect(res.status).toBe(404);
       expect(res.body.error).toBe('Subscription not found');
     });
 
-    describe('on-chain confirmation', () => {
+    describe('wallet-signed transaction flow', () => {
       const merchantKeypair = Keypair.random();
       const contractId = StrKey.encodeContract(Buffer.alloc(32, 1));
       let mockServer;
@@ -327,7 +317,7 @@ describe('Merchant API Route Validation & Responses', () => {
 
         mockSupabase.single.mockImplementation(() => {
           // First call resolves the subscription, second call resolves the merchant
-          if (mockSupabase.single.mock.calls.length === 1) {
+          if (mockSupabase.single.mock.calls.length % 2 === 1) {
             return Promise.resolve({
               data: {
                 id: validSubscriptionId,
@@ -360,12 +350,21 @@ describe('Merchant API Route Validation & Responses', () => {
         delete process.env.ORBIT_CONTRACT_ID;
       });
 
+      const prepareAndSign = async () => {
+        const prepared = await request(app).post('/trigger-pull').send({ subscription_id: validSubscriptionId });
+        expect(prepared.status).toBe(200);
+        expect(mockServer.sendTransaction).not.toHaveBeenCalled();
+        const transaction = TransactionBuilder.fromXDR(prepared.body.transaction_xdr, Networks.TESTNET);
+        transaction.sign(merchantKeypair);
+        return transaction.toXDR();
+      };
+
       it('advances next_billing_date only after the transaction is confirmed SUCCESS', async () => {
         mockServer.getTransaction.mockResolvedValue({ status: 'SUCCESS' });
-
+        const signed_xdr = await prepareAndSign();
         const res = await request(app)
-          .post('/trigger-pull')
-          .send({ subscription_id: validSubscriptionId, merchant_secret: merchantKeypair.secret() });
+          .post('/submit-pull')
+          .send({ subscription_id: validSubscriptionId, signed_xdr });
 
         expect(res.status).toBe(200);
         expect(res.body.txHash).toBe('deadbeef');
@@ -376,10 +375,10 @@ describe('Merchant API Route Validation & Responses', () => {
 
       it('marks the subscription past_due and returns an error when the transaction fails', async () => {
         mockServer.getTransaction.mockResolvedValue({ status: 'FAILED' });
-
+        const signed_xdr = await prepareAndSign();
         const res = await request(app)
-          .post('/trigger-pull')
-          .send({ subscription_id: validSubscriptionId, merchant_secret: merchantKeypair.secret() });
+          .post('/submit-pull')
+          .send({ subscription_id: validSubscriptionId, signed_xdr });
 
         expect(res.status).toBe(502);
         expect(res.body.txHash).toBe('deadbeef');
@@ -388,14 +387,21 @@ describe('Merchant API Route Validation & Responses', () => {
 
       it('returns 202 with the hash when confirmation times out', async () => {
         mockServer.getTransaction.mockResolvedValue({ status: 'NOT_FOUND' });
-
+        const signed_xdr = await prepareAndSign();
         const res = await request(app)
-          .post('/trigger-pull')
-          .send({ subscription_id: validSubscriptionId, merchant_secret: merchantKeypair.secret() });
+          .post('/submit-pull')
+          .send({ subscription_id: validSubscriptionId, signed_xdr });
 
         expect(res.status).toBe(202);
         expect(res.body.txHash).toBe('deadbeef');
         expect(mockSupabase.update).not.toHaveBeenCalled();
+      });
+
+      it('refuses an unsigned transaction', async () => {
+        const prepared = await request(app).post('/trigger-pull').send({ subscription_id: validSubscriptionId });
+        const res = await request(app).post('/submit-pull').send({ subscription_id: validSubscriptionId, signed_xdr: prepared.body.transaction_xdr });
+        expect(res.status).toBe(401);
+        expect(mockServer.sendTransaction).not.toHaveBeenCalled();
       });
     });
   });
