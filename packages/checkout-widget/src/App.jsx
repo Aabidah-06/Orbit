@@ -7,21 +7,21 @@ const PRESET_PLANS = [
     name: "Pro Developer Membership",
     usdc_amount: 490000000,
     interval_seconds: 2592000,
-    merchants: { name: "Drips Labs" }
+    merchants: { name: "Drips Labs", wallet_address: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5" }
   },
   {
     id: "plan_community",
     name: "Private Alpha Pass",
     usdc_amount: 1000000000,
     interval_seconds: 2592000,
-    merchants: { name: "Drips Labs" }
+    merchants: { name: "Drips Labs", wallet_address: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5" }
   },
   {
     id: "plan_enterprise",
     name: "Enterprise Node Retainer",
     usdc_amount: 20000000000,
     interval_seconds: 2592000,
-    merchants: { name: "Drips Labs" }
+    merchants: { name: "Drips Labs", wallet_address: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5" }
   }
 ];
 
@@ -119,7 +119,7 @@ function App() {
           background: 'linear-gradient(180deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.02) 100%)',
           boxShadow: '0 20px 50px rgba(0,0,0,0.6)'
         }}>
-          <OrbitCheckout planId={activePlan.id} planData={activePlan} demo />
+          <OrbitCheckout planId={activePlan.id} planData={activePlan} />
         </div>
       )}
 

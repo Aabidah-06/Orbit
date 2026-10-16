@@ -495,7 +495,7 @@ The release profile sets `overflow-checks = true`. The one addition (`last_pull_
 - `create_vault` does not validate that `amount_per_interval > 0` or `interval_seconds > 0`. A zero interval turns the vault into "pull whenever", still capped by the allowance.
 - Re-calling `create_vault` resets `last_pull_timestamp` to 0, which enables an immediate pull. Only the subscriber can do this, but clients should warn them.
 - `batch_disburse` does not reject zero or negative amounts. The SAC rejects negative amounts.
-- `POST /trigger-pull` accepts `merchant_secret` in the request body. That is fine for testnet demos only. Production should sign on the client (Freighter) or with a KMS-held key.
+- Merchant secret keys never reach the API. `POST /trigger-pull` returns an unsigned XDR; the merchant wallet signs it and `POST /submit-pull` verifies the registered merchant signature before submission.
 
 > This contract has not been audited. It runs on testnet only.
 
