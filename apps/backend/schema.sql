@@ -146,7 +146,6 @@ CREATE TABLE webhook_deliveries (
 CREATE INDEX webhook_deliveries_merchant_id_idx ON webhook_deliveries (merchant_id);
 CREATE INDEX webhook_deliveries_webhook_id_idx ON webhook_deliveries (webhook_id);
 CREATE INDEX webhook_deliveries_created_at_idx ON webhook_deliveries (created_at DESC);
->>>>>>> 87fc592 (feat: implement dunning, audit logging, customer portal, and webhook inspector)
 
 -- Atomically claims an idempotency key. Returns {"claimed": true, "record": ...}
 -- when the caller now owns the key and must execute the request, or
@@ -263,6 +262,71 @@ REVOKE EXECUTE ON FUNCTION acquire_billing_lock(UUID, UUID, INTEGER) FROM PUBLIC
 REVOKE EXECUTE ON FUNCTION release_billing_lock(UUID, UUID) FROM PUBLIC, anon, authenticated;
 REVOKE EXECUTE ON FUNCTION purge_expired_idempotency_keys() FROM PUBLIC, anon, authenticated;
 
+-- 11. Relayer Fee Usage Table
+-- Daily network fees (in stroops) the Orbit relayer has sponsored per merchant, used to
+-- enforce RELAYER_DAILY_FEE_LIMIT_STROOPS. Days are UTC. fee_stroops holds the fee
+-- reserved before submission, corrected to the fee actually charged once confirmed.
+CREATE TABLE relayer_fee_usage (
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    usage_date DATE NOT NULL,
+    fee_stroops BIGINT NOT NULL DEFAULT 0 CHECK (fee_stroops >= 0),
+    tx_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+
+    PRIMARY KEY (merchant_id, usage_date)
+);
+
+-- Atomically books p_amount against today's budget. Returns the usage date it was booked
+-- against, or NULL when it would take the merchant over p_daily_limit.
+CREATE OR REPLACE FUNCTION reserve_relayer_fee(
+    p_merchant_id UUID,
+    p_amount BIGINT,
+    p_daily_limit BIGINT
+) RETURNS DATE
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_usage_date DATE := (NOW() AT TIME ZONE 'UTC')::DATE;
+BEGIN
+    IF p_amount > p_daily_limit THEN
+        RETURN NULL;
+    END IF;
+
+    INSERT INTO relayer_fee_usage (merchant_id, usage_date, fee_stroops)
+    VALUES (p_merchant_id, v_usage_date, p_amount)
+    ON CONFLICT (merchant_id, usage_date) DO UPDATE
+        SET fee_stroops = relayer_fee_usage.fee_stroops + EXCLUDED.fee_stroops,
+            updated_at = NOW()
+        WHERE relayer_fee_usage.fee_stroops + EXCLUDED.fee_stroops <= p_daily_limit;
+
+    IF FOUND THEN
+        RETURN v_usage_date;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+-- Corrects a booking: refunds an unsubmitted reservation or settles it to the charged fee.
+CREATE OR REPLACE FUNCTION adjust_relayer_fee(
+    p_merchant_id UUID,
+    p_usage_date DATE,
+    p_fee_delta BIGINT,
+    p_tx_delta INTEGER
+) RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE relayer_fee_usage
+    SET fee_stroops = GREATEST(0, fee_stroops + p_fee_delta),
+        tx_count = tx_count + p_tx_delta,
+        updated_at = NOW()
+    WHERE merchant_id = p_merchant_id AND usage_date = p_usage_date;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION reserve_relayer_fee(UUID, BIGINT, BIGINT) FROM PUBLIC, anon, authenticated;
+REVOKE EXECUTE ON FUNCTION adjust_relayer_fee(UUID, DATE, BIGINT, INTEGER) FROM PUBLIC, anon, authenticated;
+
 -- ==============================================================================
 -- Row Level Security (RLS) Configuration
 -- ==============================================================================
@@ -287,6 +351,7 @@ ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhooks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhook_deliveries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE relayer_fee_usage ENABLE ROW LEVEL SECURITY;
 
 -- Public checkout read access for plans and merchant public identifiers
 CREATE POLICY "Allow public read access to merchants for checkout"
@@ -297,6 +362,7 @@ CREATE POLICY "Allow public read access to plans for checkout"
     ON plans FOR SELECT
     USING (true);
 
--- No public policies for subscriptions, idempotency_keys, billing_locks, api_keys, audit_logs, webhooks, or webhook_deliveries:
+-- No public policies for subscriptions, idempotency_keys, billing_locks, api_keys, audit_logs, webhooks,
+-- webhook_deliveries or relayer_fee_usage:
 -- default-deny prevents anon key access.
 -- No open INSERT or UPDATE policies: all mutations require backend service role.
