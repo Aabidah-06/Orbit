@@ -74,4 +74,12 @@ describe('Database Schema & Row Level Security (RLS) Policies', () => {
     expect(schemaSql).toMatch(/ALTER\s+TABLE\s+api_keys\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
     expect(schemaSql).not.toMatch(/CREATE\s+POLICY\s+.*ON\s+api_keys\b/i);
   });
+
+  it('keeps reconciliation_state private to the backend', () => {
+    const table = schemaSql.match(/CREATE\s+TABLE\s+reconciliation_state\s*\(([\s\S]*?)\n\);/i)?.[1];
+    expect(table).toBeDefined();
+    expect(table).toMatch(/event_cursor\s+TEXT/i);
+    expect(schemaSql).toMatch(/ALTER\s+TABLE\s+reconciliation_state\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
+    expect(schemaSql).not.toMatch(/CREATE\s+POLICY\s+.*ON\s+reconciliation_state\b/i);
+  });
 });

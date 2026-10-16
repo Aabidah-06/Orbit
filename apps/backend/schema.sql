@@ -90,6 +90,17 @@ CREATE TABLE api_keys (
 CREATE UNIQUE INDEX api_keys_key_hash_idx ON api_keys (key_hash);
 CREATE INDEX api_keys_merchant_id_idx ON api_keys (merchant_id);
 
+-- 7. Reconciliation State Table
+-- Progress markers for the ledger reconciliation worker (reconciliation.js). The
+-- 'soroban_events' row stores the getEvents cursor so a restarted worker resumes
+-- where it stopped instead of rescanning the RPC retention window.
+CREATE TABLE reconciliation_state (
+    id VARCHAR(64) PRIMARY KEY,
+    event_cursor TEXT,
+    last_ledger BIGINT,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- Atomically claims an idempotency key. Returns {"claimed": true, "record": ...}
 -- when the caller now owns the key and must execute the request, or
 -- {"claimed": false, "record": ...} with the existing record otherwise.
@@ -226,6 +237,7 @@ ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE idempotency_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE billing_locks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reconciliation_state ENABLE ROW LEVEL SECURITY;
 
 -- Public checkout read access for plans and merchant public identifiers
 CREATE POLICY "Allow public read access to merchants for checkout"
@@ -236,6 +248,6 @@ CREATE POLICY "Allow public read access to plans for checkout"
     ON plans FOR SELECT
     USING (true);
 
--- No public policies for subscriptions, idempotency_keys, billing_locks or api_keys:
+-- No public policies for subscriptions, idempotency_keys, billing_locks, api_keys or reconciliation_state:
 -- default-deny prevents anon key access.
 -- No open INSERT or UPDATE policies: all mutations require backend service role.
