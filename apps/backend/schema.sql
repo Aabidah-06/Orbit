@@ -28,6 +28,10 @@ CREATE TABLE subscriptions (
     customer_wallet_address VARCHAR(255) NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'active', -- 'active', 'cancelled', 'past_due'
     next_billing_date TIMESTAMP WITH TIME ZONE NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    next_dunning_retry_at TIMESTAMP WITH TIME ZONE,
+    dunning_status VARCHAR(50) DEFAULT NULL, -- 'pending', 'in_progress', 'exhausted', 'recovered'
+    metadata JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     
     -- Ensure a customer can't accidentally subscribe to the exact same plan twice concurrently
@@ -90,7 +94,60 @@ CREATE TABLE api_keys (
 CREATE UNIQUE INDEX api_keys_key_hash_idx ON api_keys (key_hash);
 CREATE INDEX api_keys_merchant_id_idx ON api_keys (merchant_id);
 
--- 7. Reconciliation State Table
+-- 7. Audit Logs Table
+-- Immutable audit records for financial mutations and administrative actions
+CREATE TABLE audit_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID REFERENCES merchants(id) ON DELETE CASCADE,
+    actor_address VARCHAR(255),
+    action VARCHAR(100) NOT NULL,
+    resource_type VARCHAR(100) NOT NULL,
+    resource_id VARCHAR(255),
+    ip_address VARCHAR(100),
+    changes_before JSONB,
+    changes_after JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX audit_logs_merchant_id_idx ON audit_logs (merchant_id);
+CREATE INDEX audit_logs_created_at_idx ON audit_logs (created_at DESC);
+CREATE INDEX audit_logs_action_idx ON audit_logs (action);
+
+-- 8. Webhook Endpoints Table
+-- Merchant configured destination URLs for event notifications
+CREATE TABLE webhooks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    signing_secret VARCHAR(255) NOT NULL,
+    events JSONB NOT NULL DEFAULT '["*"]'::jsonb,
+    active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX webhooks_merchant_id_idx ON webhooks (merchant_id);
+
+-- 9. Webhook Deliveries Table
+-- Dispatched webhook events, HTTP response status codes, and attempt payloads
+CREATE TABLE webhook_deliveries (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    webhook_id UUID REFERENCES webhooks(id) ON DELETE CASCADE,
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    event_type VARCHAR(100) NOT NULL,
+    payload JSONB NOT NULL,
+    request_headers JSONB,
+    response_status INTEGER,
+    response_body TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 1,
+    status VARCHAR(50) NOT NULL DEFAULT 'success', -- 'success', 'failed'
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX webhook_deliveries_merchant_id_idx ON webhook_deliveries (merchant_id);
+CREATE INDEX webhook_deliveries_webhook_id_idx ON webhook_deliveries (webhook_id);
+CREATE INDEX webhook_deliveries_created_at_idx ON webhook_deliveries (created_at DESC);
+
+-- 10. Reconciliation State Table
 -- Progress markers for the ledger reconciliation worker (reconciliation.js). The
 -- 'soroban_events' row stores the getEvents cursor so a restarted worker resumes
 -- where it stopped instead of rescanning the RPC retention window.
@@ -237,6 +294,9 @@ ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE idempotency_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE billing_locks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhooks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_deliveries ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reconciliation_state ENABLE ROW LEVEL SECURITY;
 
 -- Public checkout read access for plans and merchant public identifiers
@@ -248,6 +308,7 @@ CREATE POLICY "Allow public read access to plans for checkout"
     ON plans FOR SELECT
     USING (true);
 
--- No public policies for subscriptions, idempotency_keys, billing_locks, api_keys or reconciliation_state:
+-- No public policies for subscriptions, idempotency_keys, billing_locks, api_keys, audit_logs, webhooks,
+-- webhook_deliveries or reconciliation_state:
 -- default-deny prevents anon key access.
 -- No open INSERT or UPDATE policies: all mutations require backend service role.

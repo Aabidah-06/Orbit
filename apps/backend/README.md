@@ -510,7 +510,7 @@ The API queries the tables defined in `apps/backend/schema.sql`:
 - `api_keys`: `id` (UUID PK), `merchant_id` (UUID FK -> `merchants.id`, cascade), `name` (VARCHAR), `key_prefix` (VARCHAR(16)), `key_hash` (VARCHAR(64), unique SHA-256 hex), `environment` (`live` / `test`), `last_used_at`, `created_at`, `revoked_at` (TIMESTAMP). Active while `revoked_at` is null.
 - `reconciliation_state`: `id` (VARCHAR PK, e.g. `soroban_events`), `event_cursor` (TEXT), `last_ledger` (BIGINT), `updated_at` (TIMESTAMP). Progress markers for the reconciliation worker.
 
-Existing databases can apply the new sections of `schema.sql` (tables 4 to 7, their functions, indexes, `REVOKE`s and RLS statements) as a migration.
+Existing databases can apply the new sections of `schema.sql` (tables 4 to 10, their functions, indexes, `REVOKE`s and RLS statements) as a migration.
 
 ### Row Level Security (RLS) Policy Model
 

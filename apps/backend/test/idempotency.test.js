@@ -86,7 +86,8 @@ describe('Idempotency keys and billing locks', () => {
         p_request_hash: hashRequestBody(planBody),
         p_ttl_seconds: 86400,
       }));
-      expect(mockSupabase.insert).toHaveBeenCalledTimes(1);
+      expect(mockSupabase.from).toHaveBeenCalledWith('plans');
+      expect(mockSupabase.from).toHaveBeenCalledWith('audit_logs');
       expect(finalizeCall()).toMatchObject({ status: 'completed', response_code: 201 });
       expect(mockSupabase.eq).toHaveBeenCalledWith('id', idempotencyRecordId);
     });
