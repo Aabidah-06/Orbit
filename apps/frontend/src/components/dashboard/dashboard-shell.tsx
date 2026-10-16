@@ -21,9 +21,11 @@ import {
   Copy,
   Check,
   Pencil,
+  Bell,
 } from "lucide-react";
 import { Brand } from "@/components/layout/brand";
 import { useAuth } from "@/lib/auth-context";
+import { useNotifications } from "@/lib/notification-context";
 import { DashboardTab, NetworkId, NETWORKS } from "./dashboard-types";
 import { OverviewView } from "./views/overview-view";
 import { PlansView } from "./views/plans-view";
@@ -32,11 +34,13 @@ import { PayrollView } from "./views/payroll-view";
 import { PaymentLinksView } from "./views/payment-links-view";
 import { DevelopersView } from "./views/developers-view";
 import { VaultModal } from "./modals/vault-modal";
+import { NotificationDrawer } from "./drawers/notification-drawer";
 import { DOCS_URL } from "@/lib/links";
 
 export function DashboardShell() {
   const router = useRouter();
   const { user, signOut, updateVault, updateBusinessName } = useAuth();
+  const { unreadCount, toggleDrawer } = useNotifications();
   const [activeTab, setActiveTab] = useState<DashboardTab>("overview");
 
   const handleSignOut = () => {
@@ -294,6 +298,19 @@ export function DashboardShell() {
           </div>
 
           <div className="flex items-center gap-3">
+            <button
+              onClick={toggleDrawer}
+              className="relative p-2 rounded-lg border border-black/10 hover:border-black/25 bg-white text-neutral-600 hover:text-black transition-colors"
+              title="Transaction Notifications"
+              aria-label="Transaction Notifications"
+            >
+              <Bell size={16} />
+              {unreadCount > 0 && (
+                <span className="absolute -top-1 -right-1 w-4 h-4 bg-indigo-600 text-white rounded-full text-[9px] font-bold flex items-center justify-center font-mono">
+                  {unreadCount > 9 ? "9+" : unreadCount}
+                </span>
+              )}
+            </button>
             <Link
               href={`${DOCS_URL}/checkout/widget`}
               className="button button-secondary text-xs h-8 px-3 flex items-center gap-1"
@@ -339,6 +356,9 @@ export function DashboardShell() {
         user={user}
         onUpdateVault={updateVault}
       />
+
+      {/* Real-time Notifications Drawer */}
+      <NotificationDrawer />
     </div>
   );
 }

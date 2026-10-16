@@ -31,6 +31,7 @@ CREATE TABLE subscriptions (
     retry_count INTEGER NOT NULL DEFAULT 0,
     next_dunning_retry_at TIMESTAMP WITH TIME ZONE,
     dunning_status VARCHAR(50) DEFAULT NULL, -- 'pending', 'in_progress', 'exhausted', 'recovered'
+    metadata JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     
     -- Ensure a customer can't accidentally subscribe to the exact same plan twice concurrently

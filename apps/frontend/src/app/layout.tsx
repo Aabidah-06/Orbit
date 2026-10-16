@@ -28,6 +28,8 @@ export const metadata: Metadata = {
 };
 
 import { AuthProvider } from "@/lib/auth-context";
+import { NotificationProvider } from "@/lib/notification-context";
+import { ToastNotificationCenter } from "@/components/ui/toast-notification-center";
 
 export default function RootLayout({
   children,
@@ -43,11 +45,14 @@ export default function RootLayout({
       </head>
       <body className="min-h-screen bg-[#FAFAFB] text-[#09090B] selection:bg-black selection:text-white antialiased">
         <AuthProvider>
-          <div className="flex flex-col min-h-screen">
-            <Navbar />
-            <div className="flex-1">{children}</div>
-            <Footer />
-          </div>
+          <NotificationProvider>
+            <div className="flex flex-col min-h-screen">
+              <Navbar />
+              <div className="flex-1">{children}</div>
+              <Footer />
+            </div>
+            <ToastNotificationCenter />
+          </NotificationProvider>
         </AuthProvider>
       </body>
     </html>
