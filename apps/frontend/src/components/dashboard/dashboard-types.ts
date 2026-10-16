@@ -47,10 +47,52 @@ export interface SubscriberRecord {
   planName: string;
   amount: number;
   network: NetworkId;
-  status: "active" | "pending_pull" | "past_due";
+  status: "active" | "pending_pull" | "past_due" | "cancelled";
   nextPullDate: string;
   totalSettled: number;
   joinedDate: string;
+  dunningStatus?: string;
+  retryCount?: number;
+  nextDunningRetryAt?: string;
+  recoveryLink?: string;
+}
+
+export interface PaymentTimelineEvent {
+  id: string;
+  type: "subscription_created" | "settled_pull" | "failed_pull" | "dunning_retry" | "refund" | "cancelled";
+  title: string;
+  description: string;
+  timestamp: string;
+  amount?: number;
+  status: "success" | "warning" | "failed" | "info";
+  txHash?: string;
+}
+
+export interface WebhookEndpoint {
+  id: string;
+  merchant_id: string;
+  url: string;
+  signing_secret: string;
+  events: string[];
+  active: boolean;
+  created_at: string;
+}
+
+export interface WebhookDeliveryLog {
+  id: string;
+  webhook_id: string;
+  merchant_id: string;
+  event_type: string;
+  payload: Record<string, unknown>;
+  request_headers?: Record<string, string>;
+  response_status?: number;
+  response_body?: string;
+  attempt_count: number;
+  status: "success" | "failed";
+  created_at: string;
+  webhooks?: {
+    url: string;
+  };
 }
 
 export interface PayrollRecipient {

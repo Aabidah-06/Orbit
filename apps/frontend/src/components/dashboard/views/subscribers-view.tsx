@@ -16,6 +16,8 @@ import {
   Database,
   Radio,
   RefreshCw,
+  ChevronRight,
+  SlidersHorizontal,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth-context";
 import { SubscriberRecord } from "../dashboard-types";
@@ -24,6 +26,7 @@ import {
   mapApiSubscriberToRecord,
   ORBIT_API_URL,
 } from "@/lib/api";
+import { CustomerDetailDrawer } from "../drawers/customer-detail-drawer";
 
 export const INITIAL_SUBSCRIBERS: SubscriberRecord[] = [
   {
@@ -81,10 +84,12 @@ export const INITIAL_SUBSCRIBERS: SubscriberRecord[] = [
     planName: "AI Engine Starter",
     amount: 15.0,
     network: "stellar-testnet",
-    status: "active",
-    nextPullDate: "In 24 days",
+    status: "past_due",
+    nextPullDate: "Retry in 2d",
     totalSettled: 30.0,
     joinedDate: "Aug 01, 2026",
+    dunningStatus: "pending",
+    retryCount: 1,
   },
 ];
 
@@ -94,7 +99,7 @@ export function SubscribersView() {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Demo mode flag: default to true if env flag is set or no user logged in
+  // Demo mode flag
   const [isDemoMode, setIsDemoMode] = useState<boolean>(() => {
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
@@ -105,11 +110,15 @@ export function SubscribersView() {
   });
 
   const [searchQuery, setSearchQuery] = useState("");
-  const [filterTab, setFilterTab] = useState<"all" | "pending_pull" | "active">("all");
+  const [filterTab, setFilterTab] = useState<"all" | "pending_pull" | "active" | "past_due">("all");
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [executingPullId, setExecutingPullId] = useState<string | null>(null);
   const [pullSuccessMessage, setPullSuccessMessage] = useState<string | null>(null);
   const [isBatchPulling, setIsBatchPulling] = useState(false);
+
+  // Customer Management Drawer
+  const [selectedSubscriber, setSelectedSubscriber] = useState<SubscriberRecord | null>(null);
+  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
 
   // Load subscribers from Merchant API or fallback to Demo Data
   const loadSubscribers = useCallback(async () => {
@@ -121,7 +130,6 @@ export function SubscribersView() {
     }
 
     if (!user?.id) {
-      // If no signed-in merchant, show demo data gracefully
       setSubscribers(INITIAL_SUBSCRIBERS);
       setIsLoading(false);
       setError(null);
@@ -153,6 +161,18 @@ export function SubscribersView() {
     setTimeout(() => setCopiedKey(null), 1800);
   };
 
+  const handleOpenDrawer = (sub: SubscriberRecord) => {
+    setSelectedSubscriber(sub);
+    setIsDrawerOpen(true);
+  };
+
+  const handleSubscriberUpdated = (updated: SubscriberRecord) => {
+    setSubscribers((prev) =>
+      prev.map((s) => (s.id === updated.id ? updated : s))
+    );
+    setSelectedSubscriber(updated);
+  };
+
   // Execute Pull Trigger (simulates on-chain Soroban pull_funds execution)
   const handleExecutePull = async (sub: SubscriberRecord) => {
     setExecutingPullId(sub.id);
@@ -162,12 +182,16 @@ export function SubscribersView() {
       setSubscribers((prev) =>
         prev.map((s) => {
           if (s.id === sub.id) {
-            return {
+            const updated: SubscriberRecord = {
               ...s,
               status: "active",
               nextPullDate: "In 30 days",
               totalSettled: s.totalSettled + s.amount,
             };
+            if (selectedSubscriber?.id === sub.id) {
+              setSelectedSubscriber(updated);
+            }
+            return updated;
           }
           return s;
         })
@@ -227,6 +251,7 @@ export function SubscribersView() {
   });
 
   const dueCount = subscribers.filter((s) => s.status === "pending_pull").length;
+  const pastDueCount = subscribers.filter((s) => s.status === "past_due").length;
   const totalSettledAll = subscribers.reduce((acc, s) => acc + s.totalSettled, 0);
 
   return (
@@ -251,7 +276,7 @@ export function SubscribersView() {
             )}
           </div>
           <p className="text-xs text-neutral-500 mt-0.5">
-            Verified on-chain customer vaults authorizing recurring USDC pull payments on Stellar Soroban.
+            Verified on-chain customer vaults authorizing recurring USDC pull payments on Stellar Soroban. Click any customer row to manage subscription lifecycle &amp; timeline.
           </p>
         </div>
 
@@ -390,13 +415,13 @@ export function SubscribersView() {
 
         <div className="p-4 rounded-xl bg-white border border-black/10 shadow-xs">
           <div className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400">
-            Execution Finality
+            Past-Due in Dunning
           </div>
-          <div className="text-2xl font-bold text-emerald-600 mt-1">
-            &lt; 1.5s
+          <div className={`text-2xl font-bold mt-1 ${pastDueCount > 0 ? "text-red-600" : "text-black"}`}>
+            {isLoading ? "—" : pastDueCount}
           </div>
           <div className="text-xs text-neutral-500 mt-0.5">
-            Sub-cent Soroban pull fees
+            Smart retry cadence active
           </div>
         </div>
       </div>
@@ -443,7 +468,17 @@ export function SubscribersView() {
                 : "text-neutral-500 hover:text-black"
             }`}
           >
-            Active ({Math.max(0, subscribers.length - dueCount)})
+            Active ({subscribers.filter((s) => s.status === "active").length})
+          </button>
+          <button
+            onClick={() => setFilterTab("past_due")}
+            className={`text-xs px-3 py-1.5 rounded-md font-medium transition-colors ${
+              filterTab === "past_due"
+                ? "bg-white text-red-700 font-bold shadow-2xs"
+                : "text-neutral-500 hover:text-black"
+            }`}
+          >
+            Past Due ({pastDueCount})
           </button>
         </div>
       </div>
@@ -469,21 +504,37 @@ export function SubscribersView() {
                   <th className="py-3.5 px-4">Total Settled</th>
                   <th className="py-3.5 px-4">Next Pull</th>
                   <th className="py-3.5 px-4">Vault Status</th>
-                  <th className="py-3.5 px-5 text-right">Action</th>
+                  <th className="py-3.5 px-5 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-black/5 text-neutral-700">
                 {filteredSubscribers.map((sub) => {
                   const isExecuting = executingPullId === sub.id;
                   const isDue = sub.status === "pending_pull";
+                  const isPastDue = sub.status === "past_due";
+                  const isCancelled = sub.status === "cancelled";
 
                   return (
-                    <tr key={sub.id} className="hover:bg-neutral-50/50 transition-colors">
+                    <tr
+                      key={sub.id}
+                      onClick={() => handleOpenDrawer(sub)}
+                      className="hover:bg-neutral-50/70 transition-colors cursor-pointer group"
+                    >
                       {/* Customer Address & Copy */}
                       <td className="py-4 px-5">
-                        <div className="flex items-center gap-2">
-                          <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0"></span>
-                          <span className="font-mono text-xs font-semibold text-black">
+                        <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                          <span
+                            className={`w-2 h-2 rounded-full shrink-0 ${
+                              isCancelled
+                                ? "bg-neutral-400"
+                                : isPastDue
+                                ? "bg-red-500 animate-pulse"
+                                : isDue
+                                ? "bg-amber-500 animate-pulse"
+                                : "bg-emerald-500"
+                            }`}
+                          />
+                          <span className="font-mono text-xs font-semibold text-black group-hover:underline">
                             {sub.walletAddress.slice(0, 6)}...{sub.walletAddress.slice(-4)}
                           </span>
                           <button
@@ -539,7 +590,12 @@ export function SubscribersView() {
 
                       {/* Next Billing Date */}
                       <td className="py-4 px-4">
-                        {isDue ? (
+                        {isPastDue ? (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-mono font-bold text-red-800 bg-red-100 px-2 py-0.5 rounded border border-red-300">
+                            <Clock size={11} />
+                            {sub.nextPullDate}
+                          </span>
+                        ) : isDue ? (
                           <span className="inline-flex items-center gap-1 text-[10px] font-mono font-bold text-amber-800 bg-amber-100 px-2 py-0.5 rounded border border-amber-300">
                             <Clock size={11} />
                             {sub.nextPullDate}
@@ -553,7 +609,16 @@ export function SubscribersView() {
 
                       {/* Vault Status */}
                       <td className="py-4 px-4">
-                        {isDue ? (
+                        {isCancelled ? (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-neutral-100 text-neutral-600 border border-neutral-200 font-medium">
+                            CANCELLED
+                          </span>
+                        ) : isPastDue ? (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-red-50 text-red-700 border border-red-200 font-medium">
+                            <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>
+                            PAST DUE (DUNNING)
+                          </span>
+                        ) : isDue ? (
                           <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 font-medium">
                             <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
                             PULL READY
@@ -566,40 +631,35 @@ export function SubscribersView() {
                         )}
                       </td>
 
-                      {/* Execute Pull Action */}
-                      <td className="py-4 px-5 text-right">
-                        {isDue ? (
+                      {/* Action Buttons */}
+                      <td className="py-4 px-5 text-right" onClick={(e) => e.stopPropagation()}>
+                        <div className="flex items-center justify-end gap-1.5">
+                          {isDue && (
+                            <button
+                              onClick={() => handleExecutePull(sub)}
+                              disabled={isExecuting || isBatchPulling}
+                              className="button button-primary text-xs h-7 px-2.5 inline-flex items-center gap-1 bg-black text-white hover:bg-neutral-800"
+                              title="Execute pull funds on Soroban"
+                            >
+                              {isExecuting ? (
+                                <RotateCw size={11} className="animate-spin" />
+                              ) : (
+                                <Zap size={11} className="text-emerald-400" />
+                              )}
+                              <span>Pull</span>
+                            </button>
+                          )}
+
                           <button
-                            onClick={() => handleExecutePull(sub)}
-                            disabled={isExecuting || isBatchPulling}
-                            className="button button-primary text-xs h-8 px-3 inline-flex items-center gap-1.5 bg-black text-white hover:bg-neutral-800"
+                            onClick={() => handleOpenDrawer(sub)}
+                            className="button button-secondary text-[11px] h-7 px-2 text-neutral-600 hover:text-black flex items-center gap-1"
+                            title="Open Customer Portal Drawer"
                           >
-                            {isExecuting ? (
-                              <>
-                                <RotateCw size={12} className="animate-spin" />
-                                <span>Pulling...</span>
-                              </>
-                            ) : (
-                              <>
-                                <Zap size={12} className="text-emerald-400" />
-                                <span>Execute Pull</span>
-                              </>
-                            )}
+                            <SlidersHorizontal size={11} />
+                            <span>Manage</span>
+                            <ChevronRight size={11} className="text-neutral-400" />
                           </button>
-                        ) : (
-                          <button
-                            onClick={() => handleExecutePull(sub)}
-                            disabled={isExecuting || isBatchPulling}
-                            className="button button-secondary text-[11px] h-7 px-2.5 text-neutral-500 hover:text-black"
-                            title="Trigger early test pull"
-                          >
-                            {isExecuting ? (
-                              <RotateCw size={11} className="animate-spin" />
-                            ) : (
-                              <span>Test Pull</span>
-                            )}
-                          </button>
-                        )}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -638,6 +698,16 @@ export function SubscribersView() {
           {" "}The Soroban smart contract (<code className="font-mono text-[11px] text-black">CAZBZB...YQNG</code>) verifies on-chain ledger timestamps. A merchant cannot pull funds before the interval has elapsed or exceed the authorized amount cap.
         </div>
       </div>
+
+      {/* Customer Detail Drawer */}
+      <CustomerDetailDrawer
+        isOpen={isDrawerOpen}
+        onClose={() => setIsDrawerOpen(false)}
+        subscriber={selectedSubscriber}
+        onExecutePull={handleExecutePull}
+        onSubscriberUpdated={handleSubscriberUpdated}
+        isExecutingPull={executingPullId === selectedSubscriber?.id}
+      />
     </div>
   );
 }
