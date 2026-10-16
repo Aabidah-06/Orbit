@@ -23,6 +23,16 @@ const computeWebhookSignature = (secret, payloadString) => {
     return `sha256=${crypto.createHmac('sha256', secret).update(payloadString).digest('hex')}`;
 };
 
+// During rotation both the current and previous secret are accepted. This keeps
+// retries in flight valid while new deliveries immediately use the new secret.
+const verifyWebhookSignature = (signature, payloadString, secrets) => {
+    if (typeof signature !== 'string' || !signature.startsWith('sha256=')) return false;
+    return secrets.filter(Boolean).some((secret) => {
+        const expected = computeWebhookSignature(secret, payloadString);
+        return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+    });
+};
+
 /**
  * Dispatches an event to all active webhooks subscribed to this merchant and event type
  */
@@ -213,6 +223,8 @@ module.exports = {
     updateWebhookSchema,
     generateSigningSecret,
     computeWebhookSignature,
+    verifyWebhookSignature,
     dispatchWebhookEvent,
     resendWebhookDelivery,
 };
+
