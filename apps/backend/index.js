@@ -122,6 +122,7 @@ const getSubscribersQuerySchema = z.object({
 const createSubscriptionSchema = z.object({
     plan_id: z.string().uuid("plan_id must be a valid UUID"),
     customer_wallet_address: stellarAddressSchema,
+    metadata: z.record(z.any()).optional().default({}),
 });
 
 const triggerPullSchema = z.object({
@@ -532,7 +533,7 @@ app.post('/subscriptions', async (req, res) => {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
     }
 
-    const { plan_id, customer_wallet_address } = parseResult.data;
+    const { plan_id, customer_wallet_address, metadata } = parseResult.data;
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
 
@@ -554,9 +555,16 @@ app.post('/subscriptions', async (req, res) => {
     }, async () => {
         const nextBillingDate = new Date().toISOString();
 
+        const insertPayload = {
+            plan_id,
+            customer_wallet_address,
+            next_billing_date: nextBillingDate,
+            metadata: metadata || {},
+        };
+
         const { data, error } = await supabase
             .from('subscriptions')
-            .insert([{ plan_id, customer_wallet_address, next_billing_date: nextBillingDate }])
+            .insert([insertPayload])
             .select()
             .single();
 
