@@ -174,7 +174,36 @@ CREATE TABLE IF NOT EXISTS signing_sessions (
 );
 CREATE INDEX IF NOT EXISTS signing_sessions_merchant_status_idx ON signing_sessions (merchant_id, status);
 ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMP WITH TIME ZONE;
->>>>>>> 87fc592 (feat: implement dunning, audit logging, customer portal, and webhook inspector)
+
+-- Fiat-denominated plans & exchange rate oracle cache (#96)
+--
+-- Plans are priced either directly in USDC (raw token units in usdc_amount)
+-- or in a supported fiat currency (currency + price_amount). Fiat plans are
+-- converted to raw USDC units at the moment of pull using the newest cached
+-- oracle rate, guarded by the subscription's quoted_rate slippage limit.
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS currency VARCHAR(8) NOT NULL DEFAULT 'USDC'
+    CHECK (currency IN ('USDC', 'USD', 'EUR'));
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS price_amount NUMERIC CHECK (price_amount > 0);
+
+-- Fiat->USDC rate quoted when the subscription was created; the pull flow
+-- rejects settlements whose live rate drifted more than 2% from this quote.
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS quoted_rate NUMERIC;
+
+-- Timestamped historical exchange rate cache written by the oracle worker.
+-- One row per sync per pair; readers always take the newest row per base.
+CREATE TABLE IF NOT EXISTS exchange_rates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    base_currency VARCHAR(8) NOT NULL,
+    quote_currency VARCHAR(8) NOT NULL DEFAULT 'USDC',
+    rate NUMERIC NOT NULL CHECK (rate > 0),
+    source VARCHAR(32) NOT NULL,
+    fetched_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS exchange_rates_pair_fetched_at_idx
+    ON exchange_rates (base_currency, quote_currency, fetched_at DESC);
+-- Backend-only: service role bypasses RLS, no public policy is defined.
+ALTER TABLE exchange_rates ENABLE ROW LEVEL SECURITY;
 
 -- Atomically claims an idempotency key. Returns {"claimed": true, "record": ...}
 -- when the caller now owns the key and must execute the request, or

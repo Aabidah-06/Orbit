@@ -26,6 +26,16 @@ const {
 const { registerComplianceRoutes } = require('./compliance');
 const { registerSigningSessionRoutes } = require('./signing-sessions');
 const { registerFailureRecoveryRoutes } = require('./failure-recovery');
+const {
+    isFiatCurrency,
+    getRate,
+    calculateUsdcUnits,
+    quoteUsdcAmount,
+    getSupportedRates,
+    startOracleWorker,
+    SlippageError,
+    RateUnavailableError,
+} = require('./oracle');
 
 const app = express();
 // Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
@@ -104,15 +114,41 @@ const stellarAddressSchema = z.string().refine(
 // merchant_id is taken from the API key; a client-supplied value is only checked against it
 const optionalMerchantIdSchema = z.string().uuid("merchant_id must be a valid UUID").optional();
 
-const createPlanSchema = z.object({
+// USDC plans store raw token units (USDC has 7 decimals, so 290000000 = 29
+// USDC), same as the contract's amount_per_interval. Fiat plans (USD/EUR) store
+// a price_amount in that currency, which the exchange rate oracle converts to
+// raw USDC units at the moment of pull (#96).
+const usdcPlanSchema = z.object({
     merchant_id: optionalMerchantIdSchema,
     name: z.string().trim().min(1, "name cannot be empty"),
-    // Raw token units (USDC has 7 decimals, so 290000000 = 29 USDC), same as the contract's amount_per_interval
     usdc_amount: z.coerce.number()
         .int("usdc_amount must be an integer in raw token units")
         .positive("usdc_amount must be greater than 0"),
     interval_seconds: z.coerce.number().int().positive("interval_seconds must be a positive integer"),
+    currency: z.enum(['USDC']).default('USDC'),
 });
+
+const fiatPlanSchema = z.object({
+    merchant_id: optionalMerchantIdSchema,
+    name: z.string().trim().min(1, "name cannot be empty"),
+    price_amount: z.coerce.number()
+        .positive("price_amount must be greater than 0"),
+    interval_seconds: z.coerce.number().int().positive("interval_seconds must be a positive integer"),
+    currency: z.enum(['USD', 'EUR']),
+});
+
+// Validates the body against the schema for its pricing currency, so a USDC
+// plan still requires usdc_amount and a fiat plan still requires price_amount.
+const parseCreatePlanBody = (body) => {
+    const currencyResult = z
+        .object({ currency: z.enum(['USDC', 'USD', 'EUR']) })
+        .safeParse({ currency: body?.currency ?? 'USDC' });
+    if (!currencyResult.success) return currencyResult;
+
+    return currencyResult.data.currency === 'USDC'
+        ? usdcPlanSchema.safeParse(body)
+        : fiatPlanSchema.safeParse(body);
+};
 
 const getPlanParamsSchema = z.object({
     id: z.string().uuid("id parameter must be a valid UUID"),
@@ -171,13 +207,13 @@ const MERCHANT_MISMATCH_ERROR = { error: "merchant_id does not match the authent
 // ROUTE 1: POST /plans (Create a new pricing plan)
 // ==========================================
 app.post('/plans', authenticateMerchant, async (req, res) => {
-    const parseResult = createPlanSchema.safeParse(req.body);
+    const parseResult = parseCreatePlanBody(req.body);
     if (!parseResult.success) {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
     }
     if (merchantMismatch(req, parseResult.data.merchant_id)) return res.status(403).json(MERCHANT_MISMATCH_ERROR);
 
-    const { name, usdc_amount, interval_seconds } = parseResult.data;
+    const { name, currency, interval_seconds } = parseResult.data;
     const merchant_id = req.merchant.id;
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
@@ -188,9 +224,30 @@ app.post('/plans', authenticateMerchant, async (req, res) => {
         label: "creating plan",
         resolveMerchant: () => ({ merchantId: merchant_id }),
     }, async () => {
+        // Fiat plans: cache the current USDC equivalent for dashboards. The
+        // authoritative amount is always recalculated at the moment of pull;
+        // when the cache is cold the placeholder stays 0 until the oracle
+        // worker publishes the first rate.
+        let usdc_amount = parseResult.data.usdc_amount;
+        const price_amount = parseResult.data.price_amount;
+        if (isFiatCurrency(currency)) {
+            usdc_amount = 0;
+            try {
+                const rateInfo = await getRate({
+                    supabase,
+                    fetchImpl: app.locals.fetchImpl,
+                    currency,
+                    allowNetwork: false,
+                });
+                if (rateInfo) usdc_amount = calculateUsdcUnits({ amount: price_amount, rate: rateInfo.rate });
+            } catch (err) {
+                console.error("Error deriving plan usdc_amount from oracle cache:", err.message);
+            }
+        }
+
         const { data, error } = await supabase
             .from('plans')
-            .insert([{ merchant_id, name, usdc_amount, interval_seconds }])
+            .insert([{ merchant_id, name, currency, usdc_amount, price_amount, interval_seconds }])
             .select()
             .single();
 
@@ -278,6 +335,24 @@ app.get('/subscribers', authenticateMerchant, async (req, res) => {
 });
 
 // ==========================================
+// ROUTE: GET /rates (Exchange rate oracle)
+// ==========================================
+// Returns the supported fiat->USDC conversion pairs with their newest cached
+// rate, refreshed from the live feed on a cold cache (#96).
+app.get('/rates', async (req, res) => {
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const rates = await getSupportedRates({ supabase, fetchImpl: app.locals.fetchImpl });
+        res.status(200).json(rates);
+    } catch (err) {
+        console.error("Error fetching exchange rates:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==========================================
 // ROUTE 4: POST /trigger-pull (The Blockchain Bridge)
 // ==========================================
 // Loads a subscription owned by the authenticated merchant. Another merchant's
@@ -287,7 +362,7 @@ const loadPullContext = async (supabase, subscriptionId, merchant) => {
         .from('subscriptions')
         .select(`
             *,
-            plans ( merchant_id, usdc_amount, interval_seconds )
+            plans ( merchant_id, usdc_amount, interval_seconds, currency, price_amount )
         `)
         .eq('id', subscriptionId)
         .single();
@@ -319,58 +394,99 @@ app.post('/trigger-pull', authenticateMerchant, async (req, res) => {
             req,
             label: "preparing pull",
             resolveMerchant: () => ({ merchantId: sub.plans.merchant_id }),
-        }, () => withBillingLock({
-            supabase,
-            subscriptionId: subscription_id,
-            ttlSeconds: PREPARE_LOCK_TTL_SECONDS,
         }, async () => {
-            const ORBIT_CONTRACT_ID = process.env.ORBIT_CONTRACT_ID;
-            if (!ORBIT_CONTRACT_ID) {
-                return { status: 500, body: { error: "ORBIT_CONTRACT_ID not set in .env" } };
+            // Price the pull (#96): fiat plans convert price_amount into raw
+            // USDC units at the live rate and are rejected when the rate moved
+            // more than the slippage tolerance away from the quoted rate.
+            let pricing;
+            try {
+                pricing = await quoteUsdcAmount({
+                    supabase,
+                    plan: sub.plans,
+                    subscription: sub,
+                    fetchImpl: app.locals.fetchImpl,
+                });
+            } catch (err) {
+                if (err instanceof SlippageError) {
+                    return { status: 409, body: { error: err.message, ...err.details } };
+                }
+                if (err instanceof RateUnavailableError) {
+                    return { status: 503, body: { error: err.message } };
+                }
+                throw err;
             }
 
-            const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
-            const server = getSorobanServer(rpcUrl);
-            const contract = new Contract(ORBIT_CONTRACT_ID);
+            // A fiat subscription created while the rate cache was cold has no
+            // quote yet: store this pull's rate so the next one is guarded.
+            if (
+                isFiatCurrency(sub.plans?.currency) &&
+                pricing.rate != null &&
+                (sub.quoted_rate === null || sub.quoted_rate === undefined)
+            ) {
+                const { error: quoteError } = await supabase
+                    .from('subscriptions')
+                    .update({ quoted_rate: pricing.rate })
+                    .eq('id', subscription_id);
+                if (quoteError) console.error("Failed to persist subscription quote:", quoteError.message);
+            }
 
-            // 3. Build the Soroban Transaction
-            const account = await server.getAccount(merchant.wallet_address);
+            return withBillingLock({
+                supabase,
+                subscriptionId: subscription_id,
+                ttlSeconds: PREPARE_LOCK_TTL_SECONDS,
+            }, async () => {
+                const ORBIT_CONTRACT_ID = process.env.ORBIT_CONTRACT_ID;
+                if (!ORBIT_CONTRACT_ID) {
+                    return { status: 500, body: { error: "ORBIT_CONTRACT_ID not set in .env" } };
+                }
 
-            const tx = new TransactionBuilder(account, {
-                fee: "1000000",
-                networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET
-            })
-            .addOperation(contract.call("pull_funds",
-                Address.fromString(sub.customer_wallet_address).toScVal(),
-                Address.fromString(merchant.wallet_address).toScVal()
-            ))
-            .setTimeout(30)
-            .build();
+                const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
+                const server = getSorobanServer(rpcUrl);
+                const contract = new Contract(ORBIT_CONTRACT_ID);
 
-            // Simulate and return an unsigned envelope. The merchant signs it in their wallet.
-            const preparedTx = await server.prepareTransaction(tx);
+                // 3. Build the Soroban Transaction
+                const account = await server.getAccount(merchant.wallet_address);
 
-            await writeAuditLog(supabase, {
-                merchantId: sub.plans.merchant_id,
-                actorAddress: getActorAddress(req, merchant.wallet_address),
-                action: 'pull.prepare',
-                resourceType: 'subscription',
-                resourceId: subscription_id,
-                ipAddress: getClientIp(req),
-                changesBefore: null,
-                changesAfter: { subscription_id, merchant_address: merchant.wallet_address },
+                const tx = new TransactionBuilder(account, {
+                    fee: "1000000",
+                    networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET
+                })
+                .addOperation(contract.call("pull_funds",
+                    Address.fromString(sub.customer_wallet_address).toScVal(),
+                    Address.fromString(merchant.wallet_address).toScVal()
+                ))
+                .setTimeout(30)
+                .build();
+
+                // Simulate and return an unsigned envelope. The merchant signs it in their wallet.
+                const preparedTx = await server.prepareTransaction(tx);
+
+                await writeAuditLog(supabase, {
+                    merchantId: sub.plans.merchant_id,
+                    actorAddress: getActorAddress(req, merchant.wallet_address),
+                    action: 'pull.prepare',
+                    resourceType: 'subscription',
+                    resourceId: subscription_id,
+                    ipAddress: getClientIp(req),
+                    changesBefore: null,
+                    changesAfter: { subscription_id, merchant_address: merchant.wallet_address },
+                });
+
+                return {
+                    status: 200,
+                    body: {
+                        transaction_xdr: preparedTx.toXDR(),
+                        network_passphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+                        merchant_address: merchant.wallet_address,
+                        subscription_id,
+                        // Amount to settle this cycle (raw USDC units)
+                        usdc_amount: pricing.usdc_amount,
+                        currency: pricing.currency,
+                        rate: pricing.rate,
+                    },
+                };
             });
-
-            return {
-                status: 200,
-                body: {
-                    transaction_xdr: preparedTx.toXDR(),
-                    network_passphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
-                    merchant_address: merchant.wallet_address,
-                    subscription_id,
-                },
-            };
-        }));
+        });
         sendResult(res, result);
     } catch (err) {
         console.error("Error preparing pull:", err);
@@ -477,6 +593,25 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                     });
 
                     if (sub.plans.merchant_id) {
+                        // Fiat plans report the settled amount in raw USDC units
+                        // converted at the current cached rate (#96)
+                        let settledAmount = sub.plans.usdc_amount;
+                        if (isFiatCurrency(sub.plans?.currency)) {
+                            try {
+                                const quote = await quoteUsdcAmount({
+                                    supabase,
+                                    plan: sub.plans,
+                                    subscription: sub,
+                                    fetchImpl: app.locals.fetchImpl,
+                                    allowNetwork: false,
+                                    enforceSlippage: false,
+                                });
+                                settledAmount = quote.usdc_amount;
+                            } catch {
+                                // Keep the stored plan amount when the cache cannot price it
+                            }
+                        }
+
                         await dispatchWebhookEvent(supabase, {
                             merchantId: sub.plans.merchant_id,
                             eventType: 'payment.settled',
@@ -484,7 +619,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                                 event: 'payment.settled',
                                 subscription_id,
                                 customer_wallet_address: sub.customer_wallet_address,
-                                amount: sub.plans.usdc_amount,
+                                amount: settledAmount,
                                 txHash,
                                 settled_at: pullTime.toISOString(),
                             },
@@ -558,12 +693,45 @@ app.post('/subscriptions', async (req, res) => {
     }, async () => {
         const nextBillingDate = new Date().toISOString();
 
+        // Look up the plan so fiat plans can capture the oracle rate as their
+        // slippage quote. Non-fatal: the insert below still verifies the plan
+        // through its foreign key.
+        let planRow = null;
+        try {
+            const { data: planData, error: planLookupError } = await supabase
+                .from('plans')
+                .select('merchant_id, currency, price_amount, usdc_amount')
+                .eq('id', plan_id);
+            if (planLookupError) throw planLookupError;
+            planRow = Array.isArray(planData) ? planData[0] : planData || null;
+        } catch (err) {
+            console.error("Error loading plan for subscription:", err.message);
+        }
+
         const insertPayload = {
             plan_id,
             customer_wallet_address,
             next_billing_date: nextBillingDate,
             metadata: metadata || {},
         };
+
+        // Fiat plans: quote the fiat->USDC rate now. The pull flow later
+        // rejects settlements whose live rate moves more than 2% from it.
+        if (isFiatCurrency(planRow?.currency)) {
+            try {
+                const quote = await quoteUsdcAmount({
+                    supabase,
+                    plan: planRow,
+                    fetchImpl: app.locals.fetchImpl,
+                    allowNetwork: false,
+                    enforceSlippage: false,
+                });
+                insertPayload.quoted_rate = quote.rate;
+            } catch (err) {
+                // Cold rate cache: subscribe without a quote; the first pull stores one
+                console.error("Unable to quote subscription exchange rate:", err.message);
+            }
+        }
 
         const { data, error } = await supabase
             .from('subscriptions')
@@ -1291,6 +1459,18 @@ registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
 
 const PORT = process.env.PORT || 3001;
 if (require.main === module) {
+    // Background oracle worker (#96): refreshes the fiat->USDC rate cache on a
+    // schedule so /rates and dynamic fiat billing always read fresh quotes.
+    const oracleSupabase = getSupabase();
+    if (oracleSupabase) {
+        app.locals.oracleWorker = startOracleWorker({
+            supabase: oracleSupabase,
+            fetchImpl: app.locals.fetchImpl,
+        });
+    } else {
+        console.warn("Oracle worker not started: Supabase client not initialized");
+    }
+
     app.listen(PORT, () => {
         console.log(`Orbit Merchant API running on http://localhost:${PORT}`);
     });
