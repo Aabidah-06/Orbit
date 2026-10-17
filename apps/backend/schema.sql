@@ -147,6 +147,19 @@ CREATE INDEX webhook_deliveries_merchant_id_idx ON webhook_deliveries (merchant_
 CREATE INDEX webhook_deliveries_webhook_id_idx ON webhook_deliveries (webhook_id);
 CREATE INDEX webhook_deliveries_created_at_idx ON webhook_deliveries (created_at DESC);
 
+-- 10. Reconciliation State Table
+-- Progress markers for the ledger reconciliation worker (reconciliation.js). The
+-- 'soroban_events' row stores the getEvents cursor so a restarted worker resumes
+-- where it stopped instead of rescanning the RPC retention window.
+-- Backend-only: RLS with no policies denies anon/authenticated access.
+CREATE TABLE reconciliation_state (
+    id VARCHAR(64) PRIMARY KEY,
+    event_cursor TEXT,
+    last_ledger BIGINT,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+ALTER TABLE reconciliation_state ENABLE ROW LEVEL SECURITY;
+
 -- Secret rotation retains the previous key until in-flight deliveries expire.
 ALTER TABLE webhooks ADD COLUMN IF NOT EXISTS previous_signing_secret VARCHAR(255);
 ALTER TABLE webhooks ADD COLUMN IF NOT EXISTS secret_rotated_at TIMESTAMP WITH TIME ZONE;

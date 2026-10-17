@@ -27,6 +27,9 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `IDEMPOTENCY_KEY_TTL_SECONDS` | How long an `Idempotency-Key` replays its stored response (defaults to 24h) | `86400` |
 | `IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS` | After this long an unfinished claim is treated as abandoned and may be retried (defaults to 300) | `300` |
 | `PREPARE_LOCK_TTL_SECONDS` | Billing lease held while `/trigger-pull` simulates a pull (defaults to 60) | `60` |
+| `RECONCILE_INTERVAL_MS` | Delay between reconciliation worker runs (defaults to 60000) | `60000` |
+| `RECONCILE_EVENT_LOOKBACK_LEDGERS` | Ledgers scanned back when no event cursor is stored or it has left RPC retention (defaults to 17280, ~1 day) | `17280` |
+| `RECONCILE_GRACE_SECONDS` | Subscriptions younger than this are not checked against `get_vault` (defaults to 300) | `300` |
 | `RATE_LIMIT_WINDOW_MS` | Sliding window length for both rate limits (defaults to 60000) | `60000` |
 | `API_KEY_RATE_LIMIT_MAX` | Requests per window allowed for each API key on authenticated routes (defaults to 100) | `100` |
 | `IP_RATE_LIMIT_MAX` | Requests per window allowed for each client IP on every route (defaults to 300) | `300` |
@@ -483,6 +486,27 @@ Status: `201 Created`
 
 ---
 
+## Ledger Reconciliation Worker
+
+A subscriber can cancel their vault directly on-chain (from a wallet or block explorer), and a `/submit-pull` can lose track of a transaction that later lands. `reconciliation.js` is a background worker that keeps Supabase in line with the Soroban ledger, which is always treated as the source of truth.
+
+```bash
+cd apps/backend
+npm run reconcile             # poll every RECONCILE_INTERVAL_MS
+npm run reconcile -- --once   # single run, exits non-zero if any errors occurred (for cron)
+```
+
+Each run performs two passes:
+
+1. **Event ingestion**: reads `vault_created`, `vault_cancelled` and `funds_pulled` events for `ORBIT_CONTRACT_ID` via `getEvents`, resuming from the cursor stored in `reconciliation_state`. A `vault_cancelled` sets matching `active`/`past_due` subscriptions to `cancelled`; a `funds_pulled` sets `next_billing_date` to the pull's ledger timestamp plus the plan interval. The cursor is saved only after every event is applied.
+2. **State sweep**: calls `get_vault` (by simulation, no fees) for every `active`/`past_due` subscription older than `RECONCILE_GRACE_SECONDS`. A missing vault cancels the subscription; otherwise `next_billing_date` is realigned to `last_pull_timestamp + interval_seconds`. This catches drift whose events are already outside the RPC's retention window.
+
+Safety rules:
+
+- A failed or ambiguous lookup (RPC error, archived vault entry) is logged and never treated as a cancellation.
+- Every write takes the per-subscription billing lock, so the worker never races an in-flight `/submit-pull`; locked subscriptions are skipped and retried on the next run.
+
+Each discrepancy is logged as a JSON line with `event: "reconciliation.discrepancy"` and a `type` of `vault_missing_on_chain`, `next_billing_date_drift`, `untracked_vault` or `vault_archived`, plus the subscription id, source (`event` or `ledger_state`) and ledger/tx hash where known. Every run ends with a `reconciliation.run_completed` line carrying the metrics `events_ingested`, `subscriptions_checked`, `cancelled`, `billing_dates_updated`, `skipped_locked`, `discrepancies`, `errors` and `duration_ms`.
 ### 6. GET /rates
 
 #### Purpose
@@ -603,11 +627,12 @@ The API queries the tables defined in `apps/backend/schema.sql`:
 - `subscriptions`: `id` (UUID PK), `plan_id` (UUID FK -> `plans.id`), `customer_wallet_address` (VARCHAR), `status` (VARCHAR DEFAULT 'active'), `next_billing_date` (TIMESTAMP), `quoted_rate` (NUMERIC, fiat plans' slippage baseline), `created_at` (TIMESTAMP).
 - `idempotency_keys`: `id` (UUID PK), `key` (VARCHAR), `merchant_id` (UUID FK -> `merchants.id`, cascade), `request_path` (VARCHAR), `request_hash` (VARCHAR(64)), `status` (`in_progress` / `completed` / `failed`), `response_code` (INTEGER), `response_body` (JSONB), `created_at`, `updated_at`, `expires_at` (TIMESTAMP). Unique on `(merchant_id, key)`.
 - `billing_locks`: `subscription_id` (UUID PK, FK -> `subscriptions.id`), `lock_token` (UUID), `locked_until` (TIMESTAMP), `created_at` (TIMESTAMP).
+- `reconciliation_state`: `id` (VARCHAR PK, e.g. `soroban_events`), `event_cursor` (TEXT), `last_ledger` (BIGINT), `updated_at` (TIMESTAMP). Progress markers for the reconciliation worker.
 - `api_keys`: `id` (UUID PK), `merchant_id` (UUID FK -> `merchants.id`, cascade), `name` (VARCHAR), `key_prefix` (VARCHAR(16)), `key_hash` (VARCHAR(64), unique SHA-256 hex), `environment` (`live` / `test`), `last_used_at`, `created_at`, `revoked_at` (TIMESTAMP). Active while `revoked_at` is null.
 - `relayer_fee_usage`: `merchant_id` (UUID FK -> `merchants.id`, cascade), `usage_date` (DATE, UTC), `fee_stroops` (BIGINT), `tx_count` (INTEGER), `updated_at` (TIMESTAMP). Primary key `(merchant_id, usage_date)`. Daily sponsored fees per merchant, updated through `reserve_relayer_fee` / `adjust_relayer_fee`.
 - `exchange_rates`: `base_currency` (VARCHAR), `quote_currency` (VARCHAR DEFAULT 'USDC'), `rate` (NUMERIC), `source` (VARCHAR), `fetched_at` (TIMESTAMP). Append-only history of oracle quotes; the newest row per currency wins. Indexed on `(base_currency, quote_currency, fetched_at DESC)`.
 
-Existing databases can apply the new sections of `schema.sql` (tables 4, 5 and 6, their functions, indexes, `REVOKE`s and RLS statements) as a migration.
+Existing databases can apply the new sections of `schema.sql` (tables 4 to 10, their functions, indexes, `REVOKE`s and RLS statements) as a migration.
 
 ### Row Level Security (RLS) Policy Model
 
@@ -616,6 +641,7 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
 1. **Backend Service Role**: The backend Express API connects with `SUPABASE_SERVICE_ROLE_KEY`. The Postgres service role possesses the `BYPASSRLS` privilege, granting the backend full authority to execute queries, create plans, record subscriptions, and advance billing schedules.
 2. **Public Anon Access (Checkout Flow)**: Direct access via the public Supabase anon key is restricted to `SELECT` on `plans` and `merchants`. This allows unauthenticated checkout widgets and client browsers to inspect plan details and the merchant's recipient address.
 3. **No Public Mutations**: Open `INSERT` and `UPDATE` policies have been removed from all tables. Clients cannot directly inject plans, alter subscriptions, or create unauthorized merchant accounts with the anon key.
+4. **Subscription Confidentiality**: The `subscriptions`, `idempotency_keys`, `billing_locks`, `api_keys` and `reconciliation_state` tables have **no** policies granted to public/anon roles. Postgres default-deny prevents unauthenticated or client-side anon requests from querying subscriber lists or viewing competitor customer accounts.
 4. **Subscription Confidentiality**: The `subscriptions`, `idempotency_keys`, `billing_locks`, `api_keys` and `exchange_rates` tables have **no** policies granted to public/anon roles. Postgres default-deny prevents unauthenticated or client-side anon requests from querying subscriber lists, viewing competitor customer accounts, or rewriting the rate history.
 
 ---
