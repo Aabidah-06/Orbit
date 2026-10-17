@@ -147,6 +147,19 @@ CREATE INDEX webhook_deliveries_merchant_id_idx ON webhook_deliveries (merchant_
 CREATE INDEX webhook_deliveries_webhook_id_idx ON webhook_deliveries (webhook_id);
 CREATE INDEX webhook_deliveries_created_at_idx ON webhook_deliveries (created_at DESC);
 
+-- 10. Reconciliation State Table
+-- Progress markers for the ledger reconciliation worker (reconciliation.js). The
+-- 'soroban_events' row stores the getEvents cursor so a restarted worker resumes
+-- where it stopped instead of rescanning the RPC retention window.
+-- Backend-only: RLS with no policies denies anon/authenticated access.
+CREATE TABLE reconciliation_state (
+    id VARCHAR(64) PRIMARY KEY,
+    event_cursor TEXT,
+    last_ledger BIGINT,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+ALTER TABLE reconciliation_state ENABLE ROW LEVEL SECURITY;
+
 -- Secret rotation retains the previous key until in-flight deliveries expire.
 ALTER TABLE webhooks ADD COLUMN IF NOT EXISTS previous_signing_secret VARCHAR(255);
 ALTER TABLE webhooks ADD COLUMN IF NOT EXISTS secret_rotated_at TIMESTAMP WITH TIME ZONE;
@@ -174,17 +187,6 @@ CREATE TABLE IF NOT EXISTS signing_sessions (
 );
 CREATE INDEX IF NOT EXISTS signing_sessions_merchant_status_idx ON signing_sessions (merchant_id, status);
 ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMP WITH TIME ZONE;
-
--- 10. Reconciliation State Table
--- Progress markers for the ledger reconciliation worker (reconciliation.js). The
--- 'soroban_events' row stores the getEvents cursor so a restarted worker resumes
--- where it stopped instead of rescanning the RPC retention window.
-CREATE TABLE reconciliation_state (
-    id VARCHAR(64) PRIMARY KEY,
-    event_cursor TEXT,
-    last_ledger BIGINT,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
 
 -- Atomically claims an idempotency key. Returns {"claimed": true, "record": ...}
 -- when the caller now owns the key and must execute the request, or
@@ -325,7 +327,6 @@ ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhooks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhook_deliveries ENABLE ROW LEVEL SECURITY;
-ALTER TABLE reconciliation_state ENABLE ROW LEVEL SECURITY;
 
 -- Public checkout read access for plans and merchant public identifiers
 CREATE POLICY "Allow public read access to merchants for checkout"
@@ -336,8 +337,7 @@ CREATE POLICY "Allow public read access to plans for checkout"
     ON plans FOR SELECT
     USING (true);
 
--- No public policies for subscriptions, idempotency_keys, billing_locks, api_keys, audit_logs, webhooks,
--- webhook_deliveries or reconciliation_state:
+-- No public policies for subscriptions, idempotency_keys, billing_locks, api_keys, audit_logs, webhooks, or webhook_deliveries:
 -- default-deny prevents anon key access.
 -- No open INSERT or UPDATE policies: all mutations require backend service role.
 
