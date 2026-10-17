@@ -1,5 +1,9 @@
 # Orbit Merchant API
 
+See [Merchant operations](../../Docs/MERCHANT_OPERATIONS.md) for the persistent
+event indexer, `/health/ready`, federated `/graphql` API, wallet authentication,
+billing recovery endpoints, and required migrations for existing databases.
+
 The Orbit Merchant API (`apps/backend/index.js`) is an Express service that manages pricing plans, customer subscriptions, and automated on-chain pull executions on Stellar Soroban. Data is persisted in Supabase using the tables defined in `apps/backend/schema.sql` (`merchants`, `plans`, `subscriptions`).
 
 ## Setup and Configuration

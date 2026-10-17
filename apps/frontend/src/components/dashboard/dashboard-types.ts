@@ -56,6 +56,7 @@ export interface SubscriberRecord {
   retryCount?: number;
   nextDunningRetryAt?: string;
   recoveryLink?: string;
+  lastFailure?: { code: string; message: string; occurred_at?: string; transaction_hash?: string };
 }
 
 export interface PaymentTimelineEvent {
