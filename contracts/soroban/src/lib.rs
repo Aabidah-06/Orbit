@@ -330,6 +330,16 @@ fn write_vault(
 
     env.storage().persistent().set(&key, &vault_data);
 
+    // A replacement subscription resets payment policies, but retains the
+    // sequential badge identity previously assigned to this subscriber.
+    env.storage().persistent().remove(&SubscriptionKey::Swap(user.clone(), merchant.clone()));
+    env.storage().persistent().remove(&SubscriptionKey::EscrowPolicy(user.clone(), merchant.clone()));
+    let tier = env.storage().persistent()
+        .get::<_, BadgeData>(&SubscriptionKey::Badge(user.clone(), merchant.clone()))
+        .map(|badge| badge.tier).unwrap_or(1);
+    activate_badge(env, user, merchant, tier,
+        env.ledger().timestamp().saturating_add(interval_seconds), interval_seconds);
+
     // Emit contract event
     env.events().publish(
         (
@@ -372,6 +382,156 @@ impl OrbitContract {
         );
     }
 
+    /// Contract-native soulbound credential: no transfer or approval method
+    /// exists; third-party contracts can call this public read once per pair.
+    pub fn get_subscriber_badge(env: Env, user: Address, merchant: Address) -> Option<BadgeData> {
+        env.storage().persistent().get(&SubscriptionKey::Badge(user, merchant))
+    }
+
+    pub fn is_subscriber_active(env: Env, user: Address, merchant: Address) -> bool {
+        let key = VaultKey { user: user.clone(), merchant: merchant.clone() };
+        let vault: Option<VaultData> = env.storage().persistent().get(&key);
+        let badge: Option<BadgeData> = env.storage().persistent().get(
+            &SubscriptionKey::Badge(user, merchant));
+        match (vault, badge) {
+            (Some(vault), Some(badge)) => badge.active && !vault.is_paused
+                && env.ledger().timestamp() < badge.expiration_timestamp,
+            _ => false,
+        }
+    }
+
+    /// Merchant-assigned tier, without allowing arbitrary minting by a user.
+    pub fn set_subscriber_tier(env: Env, user: Address, merchant: Address, tier: u32) {
+        merchant.require_auth();
+        assert!(tier > 0, "Tier must be positive");
+        let key = SubscriptionKey::Badge(user.clone(), merchant.clone());
+        let mut badge: BadgeData = env.storage().persistent().get(&key)
+            .expect("Subscription badge does not exist");
+        assert!(env.storage().persistent().has(&VaultKey { user, merchant }),
+            "Vault does not exist");
+        badge.tier = tier;
+        env.storage().persistent().set(&key, &badge);
+    }
+
+    /// Permissionless keeper hook synchronizes a time-expired credential with
+    /// its packed bitmap. Validity reads also enforce expiration independently.
+    pub fn mark_subscription_default(env: Env, user: Address, merchant: Address) -> bool {
+        let key = SubscriptionKey::Badge(user.clone(), merchant.clone());
+        if let Some(badge) = env.storage().persistent().get::<_, BadgeData>(&key) {
+            if badge.active && env.ledger().timestamp() >= badge.expiration_timestamp {
+                let interval = env.storage().persistent()
+                    .get::<_, VaultData>(&VaultKey { user: user.clone(), merchant: merchant.clone() })
+                    .map(|v| v.interval_seconds).unwrap_or(DEFAULT_ESCROW_WINDOW_SECONDS);
+                deactivate_badge(&env, &user, &merchant, interval);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn get_subscriber_bitmap_chunk(env: Env, merchant: Address, chunk_index: u32) -> BytesN<32> {
+        env.storage().persistent()
+            .get(&SubscriptionKey::Bitmap(merchant, chunk_index))
+            .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
+    }
+
+    /// Configure a per-vault cross-asset exact-output Soroban AMM router.
+    /// Both parties consent to the trusted router, token choice, and cap.
+    pub fn configure_swap(
+        env: Env, user: Address, merchant: Address,
+        payment_token: Address, router: Address, max_input_amount: i128,
+    ) {
+        user.require_auth();
+        merchant.require_auth();
+        assert!(max_input_amount > 0, "Maximum input must be positive");
+        let vault: VaultData = env.storage().persistent()
+            .get(&VaultKey { user: user.clone(), merchant: merchant.clone() })
+            .expect("Vault does not exist");
+        assert!(payment_token != vault.token, "Use regular billing for same-token settlement");
+        let key = SubscriptionKey::Swap(user, merchant);
+        env.storage().persistent().set(&key, &SwapConfig {
+            payment_token, settlement_token: vault.token,
+            router, max_input_amount,
+        });
+        extend_key(&env, &key, vault.interval_seconds);
+    }
+
+    pub fn clear_swap(env: Env, user: Address, merchant: Address) {
+        user.require_auth();
+        env.storage().persistent().remove(&SubscriptionKey::Swap(user, merchant));
+    }
+
+    /// Opt into dispute-protected settlement with a pre-agreed arbitrator.
+    /// Legacy vaults continue immediate settlement for backward compatibility.
+    pub fn configure_escrow(
+        env: Env, user: Address, merchant: Address,
+        arbitrator: Address, escrow_window_seconds: u64,
+    ) {
+        user.require_auth();
+        merchant.require_auth();
+        assert!(escrow_window_seconds > 0, "Escrow window must be positive");
+        let vault: VaultData = env.storage().persistent()
+            .get(&VaultKey { user: user.clone(), merchant: merchant.clone() })
+            .expect("Vault does not exist");
+        let key = SubscriptionKey::EscrowPolicy(user, merchant);
+        env.storage().persistent().set(&key, &EscrowPolicy {
+            arbitrator, window_seconds: escrow_window_seconds,
+        });
+        extend_key(&env, &key, vault.interval_seconds.max(escrow_window_seconds));
+    }
+
+    /// Subscriber-only dispute during an open claim window. A disputed hold
+    /// cannot be claimed until the designated arbitrator resolves it.
+    pub fn raise_dispute(env: Env, user: Address, merchant: Address, pull_id: u64) {
+        user.require_auth();
+        let key = SubscriptionKey::Escrow(pull_id);
+        let mut hold: EscrowHold = env.storage().persistent().get(&key)
+            .expect("Escrow does not exist");
+        assert!(hold.user == user && hold.merchant == merchant, "Wrong escrow parties");
+        assert!(env.ledger().timestamp() < hold.release_at, "Dispute window closed");
+        assert!(!hold.disputed, "Already disputed");
+        hold.disputed = true;
+        env.storage().persistent().set(&key, &hold);
+    }
+
+    /// The escrow's designated arbitrator is the only entity authorized to
+    /// apportion funds. Percentages outside 0–100 are rejected.
+    pub fn resolve_dispute(env: Env, arbitrator: Address, pull_id: u64, refund_percentage: u32) {
+        arbitrator.require_auth();
+        assert!(refund_percentage <= 100, "Invalid refund percentage");
+        let key = SubscriptionKey::Escrow(pull_id);
+        let hold: EscrowHold = env.storage().persistent().get(&key)
+            .expect("Escrow does not exist");
+        assert!(hold.disputed, "Escrow is not disputed");
+        assert!(hold.arbitrator == arbitrator, "Unauthorized arbitrator");
+        env.storage().persistent().remove(&key);
+        let refund = (hold.amount / 100) * i128::from(refund_percentage)
+            + ((hold.amount % 100) * i128::from(refund_percentage) / 100);
+        let contract = env.current_contract_address();
+        let token = token::Client::new(&env, &hold.token);
+        if refund > 0 { token.transfer(&contract, &hold.user, &refund); }
+        if hold.amount > refund {
+            token.transfer(&contract, &hold.merchant, &(hold.amount - refund));
+        }
+    }
+
+    pub fn claim_escrow_funds(env: Env, merchant: Address, pull_id: u64) {
+        merchant.require_auth();
+        let key = SubscriptionKey::Escrow(pull_id);
+        let hold: EscrowHold = env.storage().persistent().get(&key)
+            .expect("Escrow does not exist");
+        assert!(hold.merchant == merchant, "Wrong escrow merchant");
+        assert!(!hold.disputed, "Escrow disputed");
+        assert!(env.ledger().timestamp() >= hold.release_at, "Escrow window still open");
+        env.storage().persistent().remove(&key);
+        token::Client::new(&env, &hold.token)
+            .transfer(&env.current_contract_address(), &merchant, &hold.amount);
+    }
+
+    pub fn get_escrow(env: Env, pull_id: u64) -> Option<EscrowHold> {
+        env.storage().persistent().get(&SubscriptionKey::Escrow(pull_id))
+    }
+
     /// Read the current terms for a user/merchant vault.
     /// This entrypoint requires no authorization and does not modify storage.
     pub fn get_vault(env: Env, user: Address, merchant: Address) -> Option<VaultData> {
@@ -398,7 +558,11 @@ impl OrbitContract {
         assert!(has_fixed || has_metered, "Vault does not exist");
 
         if has_fixed {
+            let vault: VaultData = env.storage().persistent().get(&key).expect("Vault missing");
+            deactivate_badge(&env, &user, &merchant, vault.interval_seconds);
             env.storage().persistent().remove(&key);
+            env.storage().persistent().remove(&SubscriptionKey::Swap(user.clone(), merchant.clone()));
+            env.storage().persistent().remove(&SubscriptionKey::EscrowPolicy(user.clone(), merchant.clone()));
         }
         if has_metered {
             env.storage().persistent().remove(&metered_key);
@@ -427,6 +591,7 @@ impl OrbitContract {
 
         vault.is_paused = true;
         env.storage().persistent().set(&key, &vault);
+        deactivate_badge(&env, &user, &merchant, vault.interval_seconds);
 
         // Emit contract event
         env.events()
@@ -457,6 +622,11 @@ impl OrbitContract {
         vault.is_paused = false;
         vault.last_pull_timestamp = env.ledger().timestamp();
         env.storage().persistent().set(&key, &vault);
+        let tier = env.storage().persistent()
+            .get::<_, BadgeData>(&SubscriptionKey::Badge(user.clone(), merchant.clone()))
+            .map(|b| b.tier).unwrap_or(1);
+        activate_badge(&env, &user, &merchant, tier,
+            env.ledger().timestamp().saturating_add(vault.interval_seconds), vault.interval_seconds);
 
         // Emit contract event
         env.events()
@@ -504,13 +674,25 @@ impl OrbitContract {
             "Pull already settled in this billing cycle"
         );
 
-        let token_client = token::Client::new(&env, &vault.token);
-        token_client.transfer_from(
-            &env.current_contract_address(),
-            &user,
-            &merchant,
-            &vault.amount_per_interval,
-        );
+        let policy_key = SubscriptionKey::EscrowPolicy(user.clone(), merchant.clone());
+        let policy: Option<EscrowPolicy> = env.storage().persistent().get(&policy_key);
+        let recipient = if policy.is_some() { env.current_contract_address() }
+            else { merchant.clone() };
+        pull_payment(&env, &user, &merchant, &vault, &recipient);
+        if let Some(policy) = policy {
+            let pull_id = store_escrow(&env, &user, &merchant, &vault, &policy);
+            extend_key(&env, &policy_key, vault.interval_seconds.max(policy.window_seconds));
+            env.events().publish(
+                (Symbol::new(&env, "escrow_held"), pull_id),
+                (user.clone(), merchant.clone(), vault.amount_per_interval),
+            );
+        }
+
+        let tier = env.storage().persistent()
+            .get::<_, BadgeData>(&SubscriptionKey::Badge(user.clone(), merchant.clone()))
+            .map(|b| b.tier).unwrap_or(1);
+        activate_badge(&env, &user, &merchant, tier,
+            current_time.saturating_add(vault.interval_seconds), vault.interval_seconds);
 
         vault.last_pull_timestamp = current_time;
         vault.pull_sequence = cycle_index;
