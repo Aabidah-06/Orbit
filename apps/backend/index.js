@@ -25,6 +25,7 @@ const {
 } = require('./dunning');
 const { registerComplianceRoutes } = require('./compliance');
 const { registerSigningSessionRoutes } = require('./signing-sessions');
+const { registerCustomerPortalRoutes } = require('./customer-portal');
 const { registerFailureRecoveryRoutes } = require('./failure-recovery');
 const {
     isFiatCurrency,
@@ -954,7 +955,7 @@ app.post('/dunning/process', async (req, res) => {
     }
 });
 
-app.post('/subscriptions/:id/recovery-link', async (req, res) => {
+app.post('/subscriptions/:id/recovery-link', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const supabase = getSupabase();
@@ -968,6 +969,10 @@ app.post('/subscriptions/:id/recovery-link', async (req, res) => {
 
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
 
         const recovery = generateRecoveryLink(id);
         res.status(200).json(recovery);
@@ -979,7 +984,7 @@ app.post('/subscriptions/:id/recovery-link', async (req, res) => {
 // ==========================================
 // ROUTE 8: CUSTOMER MANAGEMENT ACTIONS
 // ==========================================
-app.post('/subscriptions/:id/cancel', async (req, res) => {
+app.post('/subscriptions/:id/cancel', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const supabase = getSupabase();
@@ -993,6 +998,10 @@ app.post('/subscriptions/:id/cancel', async (req, res) => {
 
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
 
         const changesBefore = { status: sub.status };
         const changesAfter = { status: 'cancelled', next_dunning_retry_at: null };
@@ -1039,7 +1048,7 @@ app.post('/subscriptions/:id/cancel', async (req, res) => {
     }
 });
 
-app.post('/subscriptions/:id/refund', async (req, res) => {
+app.post('/subscriptions/:id/refund', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const { amount, reason, prorated } = req.body || {};
@@ -1054,6 +1063,10 @@ app.post('/subscriptions/:id/refund', async (req, res) => {
 
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
 
         const merchantId = sub.plans?.merchant_id;
         const refundAmount = amount ?? sub.plans?.usdc_amount;
@@ -1100,7 +1113,7 @@ app.post('/subscriptions/:id/refund', async (req, res) => {
     }
 });
 
-app.get('/subscriptions/:id/timeline', async (req, res) => {
+app.get('/subscriptions/:id/timeline', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const supabase = getSupabase();
@@ -1114,6 +1127,10 @@ app.get('/subscriptions/:id/timeline', async (req, res) => {
 
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
 
         const { data: logs } = await supabase
             .from('audit_logs')
@@ -1455,6 +1472,7 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
 
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
+registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
 
 const PORT = process.env.PORT || 3001;
