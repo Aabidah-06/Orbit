@@ -28,7 +28,7 @@ const generateRecoveryLink = (subscriptionId, options = {}) => {
     const recoveryToken = crypto.randomBytes(24).toString('hex');
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
-    const recoveryUrl = `${baseUrl}/pay/${subscriptionId}?recovery=true&token=${recoveryToken}`;
+    const recoveryUrl = `${baseUrl}/pay/${options.planId || subscriptionId}?recovery=true&token=${recoveryToken}`;
     return {
         recovery_url: recoveryUrl,
         recovery_token: recoveryToken,
@@ -59,7 +59,7 @@ const markSubscriptionPastDue = async (supabase, subscriptionId, {
 
     const nextRetryDate = calculateNextDunningRetry(0, now);
     const merchantId = sub.plans?.merchant_id;
-    const recovery = generateRecoveryLink(subscriptionId);
+    const recovery = generateRecoveryLink(subscriptionId, { planId: sub.plan_id });
 
     const changesBefore = {
         status: sub.status,

@@ -54,7 +54,10 @@ export default function HostedCheckoutPage({ params }: { params: Promise<{ id: s
         amount: Number(plan.usdc_amount), interval: Number(plan.interval_seconds), cycles: recurring ? 12 : 1 });
       const response = await fetch(`${ORBIT_API_URL}/subscriptions`, { method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ plan_id: plan.id, customer_wallet_address: address }) });
-      if (!response.ok) throw new Error((await response.json()).error || "The subscription could not be recorded.");
+      const recovering = new URLSearchParams(window.location.search).get("recovery") === "true";
+      // Recovery renews an existing allowance; the subscription stays past_due
+      // until the merchant settles a real pull. An existing record is expected.
+      if (!response.ok && !(recovering && response.status === 409)) throw new Error((await response.json()).error || "The subscription could not be recorded.");
       setTxHash(result.vaultHash);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Authorization failed."); }
     finally { setProcessing(false); }
