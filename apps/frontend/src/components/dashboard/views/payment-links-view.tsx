@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslations } from "next-intl";
 import { useState } from "react";
 import {
   Link2,
@@ -63,6 +64,7 @@ const SAMPLE_LINKS: PaymentLink[] = [
 ];
 
 export function PaymentLinksView({ businessName }: PaymentLinksViewProps) {
+  const t = useTranslations("Tables");
   const [links, setLinks] = useState<PaymentLink[]>(SAMPLE_LINKS);
   const [searchQuery, setSearchQuery] = useState("");
   const [filterType, setFilterType] = useState<"all" | "recurring" | "one_time">("all");
@@ -223,12 +225,12 @@ export function PaymentLinksView({ businessName }: PaymentLinksViewProps) {
             <table className="w-full text-left text-xs">
               <thead className="bg-neutral-50/80 border-b border-black/10 text-neutral-500 uppercase tracking-wider font-semibold text-[10px]">
                 <tr>
-                  <th className="py-3.5 px-5">Title &amp; URL</th>
-                  <th className="py-3.5 px-4">Amount &amp; Terms</th>
-                  <th className="py-3.5 px-4">Conversions</th>
-                  <th className="py-3.5 px-4">Total Collected</th>
-                  <th className="py-3.5 px-4">Status</th>
-                  <th className="py-3.5 px-5 text-right">Actions</th>
+                  <th className="py-3.5 px-5">{t("links.title")}</th>
+                  <th className="py-3.5 px-4">{t("links.amount")}</th>
+                  <th className="py-3.5 px-4">{t("links.conversions")}</th>
+                  <th className="py-3.5 px-4">{t("links.collected")}</th>
+                  <th className="py-3.5 px-4">{t("links.status")}</th>
+                  <th className="py-3.5 px-5 text-right">{t("links.actions")}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-black/5 text-neutral-700">

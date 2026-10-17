@@ -45,6 +45,8 @@ Key rules:
 - **Exhausted / Revoked**: the SAC rejects `transfer_from` once the allowance runs out, expires, or is set to 0. The subscriber can also call `cancel_vault` to delete the vault itself, after which `pull_funds` fails with `Vault does not exist`.
 
 See [Docs/ARCHITECTURE.md](Docs/ARCHITECTURE.md) for the full system design.
+See [Docs/MERCHANT_OPERATIONS.md](Docs/MERCHANT_OPERATIONS.md) for event indexing,
+GraphQL analytics, payroll review, and past-due payment resolution.
 
 ---
 

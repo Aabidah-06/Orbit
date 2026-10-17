@@ -2,10 +2,13 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useTranslations } from "next-intl";
 import { Brand } from "./brand";
 import { DOCS_URL } from "@/lib/links";
+import { LocaleSwitcher } from "./locale-switcher";
 
 export function Footer() {
+  const t = useTranslations("Footer");
   const pathname = usePathname();
 
   if (pathname?.startsWith("/dashboard") || pathname?.startsWith("/pay") || pathname?.startsWith("/docs")) {
@@ -18,47 +21,43 @@ export function Footer() {
         <div className="footer-top">
           <div>
             <Brand />
-            <p className="footer-brand-copy">
-              Non-custodial pull payments for businesses that sell, subscribe,
-              and pay globally.
-            </p>
+            <p className="footer-brand-copy">{t("tagline")}</p>
           </div>
           <div className="footer-columns">
             <div className="footer-column">
-              <h3>Product</h3>
-              <Link href="/#features">Allowance Vault</Link>
-              <Link href="/#features">Batch Payroll</Link>
-              <Link href="/#features">Recurring Pulls</Link>
-              <Link href="/pricing">Pricing Plans</Link>
+              <h3>{t("product")}</h3>
+              <Link href="/#features">{t("allowanceVault")}</Link>
+              <Link href="/#features">{t("batchPayroll")}</Link>
+              <Link href="/#features">{t("recurringPulls")}</Link>
+              <Link href="/pricing">{t("pricingPlans")}</Link>
             </div>
             <div className="footer-column">
-              <h3>Resources</h3>
-              <Link href={DOCS_URL}>Documentation</Link>
-              <Link href={`${DOCS_URL}/api-reference/overview`}>API Reference</Link>
-              <Link href="/get-started">Developer Playground</Link>
-              <Link href={`${DOCS_URL}/quickstart`}>SDK Quickstart</Link>
+              <h3>{t("resources")}</h3>
+              <Link href={DOCS_URL}>{t("documentation")}</Link>
+              <Link href={`${DOCS_URL}/api-reference/overview`}>{t("apiReference")}</Link>
+              <Link href="/get-started">{t("developerPlayground")}</Link>
+              <Link href={`${DOCS_URL}/quickstart`}>{t("sdkQuickstart")}</Link>
             </div>
             <div className="footer-column">
-              <h3>Company</h3>
-              <Link href="/docs">About Orbit</Link>
-              <Link href="/docs">Brand Guidelines</Link>
-              <Link href="/docs">Release Notes</Link>
-              <Link href="/docs">Network Status</Link>
+              <h3>{t("company")}</h3>
+              <Link href="/docs">{t("aboutOrbit")}</Link>
+              <Link href="/docs">{t("brandGuidelines")}</Link>
+              <Link href="/docs">{t("releaseNotes")}</Link>
+              <Link href="/docs">{t("networkStatus")}</Link>
             </div>
             <div className="footer-column">
-              <h3>Legal</h3>
-              <Link href="/docs">Privacy Policy</Link>
-              <Link href="/docs">Terms of Service</Link>
-              <Link href="/docs">Security Disclosures</Link>
+              <h3>{t("legal")}</h3>
+              <Link href="/docs">{t("privacyPolicy")}</Link>
+              <Link href="/docs">{t("termsOfService")}</Link>
+              <Link href="/docs">{t("securityDisclosures")}</Link>
             </div>
           </div>
         </div>
 
         <div className="footer-bottom">
-          <span>© Orbit Technologies 2026. All rights reserved.</span>
-          <span className="mono">
-            PROGRAMMABLE PULL PAYMENT PROTOCOL
-          </span>
+          <span>{t("copyright")}</span>
+          <LocaleSwitcher />
+          <span className="mono">{t("protocol")}</span>
         </div>
       </div>
     </footer>
