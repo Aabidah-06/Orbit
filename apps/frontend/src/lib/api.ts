@@ -9,6 +9,13 @@ import { fromRawUsdc } from "@/lib/usdc";
 export const ORBIT_API_URL =
   process.env.NEXT_PUBLIC_ORBIT_API_URL || "http://localhost:3001";
 
+// Keep the merchant credential in memory; never place a secret in localStorage.
+let merchantApiKey = "";
+export function setMerchantApiKey(key: string) { merchantApiKey = key.trim(); }
+export function merchantRequestHeaders(): Record<string, string> {
+  return { "Content-Type": "application/json", ...(merchantApiKey ? { Authorization: `Bearer ${merchantApiKey}` } : {}) };
+}
+
 export interface ApiSubscriptionItem {
   id: string;
   plan_id: string;
@@ -19,6 +26,7 @@ export interface ApiSubscriptionItem {
   retry_count?: number;
   dunning_status?: string;
   next_dunning_retry_at?: string;
+  last_failure?: { code: string; message: string; occurred_at?: string; transaction_hash?: string };
   plans?: {
     merchant_id?: string;
     name?: string;
@@ -58,13 +66,12 @@ export async function fetchSubscribers(
   signal?: AbortSignal
 ): Promise<ApiSubscriptionItem[]> {
   const url = new URL("/subscribers", ORBIT_API_URL);
-  url.searchParams.set("merchant_id", merchantId);
+  // The API key determines the merchant; dashboard session IDs are local profiles.
+  void merchantId;
 
   const res = await fetch(url.toString(), {
     method: "GET",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: merchantRequestHeaders(),
     signal,
   });
 
@@ -138,6 +145,7 @@ export function mapApiSubscriberToRecord(
     dunningStatus: item.dunning_status,
     retryCount: item.retry_count,
     nextDunningRetryAt: item.next_dunning_retry_at,
+    lastFailure: item.last_failure,
   };
 }
 
@@ -196,7 +204,7 @@ export async function generateRecoveryLink(
   const url = new URL(`/subscriptions/${subscriptionId}/recovery-link`, ORBIT_API_URL);
   const res = await fetch(url.toString(), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: merchantRequestHeaders(),
   });
   return handleResponse(res, "Failed to generate recovery link");
 }

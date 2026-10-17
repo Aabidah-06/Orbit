@@ -443,6 +443,17 @@ describe('Merchant API Route Validation & Responses', () => {
         );
       });
 
+      it('persists the specific simulation failure for the resolution dialog', async () => {
+        mockServer.prepareTransaction.mockRejectedValue(new Error('insufficient balance'));
+        const response = await request(app).post('/trigger-pull').set('Authorization', apiKey.header)
+          .send({ subscription_id: validSubscriptionId });
+        expect(response.status).toBe(500);
+        expect(mockSupabase.update).toHaveBeenCalledWith({ last_failure: expect.objectContaining({
+          code: 'insufficient_balance', message: 'insufficient balance',
+        }) });
+        expect(mockServer.sendTransaction).not.toHaveBeenCalled();
+      });
+
       it('marks the subscription past_due and returns an error when the transaction fails', async () => {
         mockServer.getTransaction.mockResolvedValue({ status: 'FAILED' });
         const signed_xdr = await prepareAndSign();
@@ -466,7 +477,10 @@ describe('Merchant API Route Validation & Responses', () => {
 
         expect(res.status).toBe(202);
         expect(res.body.txHash).toBe('deadbeef');
-        expect(mockSupabase.update).not.toHaveBeenCalled();
+        expect(mockSupabase.update).toHaveBeenCalledWith({ last_failure: expect.objectContaining({
+          code: 'rpc_timeout', transaction_hash: 'deadbeef',
+        }) });
+        expect(mockSupabase.update).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'active' }));
       });
 
       it('refuses an unsigned transaction', async () => {

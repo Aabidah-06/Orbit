@@ -700,10 +700,8 @@ fn test_contract_events_published_for_all_entrypoints() {
         merchant.clone().to_val(),
     ];
     let pull_data = (amount, 5000u64).into_val(&env);
-    let expected_pull = soroban_sdk::vec![
-        &env,
-        (orbit_client.address.clone(), pull_topics, pull_data),
-    ];
+    let expected_pull =
+        soroban_sdk::vec![&env, (orbit_client.address.clone(), pull_topics, pull_data),];
     assert_eq!(
         env.events().all().filter_by_contract(&orbit_client.address),
         expected_pull
@@ -896,6 +894,134 @@ fn test_cancel_vault_event_published() {
     assert_eq!(env.events().all(), expected_cancel);
 }
 
+#[test]
+fn test_failed_pull_enters_grace_and_settled_pull_restores_active() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&user, &100);
+    let contract_id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&user, &client.address, &100, &2000);
+    client.create_vault_with_grace_period(&user, &merchant, &token, &10, &100, &50);
+
+    env.ledger().set_timestamp(101);
+    client.record_failed_pull(&merchant, &user);
+    assert_eq!(client.get_vault(&user, &merchant).unwrap().payment_status, PAYMENT_GRACE_PERIOD);
+
+    client.pull_funds(&user, &merchant);
+    assert_eq!(client.get_vault(&user, &merchant).unwrap().payment_status, PAYMENT_ACTIVE);
+    assert_eq!(token_client.balance(&merchant), 10);
+}
+
+#[test]
+fn test_failed_pull_defaults_and_defaulted_pull_is_blocked() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let contract_id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &contract_id);
+    client.create_vault_with_grace_period(&user, &merchant, &token, &10, &100, &50);
+    env.ledger().set_timestamp(150);
+    client.record_failed_pull(&merchant, &user);
+    assert_eq!(client.get_vault(&user, &merchant).unwrap().payment_status, PAYMENT_DEFAULTED);
+    assert!(client.try_pull_funds(&user, &merchant).is_err());
+    client.merchant_cancel_vault(&merchant, &user);
+    assert_eq!(client.get_vault(&user, &merchant), None);
+}
+
+#[test]
+fn test_merchant_cancel_and_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&merchant, &100);
+    let contract_id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &contract_id);
+    client.create_vault(&user, &merchant, &token, &10, &100);
+    client.merchant_cancel_vault(&merchant, &user);
+    assert_eq!(client.get_vault(&user, &merchant), None);
+    token_client.approve(&merchant, &client.address, &25, &2000);
+    client.refund_subscriber(&merchant, &user, &token, &25);
+    assert_eq!(token_client.balance(&user), 25);
+}
+
+#[test]
+fn test_update_vault_terms_preserves_last_pull_and_uses_new_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&user, &100);
+    let contract_id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&user, &client.address, &100, &2000);
+    client.create_vault(&user, &merchant, &token, &10, &100);
+    env.ledger().set_timestamp(10);
+    client.pull_funds(&user, &merchant);
+    client.update_vault_terms(&user, &merchant, &25, &200);
+    let vault = client.get_vault(&user, &merchant).unwrap();
+    assert_eq!(vault.last_pull_timestamp, 10);
+    assert_eq!(vault.amount_per_interval, 25);
+    env.ledger().set_timestamp(210);
+    client.pull_funds(&user, &merchant);
+    assert_eq!(token_client.balance(&merchant), 35);
+}
+
+#[test]
+fn test_stream_withdraws_linearly_and_at_completion() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&sender, &100);
+    let contract_id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&sender, &client.address, &100, &2000);
+    let stream_id = client.create_stream(&sender, &recipient, &token, &100, &100, &200);
+    assert_eq!(token_client.balance(&sender), 0);
+    env.ledger().set_timestamp(150);
+    client.withdraw_from_stream(&stream_id, &25);
+    assert_eq!(token_client.balance(&recipient), 25);
+    env.ledger().set_timestamp(200);
+    client.withdraw_from_stream(&stream_id, &75);
+    assert_eq!(token_client.balance(&recipient), 100);
+}
+
+#[test]
+fn test_stream_early_cancel_splits_vested_and_unvested_amounts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&sender, &100);
+    let contract_id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&sender, &client.address, &100, &2000);
+    let stream_id = client.create_stream(&sender, &recipient, &token, &100, &100, &200);
+    env.ledger().set_timestamp(120);
+    client.cancel_stream(&stream_id);
+    assert_eq!(token_client.balance(&recipient), 20);
+    assert_eq!(token_client.balance(&sender), 80);
 // ----------------------------------------------------------------------------
 // ISSUE #93: SUBSCRIPTION PAUSE & RESUME
 // ----------------------------------------------------------------------------
@@ -1447,7 +1573,12 @@ fn test_register_plan_rejects_plan_id_owned_by_another_merchant() {
 
     // The owner can refresh the terms, which also reactivates the plan
     orbit_client.deactivate_plan(&merchant_a, &plan_id);
-    assert!(!orbit_client.get_plan(&plan_id).expect("plan exists").is_active);
+    assert!(
+        !orbit_client
+            .get_plan(&plan_id)
+            .expect("plan exists")
+            .is_active
+    );
 
     orbit_client.register_plan(&merchant_a, &plan_id, &token, &40_0000000, &172800, &name);
     let plan = orbit_client.get_plan(&plan_id).expect("plan should exist");
@@ -1484,7 +1615,12 @@ fn test_deactivate_plan_requires_owning_merchant() {
         }])
         .try_deactivate_plan(&other, &plan_id);
     assert!(res.is_err());
-    assert!(orbit_client.get_plan(&plan_id).expect("plan exists").is_active);
+    assert!(
+        orbit_client
+            .get_plan(&plan_id)
+            .expect("plan exists")
+            .is_active
+    );
 }
 
 #[test]
@@ -1538,7 +1674,12 @@ fn test_deactivate_plan_blocks_new_vaults_but_existing_vaults_keep_billing() {
 
     // Merchant deactivates the plan: no NEW subscriptions, existing ones live
     orbit_client.deactivate_plan(&merchant, &plan_id);
-    assert!(!orbit_client.get_plan(&plan_id).expect("plan exists").is_active);
+    assert!(
+        !orbit_client
+            .get_plan(&plan_id)
+            .expect("plan exists")
+            .is_active
+    );
 
     let res = orbit_client.try_create_vault_from_plan(&new_user, &plan_id);
     assert!(res.is_err());
@@ -1949,4 +2090,221 @@ fn test_metered_events_published_for_creation_and_pulls() {
         env.events().all().filter_by_contract(&orbit_client.address),
         soroban_sdk::vec![&env, (orbit_client.address.clone(), pull_topics, pull_data)]
     );
+}
+
+// ----------------------------------------------------------------------------
+// #123–126: Soulbound credentials, bitmap registry, swap and escrow settlement
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_badge_issuance_renewal_expiration_and_revocation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token = TokenClient::new(&env, &token_id);
+    StellarAssetClient::new(&env, &token_id).mint(&user, &1_000);
+    let id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &id);
+    token.approve(&user, &id, &1_000, &2_000_000);
+
+    client.create_vault(&user, &merchant, &token_id, &100, &100);
+    let original = client.get_subscriber_badge(&user, &merchant).unwrap();
+    assert!(original.active);
+    assert_eq!(original.tier, 1);
+    assert_eq!(original.subscriber_id, 0);
+    assert_eq!(original.expiration_timestamp, 100);
+    assert!(client.is_subscriber_active(&user, &merchant));
+    assert_eq!(
+        client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0],
+        1
+    );
+
+    client.set_subscriber_tier(&user, &merchant, &3);
+    env.ledger().set_timestamp(20);
+    client.pull_funds(&user, &merchant);
+    let renewed = client.get_subscriber_badge(&user, &merchant).unwrap();
+    assert_eq!(renewed.tier, 3);
+    assert_eq!(renewed.expiration_timestamp, 120);
+    env.ledger().set_timestamp(121);
+    assert!(!client.is_subscriber_active(&user, &merchant));
+    assert!(client.mark_subscription_default(&user, &merchant));
+    assert!(
+        !client
+            .get_subscriber_badge(&user, &merchant)
+            .unwrap()
+            .active
+    );
+    assert_eq!(
+        client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0],
+        0
+    );
+
+    client.cancel_vault(&user, &merchant);
+    client.create_vault(&user, &merchant, &token_id, &100, &100);
+    assert_eq!(
+        client
+            .get_subscriber_badge(&user, &merchant)
+            .unwrap()
+            .subscriber_id,
+        0
+    );
+    assert_eq!(
+        client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0],
+        1
+    );
+    client.cancel_vault(&user, &merchant);
+    assert!(!client.is_subscriber_active(&user, &merchant));
+    assert_eq!(
+        client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0],
+        0
+    );
+}
+
+#[test]
+fn test_bitmap_chunk_boundary_and_neighbor_integrity() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &id);
+    let mut users = Vec::<Address>::new(&env);
+    for _ in 0..258 {
+        let user = Address::generate(&env);
+        client.create_vault(&user, &merchant, &token, &10, &86400);
+        users.push_back(user);
+    }
+    let first = client.get_subscriber_bitmap_chunk(&merchant, &0).to_array();
+    let second = client.get_subscriber_bitmap_chunk(&merchant, &1).to_array();
+    assert_eq!(first, [255u8; 32]);
+    assert_eq!(second[0], 3);
+    assert_eq!(second[1], 0);
+
+    client.cancel_vault(&users.get(255).unwrap(), &merchant);
+    client.cancel_vault(&users.get(256).unwrap(), &merchant);
+    let first = client.get_subscriber_bitmap_chunk(&merchant, &0).to_array();
+    let second = client.get_subscriber_bitmap_chunk(&merchant, &1).to_array();
+    assert_eq!(first[31], 127);
+    assert_eq!(first[30], 255);
+    assert_eq!(second[0], 2);
+    assert!(client.is_subscriber_active(&users.get(257).unwrap(), &merchant));
+}
+
+#[test]
+fn test_escrow_claim_dispute_and_partial_arbitration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token = TokenClient::new(&env, &token_id);
+    StellarAssetClient::new(&env, &token_id).mint(&user, &1_000);
+    let id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &id);
+    token.approve(&user, &id, &1_000, &2_000_000);
+    client.create_vault(&user, &merchant, &token_id, &100, &100);
+    client.configure_escrow(&user, &merchant, &arbitrator, &30);
+
+    env.ledger().set_timestamp(10);
+    client.pull_funds(&user, &merchant);
+    assert_eq!(token.balance(&merchant), 0);
+    assert_eq!(token.balance(&id), 100);
+    assert_eq!(client.get_escrow(&0).unwrap().release_at, 40);
+    assert!(client.try_claim_escrow_funds(&merchant, &0).is_err());
+    client.raise_dispute(&user, &merchant, &0);
+    env.ledger().set_timestamp(41);
+    assert!(client.try_claim_escrow_funds(&merchant, &0).is_err());
+    assert!(client.try_resolve_dispute(&user, &0, &50).is_err());
+    assert!(client.try_resolve_dispute(&arbitrator, &0, &101).is_err());
+    client.resolve_dispute(&arbitrator, &0, &25);
+    assert_eq!(token.balance(&user), 925);
+    assert_eq!(token.balance(&merchant), 75);
+    assert!(client.get_escrow(&0).is_none());
+
+    env.ledger().set_timestamp(110);
+    client.pull_funds(&user, &merchant);
+    assert_eq!(token.balance(&merchant), 75);
+    assert!(client.try_claim_escrow_funds(&merchant, &1).is_err());
+    env.ledger().set_timestamp(141);
+    client.claim_escrow_funds(&merchant, &1);
+    assert_eq!(token.balance(&merchant), 175);
+    assert!(client.get_escrow(&1).is_none());
+}
+
+#[soroban_sdk::contract]
+pub struct TestExactOutputRouter;
+
+#[soroban_sdk::contractimpl]
+impl TestExactOutputRouter {
+    pub fn swap_exact_output(
+        env: Env,
+        payment_token: Address,
+        settlement_token: Address,
+        amount_out: i128,
+        max_amount_in: i128,
+        recipient: Address,
+    ) -> i128 {
+        let spent = amount_out.checked_mul(2).unwrap();
+        assert!(
+            spent <= max_amount_in,
+            "Insufficient max input for router quote"
+        );
+        let router = env.current_contract_address();
+        token::Client::new(&env, &settlement_token).transfer(&router, &recipient, &amount_out);
+        if max_amount_in > spent {
+            token::Client::new(&env, &payment_token).transfer(
+                &router,
+                &recipient,
+                &(max_amount_in - spent),
+            );
+        }
+        spent
+    }
+}
+
+#[test]
+fn test_cross_asset_swap_exact_output_refund_and_slippage_rejection() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let payment = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let settlement = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let payment_token = TokenClient::new(&env, &payment);
+    let settlement_token = TokenClient::new(&env, &settlement);
+    StellarAssetClient::new(&env, &payment).mint(&user, &1_000);
+    let router = env.register(TestExactOutputRouter, ());
+    StellarAssetClient::new(&env, &settlement).mint(&router, &1_000);
+    let id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &id);
+    payment_token.approve(&user, &id, &1_000, &2_000_000);
+    client.create_vault(&user, &merchant, &settlement, &100, &100);
+    client.configure_swap(&user, &merchant, &payment, &router, &250);
+    env.ledger().set_timestamp(20);
+    client.pull_funds(&user, &merchant);
+    assert_eq!(payment_token.balance(&user), 800);
+    assert_eq!(payment_token.balance(&router), 200);
+    assert_eq!(settlement_token.balance(&merchant), 100);
+    assert_eq!(settlement_token.balance(&id), 0);
+
+    // Change the authorized quote cap to below the router's input requirement.
+    client.configure_swap(&user, &merchant, &payment, &router, &150);
+    env.ledger().set_timestamp(121);
+    assert!(client.try_pull_funds(&user, &merchant).is_err());
+    assert_eq!(payment_token.balance(&user), 800);
+    assert_eq!(settlement_token.balance(&merchant), 100);
 }

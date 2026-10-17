@@ -27,6 +27,9 @@ const { registerComplianceRoutes } = require('./compliance');
 const { registerSigningSessionRoutes } = require('./signing-sessions');
 const { registerFailureRecoveryRoutes } = require('./failure-recovery');
 const { registerCouponRoutes, normalizeCode } = require('./coupons');
+const { registerGraphql } = require('./graphql');
+const { configuredIndexer, registerIndexerRoutes } = require('./ledger-indexer');
+const { recordPullFailure, registerBillingResolutionRoutes } = require('./billing-resolution');
 const {
     isFiatCurrency,
     getRate,
@@ -386,6 +389,7 @@ app.post('/trigger-pull', authenticateMerchant, async (req, res) => {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
     }
 
+    let ownedSubscriptionId;
     try {
         const { subscription_id } = parseResult.data;
         const supabase = getSupabase();
@@ -394,6 +398,7 @@ app.post('/trigger-pull', authenticateMerchant, async (req, res) => {
         const context = await loadPullContext(supabase, subscription_id, req.merchant);
         if (context.error) return res.status(context.status).json({ error: context.error });
         const { sub, merchant } = context;
+        ownedSubscriptionId = subscription_id;
 
         const result = await executeIdempotently({
             supabase,
@@ -493,9 +498,11 @@ app.post('/trigger-pull', authenticateMerchant, async (req, res) => {
                 };
             });
         });
+        if (result.status >= 500) await recordPullFailure(supabase, subscription_id, result.body?.error || 'Pull preparation failed');
         sendResult(res, result);
     } catch (err) {
         console.error("Error preparing pull:", err);
+        if (ownedSubscriptionId) await recordPullFailure(getSupabase(), ownedSubscriptionId, err.message).catch(console.error);
         res.status(500).json({ error: err.message });
     }
 });
@@ -505,6 +512,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
     const parseResult = submitPullSchema.safeParse(req.body);
     if (!parseResult.success) return res.status(400).json({ error: formatZodError(parseResult.error) });
 
+    let ownedSubscriptionId;
     try {
         const { subscription_id, signed_xdr } = parseResult.data;
         const supabase = getSupabase();
@@ -512,6 +520,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
         const context = await loadPullContext(supabase, subscription_id, req.merchant);
         if (context.error) return res.status(context.status).json({ error: context.error });
         const { sub, merchant } = context;
+        ownedSubscriptionId = subscription_id;
 
         const pollTimeoutMs = app.locals.txPollTimeoutMs ?? TX_POLL_TIMEOUT_MS;
 
@@ -584,6 +593,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                             retry_count: 0,
                             dunning_status: null,
                             next_dunning_retry_at: null,
+                            last_failure: null,
                         })
                         .eq('id', subscription_id);
 
@@ -595,7 +605,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                         resourceId: subscription_id,
                         ipAddress: getClientIp(req),
                         changesBefore: { next_billing_date: sub.next_billing_date, status: sub.status },
-                        changesAfter: { next_billing_date: nextBilling.toISOString(), status: 'active', txHash },
+                        changesAfter: { next_billing_date: nextBilling.toISOString(), status: 'active', txHash, amount: String(sub.plans.usdc_amount) },
                     });
 
                     if (sub.plans.merchant_id) {
@@ -640,6 +650,12 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                 }
 
                 if (confirmation.status === "FAILED") {
+                    let failureReason = 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.';
+                    try {
+                        const simulation = await server.simulateTransaction(signedTx);
+                        if (simulation.error) failureReason = simulation.error;
+                    } catch { /* keep the original failure when RPC diagnostics are unavailable */ }
+                    await recordPullFailure(supabase, subscription_id, failureReason, txHash);
                     await markSubscriptionPastDue(supabase, subscription_id, {
                         actorAddress: merchant.wallet_address,
                         ipAddress: getClientIp(req),
@@ -654,6 +670,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
 
                 // Still NOT_FOUND after the timeout: outcome unknown, let the caller poll later.
                 // Keep the lease until it expires so no second pull races the one still in flight.
+                await recordPullFailure(supabase, subscription_id, 'RPC timeout: transaction submitted but not yet confirmed. Do not retry until its outcome is known.', txHash);
                 return {
                     status: 202,
                     body: { message: "Transaction submitted but not yet confirmed; check back later", txHash },
@@ -661,9 +678,11 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                 };
             });
         });
+        if (result.status >= 500 && !result.body?.txHash) await recordPullFailure(supabase, subscription_id, result.body?.error || 'Pull submission failed');
         sendResult(res, result);
     } catch (err) {
         console.error("Error submitting pull:", err);
+        if (ownedSubscriptionId) await recordPullFailure(getSupabase(), ownedSubscriptionId, err.message).catch(console.error);
         res.status(500).json({ error: err.message });
     }
 });
@@ -975,7 +994,7 @@ app.post('/dunning/process', async (req, res) => {
     }
 });
 
-app.post('/subscriptions/:id/recovery-link', async (req, res) => {
+app.post('/subscriptions/:id/recovery-link', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const supabase = getSupabase();
@@ -990,7 +1009,9 @@ app.post('/subscriptions/:id/recovery-link', async (req, res) => {
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
 
-        const recovery = generateRecoveryLink(id);
+        if (sub.plans?.merchant_id !== req.merchant.id) return res.status(404).json({ error: 'Subscription not found' });
+
+        const recovery = generateRecoveryLink(id, { planId: sub.plan_id });
         res.status(200).json(recovery);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1478,9 +1499,16 @@ registerComplianceRoutes(app, getSupabase, authenticateMerchant);
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
 registerCouponRoutes(app, getSupabase, authenticateMerchant);
+registerBillingResolutionRoutes(app, getSupabase, authenticateMerchant, loadPullContext, getSorobanServer);
+registerIndexerRoutes(app);
+app.locals.graphqlServer = registerGraphql(app, getSupabase, authenticateMerchant);
 
 const PORT = process.env.PORT || 3001;
 if (require.main === module) {
+    if (getSupabase() && process.env.INDEXER_START_LEDGER) {
+        app.locals.ledgerIndexer = configuredIndexer(getSupabase());
+        app.locals.indexerWorker = app.locals.ledgerIndexer.start(Number(process.env.INDEXER_INTERVAL_MS) || 5000);
+    }
     // Background oracle worker (#96): refreshes the fiat->USDC rate cache on a
     // schedule so /rates and dynamic fiat billing always read fresh quotes.
     const oracleSupabase = getSupabase();

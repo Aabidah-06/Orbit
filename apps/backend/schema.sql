@@ -468,3 +468,153 @@ REVOKE ALL ON FUNCTION redeem_coupon_subscription(UUID, VARCHAR, JSONB, VARCHAR,
 GRANT EXECUTE ON FUNCTION redeem_coupon_subscription(UUID, VARCHAR, JSONB, VARCHAR, NUMERIC)
     TO service_role;
 
+-- 101-ledger-checkpoints.sql
+-- Apply once to existing Supabase projects before enabling the indexer.
+CREATE TABLE IF NOT EXISTS ledger_checkpoints (
+    stream_id TEXT PRIMARY KEY,
+    last_processed_ledger_sequence BIGINT NOT NULL CHECK (last_processed_ledger_sequence >= 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS contract_events (
+    stream_id TEXT NOT NULL REFERENCES ledger_checkpoints(stream_id),
+    id TEXT NOT NULL,
+    ledger_sequence BIGINT NOT NULL,
+    transaction_hash TEXT NOT NULL,
+    contract_id TEXT NOT NULL,
+    event_name TEXT NOT NULL,
+    merchant_address TEXT,
+    topics JSONB NOT NULL,
+    value JSONB NOT NULL,
+    closed_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (stream_id, id)
+);
+CREATE INDEX IF NOT EXISTS contract_events_merchant_ledger_idx ON contract_events (merchant_address, ledger_sequence);
+ALTER TABLE ledger_checkpoints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE contract_events ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION commit_ledger_batch(
+    p_stream_id TEXT, p_expected_sequence BIGINT, p_last_sequence BIGINT, p_events JSONB
+) RETURNS VOID LANGUAGE plpgsql AS $$
+DECLARE v_saved BIGINT;
+BEGIN
+    IF p_expected_sequence < 0 OR p_last_sequence <= p_expected_sequence THEN
+        RAISE EXCEPTION 'Invalid checkpoint range';
+    END IF;
+    INSERT INTO ledger_checkpoints (stream_id, last_processed_ledger_sequence)
+        VALUES (p_stream_id, p_expected_sequence) ON CONFLICT DO NOTHING;
+    SELECT last_processed_ledger_sequence INTO v_saved FROM ledger_checkpoints
+        WHERE stream_id = p_stream_id FOR UPDATE;
+    IF v_saved <> p_expected_sequence THEN
+        RAISE EXCEPTION 'Checkpoint changed; reload before retrying';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_array_elements(p_events) e
+        WHERE (e->>'ledger_sequence')::BIGINT <= p_expected_sequence
+           OR (e->>'ledger_sequence')::BIGINT > p_last_sequence) THEN
+        RAISE EXCEPTION 'Event outside checkpoint range';
+    END IF;
+    INSERT INTO contract_events (stream_id, id, ledger_sequence, transaction_hash,
+        contract_id, event_name, merchant_address, topics, value, closed_at)
+    SELECT p_stream_id, e.id, e.ledger_sequence, e.transaction_hash, e.contract_id,
+        e.event_name, e.merchant_address, e.topics, e.value, e.closed_at
+    FROM jsonb_to_recordset(p_events) AS e(id TEXT, ledger_sequence BIGINT,
+        transaction_hash TEXT, contract_id TEXT, event_name TEXT, merchant_address TEXT,
+        topics JSONB, value JSONB, closed_at TIMESTAMPTZ)
+    ON CONFLICT (stream_id, id) DO NOTHING;
+    UPDATE ledger_checkpoints SET last_processed_ledger_sequence = p_last_sequence,
+        updated_at = NOW() WHERE stream_id = p_stream_id;
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION commit_ledger_batch(TEXT, BIGINT, BIGINT, JSONB) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION commit_ledger_batch(TEXT, BIGINT, BIGINT, JSONB) TO service_role;
+
+-- 102-merchant-analytics.sql
+-- Batches nested payment pages in one query. Payment amounts are raw USDC units.
+CREATE OR REPLACE FUNCTION graphql_subscription_payments(p_merchant_id UUID, p_requests JSONB)
+RETURNS TABLE(request_index INTEGER, payment JSONB) LANGUAGE sql STABLE AS $$
+    SELECT (r.ordinality - 1)::INTEGER, to_jsonb(a)
+    FROM jsonb_array_elements(p_requests) WITH ORDINALITY r(request, ordinality)
+    CROSS JOIN LATERAL (
+        SELECT * FROM audit_logs a WHERE a.merchant_id = p_merchant_id
+          AND a.action = 'pull.execute' AND a.resource_type = 'subscription'
+          AND a.resource_id = r.request->>'id'
+        ORDER BY a.created_at DESC, a.id
+        LIMIT LEAST(GREATEST((r.request->>'limit')::INTEGER, 1), 100)
+        OFFSET LEAST(GREATEST((r.request->>'offset')::INTEGER, 0), 100000)
+    ) a;
+$$;
+
+CREATE OR REPLACE FUNCTION merchant_analytics(p_merchant_id UUID, p_from TIMESTAMPTZ, p_to TIMESTAMPTZ)
+RETURNS JSONB LANGUAGE sql STABLE AS $$
+    SELECT jsonb_build_object(
+        'activeSubscribers', (SELECT COUNT(*) FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+            WHERE p.merchant_id = p_merchant_id AND s.status = 'active'),
+        'settledPayments', COUNT(*),
+        'settledAmount', COALESCE(SUM((changes_after->>'amount')::NUMERIC), 0)::TEXT
+    ) FROM audit_logs WHERE merchant_id = p_merchant_id AND action = 'pull.execute'
+        AND created_at >= p_from AND created_at < p_to;
+$$;
+REVOKE EXECUTE ON FUNCTION graphql_subscription_payments(UUID, JSONB) FROM PUBLIC, anon, authenticated;
+REVOKE EXECUTE ON FUNCTION merchant_analytics(UUID, TIMESTAMPTZ, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION graphql_subscription_payments(UUID, JSONB) TO service_role;
+GRANT EXECUTE ON FUNCTION merchant_analytics(UUID, TIMESTAMPTZ, TIMESTAMPTZ) TO service_role;
+
+-- 105-billing-resolution.sql
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS last_failure JSONB;
+
+-- The audit record and billing-date advancement either both commit or both roll back.
+CREATE OR REPLACE FUNCTION waive_subscription_interval(p_subscription_id UUID, p_merchant_id UUID, p_actor_address TEXT)
+RETURNS JSONB LANGUAGE plpgsql AS $$
+DECLARE v_sub subscriptions; v_interval BIGINT; v_before JSONB;
+BEGIN
+    SELECT s.* INTO v_sub FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+        WHERE s.id = p_subscription_id AND p.merchant_id = p_merchant_id FOR UPDATE OF s;
+    IF NOT FOUND OR v_sub.status <> 'past_due' THEN RETURN NULL; END IF;
+    IF v_sub.last_failure->>'code' = 'rpc_timeout' AND v_sub.last_failure->>'transaction_hash' IS NOT NULL THEN RETURN NULL; END IF;
+    SELECT interval_seconds INTO v_interval FROM plans WHERE id = v_sub.plan_id;
+    v_before := to_jsonb(v_sub);
+    UPDATE subscriptions SET status = 'active', retry_count = 0,
+        dunning_status = NULL, next_dunning_retry_at = NULL, last_failure = NULL,
+        next_billing_date = GREATEST(next_billing_date, NOW()) + make_interval(secs => v_interval::DOUBLE PRECISION)
+        WHERE id = p_subscription_id RETURNING * INTO v_sub;
+    INSERT INTO audit_logs (merchant_id, actor_address, action, resource_type, resource_id, changes_before, changes_after)
+        VALUES (p_merchant_id, p_actor_address, 'subscription.interval_waived', 'subscription',
+            p_subscription_id::TEXT, v_before, to_jsonb(v_sub));
+    RETURN to_jsonb(v_sub);
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION waive_subscription_interval(UUID, UUID, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION waive_subscription_interval(UUID, UUID, TEXT) TO service_role;
+
+-- Reconcile an RPC timeout exactly once, using only the hash previously stored
+-- by the backend. The HTTP route verifies its outcome with Soroban RPC first.
+CREATE OR REPLACE FUNCTION resolve_pending_pull(p_subscription_id UUID, p_merchant_id UUID,
+    p_transaction_hash TEXT, p_succeeded BOOLEAN, p_settled_at TIMESTAMPTZ)
+RETURNS JSONB LANGUAGE plpgsql AS $$
+DECLARE v_sub subscriptions; v_plan plans; v_before JSONB;
+BEGIN
+    SELECT s.* INTO v_sub FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+        WHERE s.id = p_subscription_id AND p.merchant_id = p_merchant_id FOR UPDATE OF s;
+    IF NOT FOUND OR v_sub.last_failure->>'code' IS DISTINCT FROM 'rpc_timeout'
+        OR v_sub.last_failure->>'transaction_hash' IS DISTINCT FROM p_transaction_hash THEN RETURN NULL; END IF;
+    v_before := to_jsonb(v_sub);
+    SELECT * INTO v_plan FROM plans WHERE id = v_sub.plan_id;
+    IF p_succeeded THEN
+        UPDATE subscriptions SET status = 'active', retry_count = 0, dunning_status = NULL,
+            next_dunning_retry_at = NULL, last_failure = NULL,
+            next_billing_date = p_settled_at + make_interval(secs => v_plan.interval_seconds::DOUBLE PRECISION)
+            WHERE id = p_subscription_id RETURNING * INTO v_sub;
+        INSERT INTO audit_logs (merchant_id, actor_address, action, resource_type, resource_id, changes_before, changes_after)
+            VALUES (p_merchant_id, NULL, 'pull.execute', 'subscription', p_subscription_id::TEXT,
+                v_before, jsonb_build_object('txHash', p_transaction_hash, 'amount', v_plan.usdc_amount::TEXT,
+                    'status', v_sub.status, 'next_billing_date', v_sub.next_billing_date));
+    ELSE
+        UPDATE subscriptions SET last_failure = jsonb_build_object('code', 'unknown',
+            'message', 'The previously pending transaction failed on-chain. A fresh retry can now be prepared.',
+            'transaction_hash', p_transaction_hash, 'occurred_at', NOW())
+            WHERE id = p_subscription_id RETURNING * INTO v_sub;
+    END IF;
+    RETURN to_jsonb(v_sub);
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION resolve_pending_pull(UUID, UUID, TEXT, BOOLEAN, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION resolve_pending_pull(UUID, UUID, TEXT, BOOLEAN, TIMESTAMPTZ) TO service_role;
