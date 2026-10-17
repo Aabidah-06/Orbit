@@ -10,6 +10,9 @@ on:
       - "contracts/soroban/**"
       - ".github/workflows/soroban.yml"
 
+permissions:
+  contents: write
+
 jobs:
   contract:
     runs-on: ubuntu-latest
@@ -24,6 +27,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: contracts/soroban
+      # One-shot format pass on this contribution branch; the next revision
+      # replaces this with a non-mutating formatting gate.
+      - name: Format contract source and push
+        if: github.event_name == 'push' && github.ref_name == 'feat/123-126-subscription-badges-swaps-escrow-bitmap'
+        run: |
+          cargo fmt --all
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/lib.rs src/test.rs
+            git commit -m "style(contract): format Soroban changes with rustfmt"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
       - name: Unit and integration tests
         run: cargo test --locked -j 2
       - name: Clippy
