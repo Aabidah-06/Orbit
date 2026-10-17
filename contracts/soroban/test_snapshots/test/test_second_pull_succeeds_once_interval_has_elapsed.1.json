@@ -315,34 +315,34 @@
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
               "key": {
-                "map": [
+                "vec": [
                   {
-                    "key": {
-                      "symbol": "merchant"
-                    },
-                    "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                    }
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                   },
                   {
-                    "key": {
-                      "symbol": "user"
-                    },
-                    "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                    }
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "map": [
+                "vec": [
                   {
+                    "address": "CCABDO7UZXYE4W6GVSEGSNNZTKSLFQGKXXQTH6OX7M7GKZ4Z6CUJNGZN"
+                  },
+                  {
+                    "i128": "290000000"
+                  },
+                  {
+                    "u64": "86400"
+                  },
+                  {
+                    "u64": "87400"
                     "key": {
-                      "symbol": "amount_per_interval"
+                      "symbol": "initial_timestamp"
                     },
                     "val": {
-                      "i128": "290000000"
+                      "u64": "0"
                     }
                   },
                   {
@@ -355,10 +355,26 @@
                   },
                   {
                     "key": {
+                      "symbol": "is_paused"
+                    },
+                    "val": {
+                      "bool": false
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "last_pull_timestamp"
                     },
                     "val": {
                       "u64": "87400"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "pull_sequence"
+                    },
+                    "val": {
+                      "u64": "1"
                     }
                   },
                   {

@@ -5,12 +5,15 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Menu, X, ArrowUpRight } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
+import { useTranslations } from "next-intl";
 
 import { Brand } from "./brand";
 import { useAuth } from "@/lib/auth-context";
 import { DOCS_URL } from "@/lib/links";
+import { LocaleSwitcher } from "./locale-switcher";
 
 export function Navbar() {
+  const t = useTranslations("Nav");
   const [isOpen, setIsOpen] = useState(false);
   const pathname = usePathname();
   const { user, signOut } = useAuth();
@@ -25,38 +28,39 @@ export function Navbar() {
     <header className="site-header">
       <div className="orbit-container nav-inner">
         <Brand />
-        <nav className="nav-links" aria-label="Primary navigation">
+        <nav className="nav-links" aria-label={t("primaryNavigation")}>
           <Link
             className="nav-link"
             href="/#features"
             data-testid="link-features"
           >
-            Features
+            {t("features")}
           </Link>
           <Link
             className="nav-link"
             href="/#how-it-works"
             data-testid="link-how-it-works"
           >
-            Flow
+            {t("flow")}
           </Link>
           <Link
             className={`nav-link ${pathname === "/pricing" ? "text-black font-semibold" : ""}`}
             href="/pricing"
             data-testid="link-pricing"
           >
-            Pricing
+            {t("pricing")}
           </Link>
           <Link
             className="nav-link"
             href={DOCS_URL}
             data-testid="link-developers"
           >
-            Developers
+            {t("developers")}
           </Link>
         </nav>
 
         <div className="nav-actions">
+          <LocaleSwitcher />
           {user ? (
             <div className="flex items-center gap-3">
               <Link
@@ -64,15 +68,15 @@ export function Navbar() {
                 href="/dashboard"
                 data-testid="link-dashboard"
               >
-                Dashboard
+                {t("dashboard")}
               </Link>
               <button
                 type="button"
                 onClick={() => signOut()}
                 className="text-xs text-neutral-500 hover:text-black font-medium transition-colors"
-                title="Sign out"
+                title={t("signOut")}
               >
-                Sign out
+                {t("signOut")}
               </button>
             </div>
           ) : (
@@ -82,14 +86,14 @@ export function Navbar() {
                 href="/signin"
                 data-testid="link-signin"
               >
-                Sign in
+                {t("signIn")}
               </Link>
               <Link
                 className="button button-primary button-arrow"
                 href="/get-started"
                 data-testid="link-get-started"
               >
-                Get started
+                {t("getStarted")}
               </Link>
             </>
           )}
@@ -98,7 +102,7 @@ export function Navbar() {
         <button
           className="mobile-menu-button"
           type="button"
-          aria-label={isOpen ? "Close navigation" : "Open navigation"}
+          aria-label={isOpen ? t("closeNavigation") : t("openNavigation")}
           aria-expanded={isOpen}
           onClick={() => setIsOpen((prev) => !prev)}
           data-testid="button-mobile-menu"
@@ -124,7 +128,7 @@ export function Navbar() {
                 onClick={closeMenu}
                 data-testid="mobile-link-features"
               >
-                Features
+                {t("features")}
               </Link>
               <Link
                 className="nav-link text-base py-1"
@@ -132,7 +136,7 @@ export function Navbar() {
                 onClick={closeMenu}
                 data-testid="mobile-link-flow"
               >
-                How It Works
+                {t("howItWorks")}
               </Link>
               <Link
                 className="nav-link text-base py-1"
@@ -140,7 +144,7 @@ export function Navbar() {
                 onClick={closeMenu}
                 data-testid="mobile-link-pricing"
               >
-                Pricing
+                {t("pricing")}
               </Link>
               <Link
                 className="nav-link text-base py-1"
@@ -148,10 +152,11 @@ export function Navbar() {
                 onClick={closeMenu}
                 data-testid="mobile-link-developers"
               >
-                Developers
+                {t("developers")}
               </Link>
 
               <div className="mobile-nav-actions pt-2 border-t border-[rgba(0,0,0,0.08)]">
+                <LocaleSwitcher className="justify-center py-1" />
                 {user ? (
                   <div className="flex flex-col gap-2">
                     <Link
@@ -160,7 +165,7 @@ export function Navbar() {
                       onClick={closeMenu}
                       data-testid="mobile-link-dashboard"
                     >
-                      Dashboard
+                      {t("dashboard")}
                     </Link>
                     <button
                       type="button"
@@ -170,7 +175,7 @@ export function Navbar() {
                       }}
                       className="text-xs text-neutral-500 hover:text-black text-center py-2 font-medium"
                     >
-                      Sign out
+                      {t("signOut")}
                     </button>
                   </div>
                 ) : (
@@ -181,7 +186,7 @@ export function Navbar() {
                       onClick={closeMenu}
                       data-testid="mobile-link-signin"
                     >
-                      Sign in
+                      {t("signIn")}
                     </Link>
                     <Link
                       className="button button-primary button-arrow w-full justify-center"
@@ -189,7 +194,7 @@ export function Navbar() {
                       onClick={closeMenu}
                       data-testid="mobile-button-get-started"
                     >
-                      Get started
+                      {t("getStarted")}
                     </Link>
                   </>
                 )}

@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslations } from "next-intl";
 import { useState } from "react";
 import {
   Plus,
@@ -55,6 +56,7 @@ const INITIAL_PLANS: SubscriptionPlan[] = [
 ];
 
 export function PlansView() {
+  const t = useTranslations("Tables");
   const [plans, setPlans] = useState<SubscriptionPlan[]>(INITIAL_PLANS);
   const [searchQuery, setSearchQuery] = useState("");
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
@@ -165,12 +167,12 @@ export function PlansView() {
             <table className="w-full text-left text-xs">
               <thead className="bg-neutral-50/80 border-b border-black/10 text-neutral-500 uppercase tracking-wider font-semibold text-[10px]">
                 <tr>
-                  <th className="py-3.5 px-5">Plan Name &amp; ID</th>
-                  <th className="py-3.5 px-4">Billing Rate</th>
-                  <th className="py-3.5 px-4">Active Subscribers</th>
-                  <th className="py-3.5 px-4">Estimated Monthly</th>
-                  <th className="py-3.5 px-4">Status</th>
-                  <th className="py-3.5 px-5 text-right">Integration</th>
+                  <th className="py-3.5 px-5">{t("plans.name")}</th>
+                  <th className="py-3.5 px-4">{t("plans.rate")}</th>
+                  <th className="py-3.5 px-4">{t("plans.subscribers")}</th>
+                  <th className="py-3.5 px-4">{t("plans.monthly")}</th>
+                  <th className="py-3.5 px-4">{t("plans.status")}</th>
+                  <th className="py-3.5 px-5 text-right">{t("plans.integration")}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-black/5 text-neutral-700">
