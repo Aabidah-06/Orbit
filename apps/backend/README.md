@@ -594,3 +594,32 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
     "error": "Error description message"
   }
   ```
+
+## Streaming transaction CSV export (#76)
+
+Authenticated merchants can download settled on-chain payments using
+`GET /reports/transactions/export` with `Authorization: Bearer <MERCHANT_API_KEY>`.
+Optional query parameters: `start_date` and `end_date` (`YYYY-MM-DD`, inclusive),
+`plan_id` (UUID), and `status=settled`. Data is sorted by settlement timestamp.
+The response is RFC 4180 CSV with CRLF line endings and the
+`orbit-transactions.csv` attachment filename. Empty reports have a header row.
+
+This endpoint uses a PostgreSQL server-side cursor; set **server-only**
+`DATABASE_URL` to a PostgreSQL connection string for the same Supabase database
+used by `SUPABASE_URL`. Do not expose `DATABASE_URL` or the service-role key in
+browser/public environment variables or commit them to git. Connection errors
+return HTTP 503. Customer and plan fields remain scoped to the authenticated
+merchant; supplying another merchant's ID does not grant access.
+
+**Migration:** create the `payment_transactions` table, indexes, and RLS shown
+in `schema.sql` before enabling the endpoint. For an existing database, use
+only that new migration section in your normal SQL migration workflow; the
+complete bootstrap `schema.sql` also creates tables that may already exist.
+
+**Accounting integrity:** amounts are stored in raw USDC units and only when
+a successful pull transaction includes the expected `funds_pulled` contract
+event. A successful transaction without a decodable matching event logs a
+reconciliation error and is **not** represented as a verified settlement.
+The export does not backfill old transfers or recover missing events: operators
+should plan a ledger indexing/reconciliation job before using reports as a
+complete accounting ledger. Stellar RPC history retention is limited.

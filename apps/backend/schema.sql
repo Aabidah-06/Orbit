@@ -162,6 +162,26 @@ CREATE TABLE IF NOT EXISTS tax_transactions (
 );
 CREATE INDEX IF NOT EXISTS tax_transactions_merchant_date_idx ON tax_transactions (merchant_id, created_at);
 
+-- #76: immutable on-chain settlement ledger, keyed on transaction hash to
+-- prevent duplicate export rows on idempotent retries. Amounts are raw USDC
+-- token units and never reconstructed from mutable plan prices.
+CREATE TABLE IF NOT EXISTS payment_transactions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    subscription_id UUID NOT NULL REFERENCES subscriptions(id) ON DELETE RESTRICT,
+    plan_id UUID NOT NULL REFERENCES plans(id) ON DELETE RESTRICT,
+    customer_wallet_address VARCHAR(255) NOT NULL,
+    amount_usdc_units NUMERIC NOT NULL CHECK (amount_usdc_units >= 0),
+    status VARCHAR(32) NOT NULL DEFAULT 'settled' CHECK (status IN ('settled')),
+    tx_hash VARCHAR(128) NOT NULL UNIQUE,
+    settled_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
+CREATE INDEX IF NOT EXISTS payment_transactions_merchant_date_idx
+    ON payment_transactions (merchant_id, settled_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS payment_transactions_merchant_plan_idx
+    ON payment_transactions (merchant_id, plan_id, settled_at DESC);
+ALTER TABLE payment_transactions ENABLE ROW LEVEL SECURITY;
+
 CREATE TABLE IF NOT EXISTS signing_sessions (
     id UUID PRIMARY KEY,
     merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,

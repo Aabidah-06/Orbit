@@ -16,6 +16,8 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "pg": "^8.23.1",
+    "pg-cursor": "^2.22.1",
     "zod": "^4.6.5"
   },
   "devDependencies": {

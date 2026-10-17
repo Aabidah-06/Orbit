@@ -25,6 +25,7 @@ const {
 } = require('./dunning');
 const { registerComplianceRoutes } = require('./compliance');
 const { registerSigningSessionRoutes } = require('./signing-sessions');
+const { registerTransactionExportRoute } = require('./transaction-report');
 const { registerFailureRecoveryRoutes } = require('./failure-recovery');
 const {
     isFiatCurrency,
@@ -609,6 +610,33 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                                 settledAmount = quote.usdc_amount;
                             } catch {
                                 // Keep the stored plan amount when the cache cannot price it
+                            }
+                        }
+
+                        // Only record amounts independently verified from the
+                        // successful on-chain funds_pulled event. Plan and oracle
+                        // quotes are not necessarily the vault's actual transfer.
+                        const verifiedAmount = require('./transaction-report').confirmedSettlementAmount(
+                            confirmation,
+                            { customerWallet: sub.customer_wallet_address,
+                              merchantWallet: merchant.wallet_address,
+                              contractId: process.env.ORBIT_CONTRACT_ID },
+                        );
+                        if (verifiedAmount === null) {
+                            console.error('CRITICAL: confirmed transfer missing verified amount; reconcile transaction:', txHash);
+                        } else {
+                            const { error: paymentError } = await supabase.from('payment_transactions').insert([{
+                                merchant_id: sub.plans.merchant_id,
+                                subscription_id,
+                                plan_id: sub.plan_id,
+                                customer_wallet_address: sub.customer_wallet_address,
+                                amount_usdc_units: verifiedAmount,
+                                status: 'settled',
+                                tx_hash: txHash,
+                                settled_at: pullTime.toISOString(),
+                            }]);
+                            if (paymentError && paymentError.code !== '23505') {
+                                console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
                             }
                         }
 
@@ -1456,6 +1484,26 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
+
+// PostgreSQL protocol cursor: unlike Supabase REST pagination, the cursor
+// never materializes the full transaction table in application memory.
+let reportPool;
+const getReportPool = () => {
+    if (app.locals.reportPool) return app.locals.reportPool;
+    if (!process.env.DATABASE_URL) return null;
+    if (!reportPool) {
+        const { Pool } = require('pg');
+        reportPool = new Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
+    }
+    return reportPool;
+};
+registerTransactionExportRoute(
+    app, authenticateMerchant, getReportPool,
+    (sql, values) => {
+        const Cursor = require('pg-cursor');
+        return new Cursor(sql, values);
+    },
+);
 
 const PORT = process.env.PORT || 3001;
 if (require.main === module) {
