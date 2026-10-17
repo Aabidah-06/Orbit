@@ -173,8 +173,9 @@ pub struct EscrowHold {
     pub disputed: bool,
 }
 
-/// A trusted Soroban AMM router must receive the input token through allowance,
-/// send settlement tokens to `recipient`, and return actual input consumed.
+/// A trusted Soroban AMM router receives only the exact reserved input transferred
+/// for this swap (never an approval to drain pooled escrow holdings), sends
+/// settlement tokens to `recipient`, refunds unused input, and reports spent input.
 /// It must execute atomically and enforce its own route/oracle protections.
 #[contractclient(name = "SwapRouterClient")]
 pub trait SwapRouter {
@@ -248,9 +249,7 @@ fn pull_payment(env: &Env, user: &Address, merchant: &Address, vault: &VaultData
         let output = token::Client::new(env, &config.settlement_token);
         let input_before = input.balance(&contract);
         let output_before = output.balance(&contract);
-        input.transfer_from(&contract, user, &contract, &config.max_input_amount);
-        input.approve(&contract, &config.router, &config.max_input_amount,
-            &env.ledger().sequence().saturating_add(1));
+        input.transfer_from(&contract, user, &config.router, &config.max_input_amount);
         let spent = SwapRouterClient::new(env, &config.router).swap_exact_output(
             &config.payment_token, &config.settlement_token, &vault.amount_per_interval,
             &config.max_input_amount, &contract,
@@ -259,7 +258,9 @@ fn pull_payment(env: &Env, user: &Address, merchant: &Address, vault: &VaultData
         let received = output.balance(&contract) - output_before;
         assert!(received >= vault.amount_per_interval, "Insufficient settlement output");
         let unspent = input.balance(&contract) - input_before;
-        assert!(unspent >= 0, "Router exceeded reserved input");
+        assert!(unspent >= 0 && unspent <= config.max_input_amount,
+            "Invalid swap input refund");
+        assert!(config.max_input_amount - unspent == spent, "Router input accounting mismatch");
         if unspent > 0 { input.transfer(&contract, user, &unspent); }
         if received > vault.amount_per_interval {
             output.transfer(&contract, user, &(received - vault.amount_per_interval));
