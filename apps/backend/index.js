@@ -26,6 +26,7 @@ const {
 const { registerComplianceRoutes } = require('./compliance');
 const { registerSigningSessionRoutes } = require('./signing-sessions');
 const { registerFailureRecoveryRoutes } = require('./failure-recovery');
+const { registerCouponRoutes, normalizeCode } = require('./coupons');
 const {
     isFiatCurrency,
     getRate,
@@ -162,6 +163,7 @@ const createSubscriptionSchema = z.object({
     plan_id: z.string().uuid("plan_id must be a valid UUID"),
     customer_wallet_address: stellarAddressSchema,
     metadata: z.record(z.any()).optional().default({}),
+    coupon_code: z.string().trim().min(3).max(32).regex(/^[A-Za-z0-9_-]+$/).optional(),
 });
 
 const triggerPullSchema = z.object({
@@ -370,6 +372,10 @@ const loadPullContext = async (supabase, subscriptionId, merchant) => {
     if (isNoRowsError(subError) || !sub) return { status: 404, error: "Subscription not found" };
     if (subError) throw subError;
     if (sub.plans?.merchant_id !== merchant.id) return { status: 404, error: "Subscription not found" };
+    // A coupon quote must not silently charge the fixed-price legacy Soroban vault.
+    if (sub.coupon_id && !sub.promotion_onchain_verified) {
+        return { status: 409, error: "Promotional vault terms are not verified on-chain; billing is blocked" };
+    }
 
     return { sub, merchant };
 };
@@ -671,7 +677,7 @@ app.post('/subscriptions', async (req, res) => {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
     }
 
-    const { plan_id, customer_wallet_address, metadata } = parseResult.data;
+    const { plan_id, customer_wallet_address, metadata, coupon_code } = parseResult.data;
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
 
@@ -733,11 +739,26 @@ app.post('/subscriptions', async (req, res) => {
             }
         }
 
-        const { data, error } = await supabase
-            .from('subscriptions')
-            .insert([insertPayload])
-            .select()
-            .single();
+        // A SQL function locks the coupon and atomically creates the
+        // subscription and increments redemptions_count; no read-then-write race.
+        let data, error;
+        if (coupon_code) {
+            const redeemed = await supabase.rpc('redeem_coupon_subscription', {
+                p_plan_id: plan_id,
+                p_customer_wallet_address: customer_wallet_address,
+                p_metadata: metadata || {},
+                p_code: normalizeCode(coupon_code),
+                p_quoted_rate: insertPayload.quoted_rate ?? null,
+            });
+            data = Array.isArray(redeemed.data) ? redeemed.data[0] : redeemed.data;
+            error = redeemed.error;
+            if (error?.code === 'P7501') return { status: 422, body: { error: 'Coupon invalid or incompatible with plan' } };
+            if (error?.code === 'P7502') return { status: 409, body: { error: 'Coupon redemption limit reached' } };
+            if (error?.code === 'P7503') return { status: 404, body: { error: 'Plan not found' } };
+        } else {
+            ({ data, error } = await supabase.from('subscriptions')
+                .insert([insertPayload]).select().single());
+        }
 
         if (isForeignKeyError(error)) return { status: 404, body: { error: "Plan not found" } };
         if (isUniqueViolation(error)) {
@@ -1456,6 +1477,7 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
+registerCouponRoutes(app, getSupabase, authenticateMerchant);
 
 const PORT = process.env.PORT || 3001;
 if (require.main === module) {
