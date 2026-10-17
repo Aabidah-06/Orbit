@@ -895,3 +895,491 @@ fn test_cancel_vault_event_published() {
     ];
     assert_eq!(env.events().all(), expected_cancel);
 }
+
+// ----------------------------------------------------------------------------
+// ISSUE #65: MULTI-SIG / THRESHOLD AUTHORIZATION FOR BATCH PAYROLL
+// ----------------------------------------------------------------------------
+
+struct PayrollSetup<'a> {
+    env: Env,
+    orbit_client: OrbitContractClient<'a>,
+    token_client: TokenClient<'a>,
+    token_address: Address,
+    sender: Address,
+    recipient_1: Address,
+    recipient_2: Address,
+    approvers: Vec<Address>,
+    splits: Vec<PaymentSplit>,
+}
+
+/// Sender with 100 USDC, a 60 USDC allowance to the contract, three approvers and
+/// two splits totalling 30 USDC. All auths are mocked.
+fn setup_payroll<'a>() -> PayrollSetup<'a> {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let sender = Address::generate(&env);
+    let recipient_1 = Address::generate(&env);
+    let recipient_2 = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = TokenClient::new(&env, &token_address);
+    StellarAssetClient::new(&env, &token_address).mint(&sender, &100_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&sender, &orbit_client.address, &60_0000000, &2000000);
+
+    let approvers = soroban_sdk::vec![
+        &env,
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let mut splits = Vec::new(&env);
+    splits.push_back(PaymentSplit {
+        recipient: recipient_1.clone(),
+        amount: 10_0000000,
+    });
+    splits.push_back(PaymentSplit {
+        recipient: recipient_2.clone(),
+        amount: 20_0000000,
+    });
+
+    PayrollSetup {
+        env,
+        orbit_client,
+        token_client,
+        token_address,
+        sender,
+        recipient_1,
+        recipient_2,
+        approvers,
+        splits,
+    }
+}
+
+impl PayrollSetup<'_> {
+    fn propose(&self, required_approvals: u32) -> u64 {
+        self.orbit_client.propose_batch_disburse(
+            &self.sender,
+            &self.token_address,
+            &self.splits,
+            &required_approvals,
+            &self.approvers,
+        )
+    }
+
+    fn approver(&self, index: u32) -> Address {
+        self.approvers.get(index).unwrap()
+    }
+
+    fn assert_nobody_paid(&self) {
+        assert_eq!(self.token_client.balance(&self.recipient_1), 0);
+        assert_eq!(self.token_client.balance(&self.recipient_2), 0);
+        assert_eq!(self.token_client.balance(&self.sender), 100_0000000);
+    }
+}
+
+#[test]
+fn test_propose_payroll_stores_pending_proposal_with_sequential_ids() {
+    let s = setup_payroll();
+
+    let first = s.propose(2);
+    let second = s.propose(3);
+    assert_eq!(first, 0);
+    assert_eq!(second, 1);
+
+    let proposal = s
+        .orbit_client
+        .get_payroll_proposal(&first)
+        .expect("proposal should exist");
+    assert_eq!(
+        proposal,
+        PayrollProposal {
+            id: 0,
+            sender: s.sender.clone(),
+            token: s.token_address.clone(),
+            splits: s.splits.clone(),
+            approvers: s.approvers.clone(),
+            approvals: Vec::new(&s.env),
+            required_approvals: 2,
+            executed: false,
+        }
+    );
+    assert_eq!(s.orbit_client.get_payroll_proposal(&2), None);
+
+    // Proposing moves no funds
+    s.assert_nobody_paid();
+}
+
+#[test]
+fn test_payroll_executes_after_threshold_of_distinct_approvals() {
+    let s = setup_payroll();
+    let id = s.propose(2);
+
+    s.orbit_client.approve_payroll_proposal(&s.approver(0), &id);
+    s.orbit_client.approve_payroll_proposal(&s.approver(2), &id);
+    s.orbit_client.execute_payroll_proposal(&id);
+
+    // events().all() only covers the most recent invocation, so check it before any other call
+    let executed_topics = soroban_sdk::vec![
+        &s.env,
+        Symbol::new(&s.env, "payroll_executed").to_val(),
+        s.sender.to_val(),
+        id.into_val(&s.env),
+    ];
+    let executed_data = (s.token_address.clone(), 2u32, 30_0000000i128).into_val(&s.env);
+    assert_eq!(
+        s.env
+            .events()
+            .all()
+            .filter_by_contract(&s.orbit_client.address),
+        soroban_sdk::vec![
+            &s.env,
+            (
+                s.orbit_client.address.clone(),
+                executed_topics,
+                executed_data
+            ),
+        ]
+    );
+
+    assert_eq!(s.token_client.balance(&s.recipient_1), 10_0000000);
+    assert_eq!(s.token_client.balance(&s.recipient_2), 20_0000000);
+    assert_eq!(s.token_client.balance(&s.sender), 70_0000000);
+
+    let proposal = s.orbit_client.get_payroll_proposal(&id).unwrap();
+    assert!(proposal.executed);
+    assert_eq!(
+        proposal.approvals,
+        soroban_sdk::vec![&s.env, s.approver(0), s.approver(2)]
+    );
+}
+
+#[test]
+fn test_payroll_execution_fails_below_threshold() {
+    let s = setup_payroll();
+    let id = s.propose(2);
+
+    assert!(s.orbit_client.try_execute_payroll_proposal(&id).is_err());
+
+    s.orbit_client.approve_payroll_proposal(&s.approver(1), &id);
+    assert!(s.orbit_client.try_execute_payroll_proposal(&id).is_err());
+
+    s.assert_nobody_paid();
+    assert!(!s.orbit_client.get_payroll_proposal(&id).unwrap().executed);
+}
+
+#[test]
+fn test_payroll_counts_each_approver_once() {
+    let s = setup_payroll();
+    let id = s.propose(2);
+
+    s.orbit_client.approve_payroll_proposal(&s.approver(0), &id);
+    let res = s
+        .orbit_client
+        .try_approve_payroll_proposal(&s.approver(0), &id);
+    assert!(res.is_err());
+
+    // One distinct approval is still short of a 2-of-3 threshold
+    assert_eq!(
+        s.orbit_client
+            .get_payroll_proposal(&id)
+            .unwrap()
+            .approvals
+            .len(),
+        1
+    );
+    assert!(s.orbit_client.try_execute_payroll_proposal(&id).is_err());
+    s.assert_nobody_paid();
+}
+
+#[test]
+fn test_payroll_rejects_approval_from_address_not_in_approver_list() {
+    let s = setup_payroll();
+    let id = s.propose(1);
+
+    let outsider = Address::generate(&s.env);
+    assert!(s
+        .orbit_client
+        .try_approve_payroll_proposal(&outsider, &id)
+        .is_err());
+
+    // The sender is not an approver unless listed
+    assert!(s
+        .orbit_client
+        .try_approve_payroll_proposal(&s.sender, &id)
+        .is_err());
+
+    assert!(s.orbit_client.try_execute_payroll_proposal(&id).is_err());
+    s.assert_nobody_paid();
+}
+
+#[test]
+fn test_payroll_approval_requires_the_approvers_own_signature() {
+    let s = setup_payroll();
+    let id = s.propose(1);
+    let approver = s.approver(0);
+    let other_approver = s.approver(1);
+
+    // Another listed approver signing cannot approve on `approver`'s behalf
+    let res = s
+        .orbit_client
+        .mock_auths(&[MockAuth {
+            address: &other_approver,
+            invoke: &MockAuthInvoke {
+                contract: &s.orbit_client.address,
+                fn_name: "approve_payroll_proposal",
+                args: (&approver, id).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_approve_payroll_proposal(&approver, &id);
+    assert!(res.is_err());
+
+    let res = s
+        .orbit_client
+        .mock_auths(&[MockAuth {
+            address: &approver,
+            invoke: &MockAuthInvoke {
+                contract: &s.orbit_client.address,
+                fn_name: "approve_payroll_proposal",
+                args: (&approver, id).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_approve_payroll_proposal(&approver, &id);
+    assert!(res.is_ok());
+    assert_eq!(
+        s.orbit_client.get_payroll_proposal(&id).unwrap().approvals,
+        soroban_sdk::vec![&s.env, approver]
+    );
+}
+
+#[test]
+fn test_propose_payroll_requires_sender_signature() {
+    let s = setup_payroll();
+    let impostor = Address::generate(&s.env);
+    let required_approvals: u32 = 1;
+
+    let res = s
+        .orbit_client
+        .mock_auths(&[MockAuth {
+            address: &impostor,
+            invoke: &MockAuthInvoke {
+                contract: &s.orbit_client.address,
+                fn_name: "propose_batch_disburse",
+                args: (
+                    &s.sender,
+                    &s.token_address,
+                    &s.splits,
+                    required_approvals,
+                    &s.approvers,
+                )
+                    .into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_propose_batch_disburse(
+            &s.sender,
+            &s.token_address,
+            &s.splits,
+            &required_approvals,
+            &s.approvers,
+        );
+    assert!(res.is_err());
+    assert_eq!(s.orbit_client.get_payroll_proposal(&0), None);
+}
+
+#[test]
+fn test_payroll_cannot_be_executed_twice() {
+    let s = setup_payroll();
+    let id = s.propose(1);
+
+    s.orbit_client.approve_payroll_proposal(&s.approver(0), &id);
+    s.orbit_client.execute_payroll_proposal(&id);
+    assert_eq!(s.token_client.balance(&s.sender), 70_0000000);
+
+    // Replay: the remaining 30 USDC allowance would cover a second run, but it must not happen
+    assert!(s.orbit_client.try_execute_payroll_proposal(&id).is_err());
+    assert_eq!(s.token_client.balance(&s.recipient_1), 10_0000000);
+    assert_eq!(s.token_client.balance(&s.recipient_2), 20_0000000);
+    assert_eq!(s.token_client.balance(&s.sender), 70_0000000);
+
+    // Nor can it collect further approvals
+    assert!(s
+        .orbit_client
+        .try_approve_payroll_proposal(&s.approver(1), &id)
+        .is_err());
+}
+
+#[test]
+fn test_payroll_execution_reverts_atomically_and_can_be_retried() {
+    let s = setup_payroll();
+    let id = s.propose(1);
+    s.orbit_client.approve_payroll_proposal(&s.approver(0), &id);
+
+    // Allowance too small for the 30 USDC payroll
+    s.token_client
+        .approve(&s.sender, &s.orbit_client.address, &15_0000000, &2000000);
+    assert!(s.orbit_client.try_execute_payroll_proposal(&id).is_err());
+
+    // Nothing moved and the executed flag was rolled back with the failed transfers
+    s.assert_nobody_paid();
+    assert!(!s.orbit_client.get_payroll_proposal(&id).unwrap().executed);
+
+    s.token_client
+        .approve(&s.sender, &s.orbit_client.address, &30_0000000, &2000000);
+    s.orbit_client.execute_payroll_proposal(&id);
+    assert_eq!(s.token_client.balance(&s.recipient_2), 20_0000000);
+    assert!(s.orbit_client.get_payroll_proposal(&id).unwrap().executed);
+}
+
+#[test]
+fn test_propose_payroll_rejects_invalid_threshold() {
+    let s = setup_payroll();
+
+    // Zero approvals required
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(&s.sender, &s.token_address, &s.splits, &0, &s.approvers)
+        .is_err());
+    // More approvals required than there are approvers
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(&s.sender, &s.token_address, &s.splits, &4, &s.approvers)
+        .is_err());
+    // A threshold equal to the approver count is allowed
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(&s.sender, &s.token_address, &s.splits, &3, &s.approvers)
+        .is_ok());
+}
+
+#[test]
+fn test_propose_payroll_rejects_invalid_approver_lists() {
+    let s = setup_payroll();
+    let approver = s.approver(0);
+
+    // Empty list
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(
+            &s.sender,
+            &s.token_address,
+            &s.splits,
+            &1,
+            &Vec::new(&s.env)
+        )
+        .is_err());
+
+    // A duplicated approver could otherwise satisfy a 2-of-2 threshold alone
+    let duplicated = soroban_sdk::vec![&s.env, approver.clone(), approver];
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(&s.sender, &s.token_address, &s.splits, &2, &duplicated)
+        .is_err());
+
+    // Over the approver cap
+    let mut too_many = Vec::new(&s.env);
+    for _ in 0..(MAX_PAYROLL_APPROVERS + 1) {
+        too_many.push_back(Address::generate(&s.env));
+    }
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(&s.sender, &s.token_address, &s.splits, &1, &too_many)
+        .is_err());
+}
+
+#[test]
+fn test_propose_payroll_rejects_invalid_splits() {
+    let s = setup_payroll();
+
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(
+            &s.sender,
+            &s.token_address,
+            &Vec::new(&s.env),
+            &1,
+            &s.approvers
+        )
+        .is_err());
+
+    let mut zero_split = s.splits.clone();
+    zero_split.push_back(PaymentSplit {
+        recipient: Address::generate(&s.env),
+        amount: 0,
+    });
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(&s.sender, &s.token_address, &zero_split, &1, &s.approvers)
+        .is_err());
+}
+
+#[test]
+fn test_payroll_actions_fail_for_unknown_proposal() {
+    let s = setup_payroll();
+
+    assert!(s
+        .orbit_client
+        .try_approve_payroll_proposal(&s.approver(0), &42)
+        .is_err());
+    assert!(s.orbit_client.try_execute_payroll_proposal(&42).is_err());
+}
+
+#[test]
+fn test_payroll_proposal_and_approval_events_published() {
+    let s = setup_payroll();
+    let id = s.propose(2);
+
+    let proposed_topics = soroban_sdk::vec![
+        &s.env,
+        Symbol::new(&s.env, "payroll_proposed").to_val(),
+        s.sender.to_val(),
+        id.into_val(&s.env),
+    ];
+    let proposed_data = (s.token_address.clone(), 2u32, 3u32, 30_0000000i128).into_val(&s.env);
+    assert_eq!(
+        s.env
+            .events()
+            .all()
+            .filter_by_contract(&s.orbit_client.address),
+        soroban_sdk::vec![
+            &s.env,
+            (
+                s.orbit_client.address.clone(),
+                proposed_topics,
+                proposed_data
+            ),
+        ]
+    );
+
+    s.orbit_client.approve_payroll_proposal(&s.approver(1), &id);
+
+    let approved_topics = soroban_sdk::vec![
+        &s.env,
+        Symbol::new(&s.env, "payroll_approved").to_val(),
+        s.approver(1).to_val(),
+        id.into_val(&s.env),
+    ];
+    let approved_data = (1u32, 2u32).into_val(&s.env);
+    assert_eq!(
+        s.env
+            .events()
+            .all()
+            .filter_by_contract(&s.orbit_client.address),
+        soroban_sdk::vec![
+            &s.env,
+            (
+                s.orbit_client.address.clone(),
+                approved_topics,
+                approved_data
+            ),
+        ]
+    );
+}
