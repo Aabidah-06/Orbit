@@ -31,6 +31,15 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `API_KEY_RATE_LIMIT_MAX` | Requests per window allowed for each API key on authenticated routes (defaults to 100) | `100` |
 | `IP_RATE_LIMIT_MAX` | Requests per window allowed for each client IP on every route (defaults to 300) | `300` |
 | `TRUST_PROXY` | Express `trust proxy` setting; set when behind a load balancer so rate limiting sees the client IP | `1` |
+| `RELAYER_SECRET_KEY` | Orbit relayer account that pays sponsored pull fees (fee-bump fee source). `/relay/*` returns 503 when unset | `S...` |
+| `RELAYER_CHANNEL_SECRET_KEYS` | Optional comma-separated channel accounts used as inner transaction sources (defaults to the relayer account) | `S...,S...` |
+| `RELAYER_DAILY_FEE_LIMIT_STROOPS` | Sponsored fee budget per merchant per UTC day (defaults to 50000000 = 5 XLM) | `50000000` |
+| `RELAYER_MAX_FEE_STROOPS` | Largest total fee sponsored for one pull (defaults to 5000000) | `5000000` |
+| `RELAYER_BASE_FEE` | Fee bump inclusion fee per operation in stroops (defaults to 100) | `100` |
+| `RELAYER_MAX_ATTEMPTS` | Submission attempts on `txBadSeq` / `TRY_AGAIN_LATER` (defaults to 3) | `3` |
+| `RELAYER_QUEUE_TIMEOUT_MS` | Longest a relay waits for a free channel before `503` (defaults to 30000) | `30000` |
+| `RELAYER_AUTH_VALIDITY_LEDGERS` | Ledgers a prepared merchant authorization remains signable (defaults to 100, ~8 minutes) | `100` |
+| `RELAYER_RATE_LIMIT_MAX` / `RELAYER_RATE_LIMIT_WINDOW_MS` | Relay requests allowed per merchant per window (defaults to 10 per 60000 ms) | `10` |
 | `ORACLE_SYNC_INTERVAL_MS` | Background worker refresh interval for the fiat → USDC rate cache (defaults to 300000 = 5 min) | `300000` |
 | `ORACLE_SLIPPAGE_TOLERANCE_BPS` | Maximum rate movement from a subscription's quoted rate that a fiat pull may settle at (defaults to 200 = 2%) | `200` |
 | `ORACLE_FETCH_TIMEOUT_MS` | Price feed request timeout in milliseconds (defaults to 6000) | `6000` |
@@ -57,6 +66,9 @@ The service runs at `http://localhost:3001`.
 | `GET` | `/rates` | Public | Supported fiat → USDC pairs with their newest cached rate |
 | `POST` | `/trigger-pull` | API key | Prepare an unsigned merchant pull transaction |
 | `POST` | `/submit-pull` | API key | Verify and submit a wallet-signed pull transaction |
+| `POST` | `/relay/prepare-pull` | API key | Get the authorization entry for a gas-sponsored pull |
+| `POST` | `/relay/submit-pull` | API key | Submit a merchant-authorized pull through the fee-bump relayer |
+| `GET` | `/relay/budget` | API key | Today's sponsored fee usage and remaining budget |
 | `POST` | `/subscriptions` | Public | Record a customer subscription after handshake |
 | `POST` | `/api-keys` | API key | Create an API key (secret shown once) |
 | `GET` | `/api-keys` | API key | List the merchant's API keys |
@@ -562,6 +574,26 @@ SELECT cron.schedule('purge-idempotency', '0 * * * *', 'SELECT purge_expired_ide
 
 ---
 
+## Gas-Sponsored Pulls (Fee-Bump Relayer)
+
+`/trigger-pull` + `/submit-pull` make the merchant wallet the transaction source, so it must hold XLM for fees and track its sequence number. The `/relay/*` routes remove both: the Orbit relayer (`relayer.js`) submits the transaction and pays for it.
+
+1. `POST /relay/prepare-pull` with `{ "subscription_id" }` simulates `pull_funds` and returns `auth_entry_xdr`, the merchant's unsigned Soroban authorization entry, plus `valid_until_ledger` and `network_passphrase`.
+2. The merchant signs **only that authorization**, not a transaction. With the JS SDK: `authorizeEntry(xdr.SorobanAuthorizationEntry.fromXdr(auth_entry_xdr, 'base64'), keypair, valid_until_ledger, network_passphrase)`, or the wallet's `signAuthEntry`.
+3. `POST /relay/submit-pull` with `{ "subscription_id", "signed_auth_entry_xdr" }`. The API checks that the entry authorizes exactly `pull_funds(subscriber, merchant)` on `ORBIT_CONTRACT_ID`, is signed by the merchant's key for this network, and has not expired. It then relays the pull and records the outcome exactly like `/submit-pull` (billing date, audit log, `payment.settled` webhook, or `past_due` on failure). The response adds `sponsored`, `sponsor_address`, `fee_charged_stroops` and `attempts`.
+
+How it is submitted:
+
+- The authorization goes into a transaction sourced from a relayer **channel account**, signed by the channel, then wrapped in a `FeeBumpTransaction` whose fee source is `RELAYER_SECRET_KEY`. The merchant is never a transaction source and is never charged a fee. Its account only has to exist so its signature can be checked.
+- **Sequence management**: channels are handed out one relay at a time (FIFO queue, `503 relayer_busy` after `RELAYER_QUEUE_TIMEOUT_MS`), and each channel's sequence number is cached and advanced locally, so concurrent relays never collide. On `txBadSeq` the cache is re-read from the ledger and the transaction rebuilt; on `TRY_AGAIN_LATER` it is retried after a backoff, up to `RELAYER_MAX_ATTEMPTS`. The merchant's signature covers the invocation, not the transaction, so retries never need a new signature. Add channels with `RELAYER_CHANNEL_SECRET_KEYS` for more parallelism.
+- **Budget**: before submitting, the fee-bump fee is booked against the merchant's daily budget with `reserve_relayer_fee` (atomic, in `relayer_fee_usage`), then settled to the fee actually charged. Unsubmitted reservations are refunded; an unconfirmed (`202`) relay keeps the full reservation. Over budget returns `429 daily_budget_exceeded`, and a pull costing more than `RELAYER_MAX_FEE_STROOPS` returns `422 fee_cap_exceeded`. `GET /relay/budget` shows today's usage.
+- **Throttling**: relay routes have their own per-merchant limit (`RELAYER_RATE_LIMIT_MAX`, default 10/minute) on top of the API key limit.
+- `/relay/submit-pull` takes the same per-subscription billing lock and honours `Idempotency-Key` like `/submit-pull`.
+
+Errors carry a machine-readable `code`: `invalid_authorization` (400), `authorization_expired` (400), `invalid_signature` (401), `simulation_failed` (422, e.g. pulling too early), `fee_cap_exceeded` (422), `daily_budget_exceeded` (429), `submission_rejected` (502), `relayer_busy` / `relayer_unavailable` (503).
+
+---
+
 ## Database Schema Reference
 
 The API queries the tables defined in `apps/backend/schema.sql`:
@@ -572,6 +604,7 @@ The API queries the tables defined in `apps/backend/schema.sql`:
 - `idempotency_keys`: `id` (UUID PK), `key` (VARCHAR), `merchant_id` (UUID FK -> `merchants.id`, cascade), `request_path` (VARCHAR), `request_hash` (VARCHAR(64)), `status` (`in_progress` / `completed` / `failed`), `response_code` (INTEGER), `response_body` (JSONB), `created_at`, `updated_at`, `expires_at` (TIMESTAMP). Unique on `(merchant_id, key)`.
 - `billing_locks`: `subscription_id` (UUID PK, FK -> `subscriptions.id`), `lock_token` (UUID), `locked_until` (TIMESTAMP), `created_at` (TIMESTAMP).
 - `api_keys`: `id` (UUID PK), `merchant_id` (UUID FK -> `merchants.id`, cascade), `name` (VARCHAR), `key_prefix` (VARCHAR(16)), `key_hash` (VARCHAR(64), unique SHA-256 hex), `environment` (`live` / `test`), `last_used_at`, `created_at`, `revoked_at` (TIMESTAMP). Active while `revoked_at` is null.
+- `relayer_fee_usage`: `merchant_id` (UUID FK -> `merchants.id`, cascade), `usage_date` (DATE, UTC), `fee_stroops` (BIGINT), `tx_count` (INTEGER), `updated_at` (TIMESTAMP). Primary key `(merchant_id, usage_date)`. Daily sponsored fees per merchant, updated through `reserve_relayer_fee` / `adjust_relayer_fee`.
 - `exchange_rates`: `base_currency` (VARCHAR), `quote_currency` (VARCHAR DEFAULT 'USDC'), `rate` (NUMERIC), `source` (VARCHAR), `fetched_at` (TIMESTAMP). Append-only history of oracle quotes; the newest row per currency wins. Indexed on `(base_currency, quote_currency, fetched_at DESC)`.
 
 Existing databases can apply the new sections of `schema.sql` (tables 4, 5 and 6, their functions, indexes, `REVOKE`s and RLS statements) as a migration.
