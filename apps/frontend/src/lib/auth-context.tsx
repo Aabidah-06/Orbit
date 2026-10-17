@@ -1,6 +1,7 @@
 "use client";
 
 import React, { createContext, useContext, useEffect, useState } from "react";
+import { setMerchantApiKey } from "@/lib/api";
 
 export interface LinkedVaults {
   stellar?: string;
@@ -43,6 +44,7 @@ const STORAGE_KEY = "orbit_merchant_session";
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<MerchantUser | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  useEffect(() => { setMerchantApiKey(""); }, [user?.id]);
 
   // Restore session on mount
   useEffect(() => {

@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslations } from "next-intl";
 import { useEffect, useState, useCallback } from "react";
 import {
   Users,
@@ -25,8 +26,11 @@ import {
   fetchSubscribers,
   mapApiSubscriberToRecord,
   ORBIT_API_URL,
+  setMerchantApiKey,
 } from "@/lib/api";
 import { CustomerDetailDrawer } from "../drawers/customer-detail-drawer";
+import { PastDueResolutionModal } from "../modals/past-due-resolution-modal";
+import { retrySignedPull } from "@/lib/billing-resolution";
 
 export const INITIAL_SUBSCRIBERS: SubscriberRecord[] = [
   {
@@ -94,6 +98,7 @@ export const INITIAL_SUBSCRIBERS: SubscriberRecord[] = [
 ];
 
 export function SubscribersView() {
+  const t = useTranslations("Tables");
   const { user } = useAuth();
   const [subscribers, setSubscribers] = useState<SubscriberRecord[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
@@ -119,6 +124,8 @@ export function SubscribersView() {
   // Customer Management Drawer
   const [selectedSubscriber, setSelectedSubscriber] = useState<SubscriberRecord | null>(null);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+  const [resolutionSubscriber, setResolutionSubscriber] = useState<SubscriberRecord | null>(null);
+  const [apiKeyInput, setApiKeyInput] = useState("");
 
   // Load subscribers from Merchant API or fallback to Demo Data
   const loadSubscribers = useCallback(async () => {
@@ -177,6 +184,15 @@ export function SubscribersView() {
   const handleExecutePull = async (sub: SubscriberRecord) => {
     setExecutingPullId(sub.id);
     setPullSuccessMessage(null);
+    if (!isDemoMode) {
+      try {
+        const result = await retrySignedPull(sub.id, setPullSuccessMessage);
+        setPullSuccessMessage(result.pending ? `Pull submitted; confirmation pending. Transaction: ${result.txHash}` : `Pull confirmed. Transaction: ${result.txHash}`);
+        if (!result.pending) await loadSubscribers();
+      } catch (reason) { setError(reason instanceof Error ? reason.message : "Pull failed"); }
+      finally { setExecutingPullId(null); }
+      return;
+    }
 
     setTimeout(() => {
       setSubscribers((prev) =>
@@ -213,6 +229,11 @@ export function SubscribersView() {
 
     setIsBatchPulling(true);
     setPullSuccessMessage(null);
+    if (!isDemoMode) {
+      try { for (const subscriber of dueSubs) await handleExecutePull(subscriber); }
+      finally { setIsBatchPulling(false); }
+      return;
+    }
 
     const totalPullAmount = dueSubs.reduce((acc, s) => acc + s.amount, 0);
 
@@ -334,6 +355,13 @@ export function SubscribersView() {
           )}
         </div>
       </div>
+
+      {!isDemoMode && <form className="flex flex-wrap items-center gap-3 rounded-xl border p-4 text-xs" onSubmit={(event) => {
+        event.preventDefault(); setMerchantApiKey(apiKeyInput); setApiKeyInput(""); void loadSubscribers();
+      }}><label htmlFor="subscriber-api-key">Merchant API key</label><input id="subscriber-api-key" type="password" autoComplete="off"
+        value={apiKeyInput} onChange={(event) => setApiKeyInput(event.target.value)} required placeholder="orb_test_…"
+        className="min-w-0 flex-1 rounded-lg border px-3 py-2" /><button type="submit" className="button button-secondary px-3 py-2">Connect API</button>
+        <span className="text-neutral-500">Held in memory for this page session.</span></form>}
 
       {/* Success Notification Banner */}
       {pullSuccessMessage && (
@@ -498,13 +526,13 @@ export function SubscribersView() {
             <table className="w-full text-left text-xs">
               <thead className="bg-neutral-50/80 border-b border-black/10 text-neutral-500 uppercase tracking-wider font-semibold text-[10px]">
                 <tr>
-                  <th className="py-3.5 px-5">Subscriber Vault</th>
-                  <th className="py-3.5 px-4">Plan Tier</th>
-                  <th className="py-3.5 px-4">Allowance Rate</th>
-                  <th className="py-3.5 px-4">Total Settled</th>
-                  <th className="py-3.5 px-4">Next Pull</th>
-                  <th className="py-3.5 px-4">Vault Status</th>
-                  <th className="py-3.5 px-5 text-right">Actions</th>
+                  <th className="py-3.5 px-5">{t("subscribers.vault")}</th>
+                  <th className="py-3.5 px-4">{t("subscribers.plan")}</th>
+                  <th className="py-3.5 px-4">{t("subscribers.rate")}</th>
+                  <th className="py-3.5 px-4">{t("subscribers.settled")}</th>
+                  <th className="py-3.5 px-4">{t("subscribers.nextPull")}</th>
+                  <th className="py-3.5 px-4">{t("subscribers.status")}</th>
+                  <th className="py-3.5 px-5 text-right">{t("subscribers.actions")}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-black/5 text-neutral-700">
@@ -634,6 +662,8 @@ export function SubscribersView() {
                       {/* Action Buttons */}
                       <td className="py-4 px-5 text-right" onClick={(e) => e.stopPropagation()}>
                         <div className="flex items-center justify-end gap-1.5">
+                          {isPastDue && <button className="button button-secondary h-7 px-2 text-xs text-red-700"
+                            onClick={() => setResolutionSubscriber(sub)}>Resolve payment</button>}
                           {isDue && (
                             <button
                               onClick={() => handleExecutePull(sub)}
@@ -700,6 +730,10 @@ export function SubscribersView() {
       </div>
 
       {/* Customer Detail Drawer */}
+      {resolutionSubscriber && <PastDueResolutionModal key={resolutionSubscriber.id} subscriber={resolutionSubscriber} demo={isDemoMode}
+        onClose={() => setResolutionSubscriber(null)} onUpdated={(updated) => {
+          if (updated) handleSubscriberUpdated(updated); else void loadSubscribers();
+        }} />}
       <CustomerDetailDrawer
         isOpen={isDrawerOpen}
         onClose={() => setIsDrawerOpen(false)}
