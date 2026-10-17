@@ -700,10 +700,8 @@ fn test_contract_events_published_for_all_entrypoints() {
         merchant.clone().to_val(),
     ];
     let pull_data = (amount, 5000u64).into_val(&env);
-    let expected_pull = soroban_sdk::vec![
-        &env,
-        (orbit_client.address.clone(), pull_topics, pull_data),
-    ];
+    let expected_pull =
+        soroban_sdk::vec![&env, (orbit_client.address.clone(), pull_topics, pull_data),];
     assert_eq!(
         env.events().all().filter_by_contract(&orbit_client.address),
         expected_pull
@@ -1447,7 +1445,12 @@ fn test_register_plan_rejects_plan_id_owned_by_another_merchant() {
 
     // The owner can refresh the terms, which also reactivates the plan
     orbit_client.deactivate_plan(&merchant_a, &plan_id);
-    assert!(!orbit_client.get_plan(&plan_id).expect("plan exists").is_active);
+    assert!(
+        !orbit_client
+            .get_plan(&plan_id)
+            .expect("plan exists")
+            .is_active
+    );
 
     orbit_client.register_plan(&merchant_a, &plan_id, &token, &40_0000000, &172800, &name);
     let plan = orbit_client.get_plan(&plan_id).expect("plan should exist");
@@ -1484,7 +1487,12 @@ fn test_deactivate_plan_requires_owning_merchant() {
         }])
         .try_deactivate_plan(&other, &plan_id);
     assert!(res.is_err());
-    assert!(orbit_client.get_plan(&plan_id).expect("plan exists").is_active);
+    assert!(
+        orbit_client
+            .get_plan(&plan_id)
+            .expect("plan exists")
+            .is_active
+    );
 }
 
 #[test]
@@ -1538,7 +1546,12 @@ fn test_deactivate_plan_blocks_new_vaults_but_existing_vaults_keep_billing() {
 
     // Merchant deactivates the plan: no NEW subscriptions, existing ones live
     orbit_client.deactivate_plan(&merchant, &plan_id);
-    assert!(!orbit_client.get_plan(&plan_id).expect("plan exists").is_active);
+    assert!(
+        !orbit_client
+            .get_plan(&plan_id)
+            .expect("plan exists")
+            .is_active
+    );
 
     let res = orbit_client.try_create_vault_from_plan(&new_user, &plan_id);
     assert!(res.is_err());
@@ -1951,7 +1964,6 @@ fn test_metered_events_published_for_creation_and_pulls() {
     );
 }
 
-
 // ----------------------------------------------------------------------------
 // #123–126: Soulbound credentials, bitmap registry, swap and escrow settlement
 // ----------------------------------------------------------------------------
@@ -1963,7 +1975,9 @@ fn test_badge_issuance_renewal_expiration_and_revocation() {
     let user = Address::generate(&env);
     let merchant = Address::generate(&env);
     let admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let token = TokenClient::new(&env, &token_id);
     StellarAssetClient::new(&env, &token_id).mint(&user, &1_000);
     let id = env.register(OrbitContract, ());
@@ -1977,7 +1991,10 @@ fn test_badge_issuance_renewal_expiration_and_revocation() {
     assert_eq!(original.subscriber_id, 0);
     assert_eq!(original.expiration_timestamp, 100);
     assert!(client.is_subscriber_active(&user, &merchant));
-    assert_eq!(client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0], 1);
+    assert_eq!(
+        client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0],
+        1
+    );
 
     client.set_subscriber_tier(&user, &merchant, &3);
     env.ledger().set_timestamp(20);
@@ -1988,16 +2005,36 @@ fn test_badge_issuance_renewal_expiration_and_revocation() {
     env.ledger().set_timestamp(121);
     assert!(!client.is_subscriber_active(&user, &merchant));
     assert!(client.mark_subscription_default(&user, &merchant));
-    assert!(!client.get_subscriber_badge(&user, &merchant).unwrap().active);
-    assert_eq!(client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0], 0);
+    assert!(
+        !client
+            .get_subscriber_badge(&user, &merchant)
+            .unwrap()
+            .active
+    );
+    assert_eq!(
+        client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0],
+        0
+    );
 
     client.cancel_vault(&user, &merchant);
     client.create_vault(&user, &merchant, &token_id, &100, &100);
-    assert_eq!(client.get_subscriber_badge(&user, &merchant).unwrap().subscriber_id, 0);
-    assert_eq!(client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0], 1);
+    assert_eq!(
+        client
+            .get_subscriber_badge(&user, &merchant)
+            .unwrap()
+            .subscriber_id,
+        0
+    );
+    assert_eq!(
+        client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0],
+        1
+    );
     client.cancel_vault(&user, &merchant);
     assert!(!client.is_subscriber_active(&user, &merchant));
-    assert_eq!(client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0], 0);
+    assert_eq!(
+        client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0],
+        0
+    );
 }
 
 #[test]
@@ -2038,7 +2075,9 @@ fn test_escrow_claim_dispute_and_partial_arbitration() {
     let merchant = Address::generate(&env);
     let arbitrator = Address::generate(&env);
     let admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let token = TokenClient::new(&env, &token_id);
     StellarAssetClient::new(&env, &token_id).mint(&user, &1_000);
     let id = env.register(OrbitContract, ());
@@ -2087,13 +2126,18 @@ impl TestExactOutputRouter {
         recipient: Address,
     ) -> i128 {
         let spent = amount_out.checked_mul(2).unwrap();
-        assert!(spent <= max_amount_in, "Insufficient max input for router quote");
+        assert!(
+            spent <= max_amount_in,
+            "Insufficient max input for router quote"
+        );
         let router = env.current_contract_address();
-        token::Client::new(&env, &settlement_token)
-            .transfer(&router, &recipient, &amount_out);
+        token::Client::new(&env, &settlement_token).transfer(&router, &recipient, &amount_out);
         if max_amount_in > spent {
-            token::Client::new(&env, &payment_token)
-                .transfer(&router, &recipient, &(max_amount_in - spent));
+            token::Client::new(&env, &payment_token).transfer(
+                &router,
+                &recipient,
+                &(max_amount_in - spent),
+            );
         }
         spent
     }
@@ -2106,8 +2150,12 @@ fn test_cross_asset_swap_exact_output_refund_and_slippage_rejection() {
     let user = Address::generate(&env);
     let merchant = Address::generate(&env);
     let admin = Address::generate(&env);
-    let payment = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let settlement = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let payment = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let settlement = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let payment_token = TokenClient::new(&env, &payment);
     let settlement_token = TokenClient::new(&env, &settlement);
     StellarAssetClient::new(&env, &payment).mint(&user, &1_000);
