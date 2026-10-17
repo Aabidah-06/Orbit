@@ -18,9 +18,11 @@ import {
   ShieldCheck,
   X,
 } from "lucide-react";
+import { useTranslations } from "next-intl";
 import Papa from "papaparse";
 import { StrKey } from "@stellar/stellar-sdk";
 import { PayrollRecipient } from "../dashboard-types";
+import { useTeam } from "@/lib/team-context";
 
 const SAMPLE_RECIPIENTS: PayrollRecipient[] = [
   {
@@ -67,6 +69,9 @@ interface RowValidationError {
 }
 
 export function PayrollView() {
+  const t = useTranslations("Tables");
+  const { can } = useTeam();
+  const canRunPayroll = can("runPayroll");
   const [recipients, setRecipients] = useState<PayrollRecipient[]>(SAMPLE_RECIPIENTS);
   const [isExecuting, setIsExecuting] = useState(false);
   const [disbursedSuccess, setDisbursedSuccess] = useState<string | null>(null);
@@ -273,7 +278,7 @@ export function PayrollView() {
 
   // Run Batch Payroll Trigger (simulates on-chain Soroban batch_disburse execution)
   const handleRunBatchPayroll = () => {
-    if (readyCount === 0) return;
+    if (readyCount === 0 || !canRunPayroll) return;
     setIsExecuting(true);
     setDisbursedSuccess(null);
 
@@ -435,27 +440,28 @@ export function PayrollView() {
         <div className="p-5 rounded-xl bg-neutral-900 text-white flex flex-col justify-between shadow-xs">
           <div>
             <div className="text-[10px] font-mono text-neutral-400 uppercase tracking-wider">
-              1-Click Disbursement
+              {t("payroll.oneClick")}
             </div>
             <div className="text-sm font-bold mt-1">
-              Ready to execute batch
+              {t("payroll.readyToExecute")}
             </div>
           </div>
 
           <button
             onClick={handleRunBatchPayroll}
-            disabled={isExecuting || readyCount === 0}
+            disabled={isExecuting || readyCount === 0 || !canRunPayroll}
+            title={canRunPayroll ? undefined : t("payroll.noPermission")}
             className="w-full mt-3 button bg-white text-black hover:bg-neutral-100 font-bold text-xs h-10 px-4 flex items-center justify-center gap-2 disabled:opacity-50 transition-all cursor-pointer shadow-xs"
           >
             {isExecuting ? (
               <>
                 <RotateCw size={14} className="animate-spin text-black" />
-                <span>Broadcasting Batch...</span>
+                <span>{t("payroll.broadcasting")}</span>
               </>
             ) : (
               <>
                 <Zap size={14} className="text-black" />
-                <span>Run Batch Payroll ({readyCount})</span>
+                <span>{t("payroll.runBatch", { count: readyCount })}</span>
               </>
             )}
           </button>
@@ -549,12 +555,12 @@ export function PayrollView() {
             <table className="w-full text-left text-xs">
               <thead className="bg-neutral-50/80 border-b border-black/10 text-neutral-500 uppercase tracking-wider font-semibold text-[10px]">
                 <tr>
-                  <th className="py-3.5 px-5">Contractor</th>
-                  <th className="py-3.5 px-4">Role</th>
-                  <th className="py-3.5 px-4">Stellar Payout Address</th>
-                  <th className="py-3.5 px-4">Amount</th>
-                  <th className="py-3.5 px-4">Status</th>
-                  <th className="py-3.5 px-5 text-right">Action</th>
+                  <th className="py-3.5 px-5">{t("payroll.contractor")}</th>
+                  <th className="py-3.5 px-4">{t("payroll.role")}</th>
+                  <th className="py-3.5 px-4">{t("payroll.address")}</th>
+                  <th className="py-3.5 px-4">{t("payroll.amount")}</th>
+                  <th className="py-3.5 px-4">{t("payroll.status")}</th>
+                  <th className="py-3.5 px-5 text-right">{t("payroll.action")}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-black/5 text-neutral-700">

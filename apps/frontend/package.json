@@ -17,6 +17,7 @@
     "gsap": "^3.12.7",
     "lucide-react": "^0.475.0",
     "next": "15.3.9",
+    "next-intl": "~4.14.9",
     "orbit-monorepo": "file:../..",
     "papaparse": "^5.7.0",
     "react": "^19.0.0",
