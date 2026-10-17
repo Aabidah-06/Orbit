@@ -1655,3 +1655,298 @@ fn test_create_vault_from_plan_emits_vault_created_event() {
     ];
     assert_eq!(env.events().all(), expected);
 }
+
+// ----------------------------------------------------------------------------
+// ISSUE #46: METERED (USAGE-BASED) BILLING
+// ----------------------------------------------------------------------------
+
+const METERED_CAP: i128 = 20_0000000; // 20 USDC per interval
+const METERED_INTERVAL: u64 = 7 * 24 * 60 * 60; // weekly
+
+struct MeteredWorld<'a> {
+    env: Env,
+    user: Address,
+    merchant: Address,
+    token_address: Address,
+    token_client: TokenClient<'a>,
+    orbit_client: OrbitContractClient<'a>,
+}
+
+fn metered_world<'a>() -> MeteredWorld<'a> {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = TokenClient::new(&env, &token_address);
+    StellarAssetClient::new(&env, &token_address).mint(&user, &100_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&user, &orbit_client.address, &100_0000000, &2000000);
+    orbit_client.create_metered_vault(
+        &user,
+        &merchant,
+        &token_address,
+        &METERED_CAP,
+        &METERED_INTERVAL,
+    );
+
+    MeteredWorld {
+        env,
+        user,
+        merchant,
+        token_address,
+        token_client,
+        orbit_client,
+    }
+}
+
+#[test]
+fn test_create_metered_vault_stores_terms() {
+    let w = metered_world();
+    let vault = w
+        .orbit_client
+        .get_metered_vault(&w.user, &w.merchant)
+        .unwrap();
+    assert_eq!(vault.token, w.token_address);
+    assert_eq!(vault.max_amount_per_interval, METERED_CAP);
+    assert_eq!(vault.interval_seconds, METERED_INTERVAL);
+    assert_eq!(vault.current_epoch_start, 1_000);
+    assert_eq!(vault.epoch_spent, 0);
+    // A metered vault doesn't create a fixed-interval vault.
+    assert!(w.orbit_client.get_vault(&w.user, &w.merchant).is_none());
+}
+
+#[test]
+fn test_metered_multiple_partial_pulls_within_interval() {
+    let w = metered_world();
+    w.orbit_client
+        .pull_metered_funds(&w.user, &w.merchant, &3_4500000); // $3.45
+    w.env.ledger().set_timestamp(2_000);
+    w.orbit_client
+        .pull_metered_funds(&w.user, &w.merchant, &8_2000000); // $8.20
+    w.orbit_client
+        .pull_metered_funds(&w.user, &w.merchant, &8_3500000); // exactly up to the cap
+
+    assert_eq!(w.token_client.balance(&w.merchant), 20_0000000);
+    assert_eq!(w.token_client.balance(&w.user), 80_0000000);
+    let vault = w
+        .orbit_client
+        .get_metered_vault(&w.user, &w.merchant)
+        .unwrap();
+    assert_eq!(vault.epoch_spent, METERED_CAP);
+    assert_eq!(vault.current_epoch_start, 1_000, "still the same epoch");
+}
+
+#[test]
+#[should_panic(expected = "Interval spending limit exceeded")]
+fn test_metered_pull_exceeding_remaining_allowance_panics() {
+    let w = metered_world();
+    w.orbit_client
+        .pull_metered_funds(&w.user, &w.merchant, &15_0000000);
+    w.orbit_client
+        .pull_metered_funds(&w.user, &w.merchant, &5_0000001); // 1 stroop over
+}
+
+#[test]
+#[should_panic(expected = "Interval spending limit exceeded")]
+fn test_metered_allowance_does_not_reset_before_interval_elapses() {
+    let w = metered_world();
+    w.orbit_client
+        .pull_metered_funds(&w.user, &w.merchant, &METERED_CAP);
+    w.env.ledger().set_timestamp(1_000 + METERED_INTERVAL - 1);
+    w.orbit_client.pull_metered_funds(&w.user, &w.merchant, &1);
+}
+
+#[test]
+fn test_metered_epoch_rolls_over_and_resets_allowance() {
+    let w = metered_world();
+    w.orbit_client
+        .pull_metered_funds(&w.user, &w.merchant, &METERED_CAP);
+
+    let next_epoch = 1_000 + METERED_INTERVAL;
+    w.env.ledger().set_timestamp(next_epoch);
+    w.orbit_client
+        .pull_metered_funds(&w.user, &w.merchant, &4_0000000);
+
+    let vault = w
+        .orbit_client
+        .get_metered_vault(&w.user, &w.merchant)
+        .unwrap();
+    assert_eq!(vault.current_epoch_start, next_epoch);
+    assert_eq!(vault.epoch_spent, 4_0000000);
+    assert_eq!(w.token_client.balance(&w.merchant), 24_0000000);
+}
+
+#[test]
+fn test_cancel_vault_removes_metered_vault() {
+    let w = metered_world();
+    w.orbit_client.cancel_vault(&w.user, &w.merchant);
+    assert!(w
+        .orbit_client
+        .get_metered_vault(&w.user, &w.merchant)
+        .is_none());
+}
+
+#[test]
+#[should_panic(expected = "Metered vault does not exist")]
+fn test_pull_after_cancelling_metered_vault_fails() {
+    let w = metered_world();
+    w.orbit_client.cancel_vault(&w.user, &w.merchant);
+    w.orbit_client
+        .pull_metered_funds(&w.user, &w.merchant, &1_0000000);
+}
+
+#[test]
+fn test_metered_and_fixed_vaults_for_same_pair_are_independent() {
+    let w = metered_world();
+    w.orbit_client
+        .create_vault(&w.user, &w.merchant, &w.token_address, &29_0000000, &86400);
+    w.orbit_client
+        .pull_metered_funds(&w.user, &w.merchant, &5_0000000);
+    assert_eq!(
+        w.orbit_client
+            .get_vault(&w.user, &w.merchant)
+            .unwrap()
+            .amount_per_interval,
+        29_0000000
+    );
+    assert_eq!(
+        w.orbit_client
+            .get_metered_vault(&w.user, &w.merchant)
+            .unwrap()
+            .epoch_spent,
+        5_0000000
+    );
+
+    // cancel_vault clears both.
+    w.orbit_client.cancel_vault(&w.user, &w.merchant);
+    assert!(w.orbit_client.get_vault(&w.user, &w.merchant).is_none());
+    assert!(w
+        .orbit_client
+        .get_metered_vault(&w.user, &w.merchant)
+        .is_none());
+}
+
+#[test]
+#[should_panic(expected = "max_amount_per_interval must be positive")]
+fn test_create_metered_vault_rejects_zero_cap() {
+    let w = metered_world();
+    w.orbit_client.create_metered_vault(
+        &w.user,
+        &w.merchant,
+        &w.token_address,
+        &0,
+        &METERED_INTERVAL,
+    );
+}
+
+#[test]
+#[should_panic(expected = "interval_seconds must be greater than zero")]
+fn test_create_metered_vault_rejects_zero_interval() {
+    let w = metered_world();
+    w.orbit_client
+        .create_metered_vault(&w.user, &w.merchant, &w.token_address, &METERED_CAP, &0);
+}
+
+#[test]
+#[should_panic(expected = "amount must be positive")]
+fn test_metered_pull_rejects_non_positive_amount() {
+    let w = metered_world();
+    w.orbit_client.pull_metered_funds(&w.user, &w.merchant, &0);
+}
+
+#[test]
+#[should_panic]
+fn test_metered_pull_authorized_by_different_merchant_fails() {
+    let w = metered_world();
+    let other_merchant = Address::generate(&w.env);
+    // `mock_auths` returns a client with per-call auth, so chain the call on it.
+    w.orbit_client
+        .mock_auths(&[MockAuth {
+            address: &other_merchant,
+            invoke: &MockAuthInvoke {
+                contract: &w.orbit_client.address,
+                fn_name: "pull_metered_funds",
+                args: (&w.user, &w.merchant, 1_0000000i128).into_val(&w.env),
+                sub_invokes: &[],
+            },
+        }])
+        .pull_metered_funds(&w.user, &w.merchant, &1_0000000);
+}
+
+#[test]
+#[should_panic]
+fn test_create_metered_vault_requires_user_auth() {
+    let env = Env::default();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+    // No auths mocked: user.require_auth() must fail.
+    orbit_client.create_metered_vault(&user, &merchant, &token, &METERED_CAP, &METERED_INTERVAL);
+}
+
+#[test]
+fn test_metered_events_published_for_creation_and_pulls() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    StellarAssetClient::new(&env, &token_address).mint(&user, &100_0000000);
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+    TokenClient::new(&env, &token_address).approve(
+        &user,
+        &orbit_client.address,
+        &100_0000000,
+        &2000000,
+    );
+
+    orbit_client.create_metered_vault(
+        &user,
+        &merchant,
+        &token_address,
+        &METERED_CAP,
+        &METERED_INTERVAL,
+    );
+    let create_topics = soroban_sdk::vec![
+        &env,
+        Symbol::new(&env, "metered_vault_created").to_val(),
+        user.clone().to_val(),
+        merchant.clone().to_val(),
+    ];
+    let create_data = (token_address.clone(), METERED_CAP, METERED_INTERVAL).into_val(&env);
+    assert_eq!(
+        env.events().all().filter_by_contract(&orbit_client.address),
+        soroban_sdk::vec![
+            &env,
+            (orbit_client.address.clone(), create_topics, create_data)
+        ]
+    );
+
+    orbit_client.pull_metered_funds(&user, &merchant, &3_4500000);
+    let pull_topics = soroban_sdk::vec![
+        &env,
+        Symbol::new(&env, "metered_funds_pulled").to_val(),
+        user.clone().to_val(),
+        merchant.clone().to_val(),
+    ];
+    let pull_data = (3_4500000i128, 3_4500000i128, METERED_CAP).into_val(&env);
+    assert_eq!(
+        env.events().all().filter_by_contract(&orbit_client.address),
+        soroban_sdk::vec![&env, (orbit_client.address.clone(), pull_topics, pull_data)]
+    );
+}
