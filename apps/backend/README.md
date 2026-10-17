@@ -599,6 +599,9 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
   }
   ```
 
+## Customer Portal (#74)
+
+See [CUSTOMER_PORTAL.md](CUSTOMER_PORTAL.md) for challenge signing, wallet-scoped routes, cancellation, database migrations and security considerations.
 
 ## Coupons and promotional quotes (#75 — experimental)
 
