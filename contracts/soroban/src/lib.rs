@@ -71,6 +71,32 @@ pub struct PaymentSplit {
     pub amount: i128,
 }
 
+/// Storage key for a metered (usage-based) vault (#46). An enum on purpose:
+/// `#[contracttype]` structs encode as a map of field names without the type
+/// name, so a struct with the same fields as `VaultKey` would share its storage
+/// entry. The enum encodes as `["Vault", user, merchant]`, which can't collide.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MeteredVaultKey {
+    /// (user, merchant)
+    Vault(Address, Address),
+}
+
+/// Usage-based allowance (#46): the merchant may pull variable amounts, any
+/// number of times, as long as the total within the current epoch stays at or
+/// below `max_amount_per_interval`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MeteredVaultData {
+    pub token: Address,
+    pub max_amount_per_interval: i128,
+    pub interval_seconds: u64,
+    /// Ledger timestamp the current billing epoch started at.
+    pub current_epoch_start: u64,
+    /// Total pulled in the current epoch.
+    pub epoch_spent: i128,
+}
+
 /// Storage key for the on-chain plan catalog (#95). `plan_id` is unique
 /// across the contract so anyone can read a plan back with `get_plan`.
 #[contracttype]
@@ -185,6 +211,8 @@ impl OrbitContract {
 
     /// Close a vault so the merchant can no longer pull from it.
     /// Only the user can cancel. The token allowance is left untouched.
+    /// Removes the fixed-interval vault and/or the metered vault (#46) for the
+    /// pair; panics if neither exists.
     pub fn cancel_vault(env: Env, user: Address, merchant: Address) {
         user.require_auth();
 
@@ -192,10 +220,18 @@ impl OrbitContract {
             user: user.clone(),
             merchant: merchant.clone(),
         };
+        let metered_key = MeteredVaultKey::Vault(user.clone(), merchant.clone());
 
-        assert!(env.storage().persistent().has(&key), "Vault does not exist");
+        let has_fixed = env.storage().persistent().has(&key);
+        let has_metered = env.storage().persistent().has(&metered_key);
+        assert!(has_fixed || has_metered, "Vault does not exist");
 
-        env.storage().persistent().remove(&key);
+        if has_fixed {
+            env.storage().persistent().remove(&key);
+        }
+        if has_metered {
+            env.storage().persistent().remove(&metered_key);
+        }
 
         // Emit contract event
         env.events()
@@ -317,6 +353,119 @@ impl OrbitContract {
         // Extend TTL on each pull for both the vault entry and the contract instance
         let (threshold, extend_to) = calculate_ttl_params(vault.interval_seconds);
         env.storage().persistent().extend_ttl(&key, threshold, extend_to);
+        env.storage().instance().extend_ttl(threshold, extend_to);
+    }
+
+    // --------------------------------------------------------------------
+    // METERED (USAGE-BASED) BILLING (#46)
+    // --------------------------------------------------------------------
+
+    /// Create a usage-based allowance: the merchant may pull variable amounts
+    /// up to `max_amount_per_interval` in total per `interval_seconds` epoch.
+    /// Re-creating replaces the terms and starts a fresh epoch.
+    pub fn create_metered_vault(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        token: Address,
+        max_amount_per_interval: i128,
+        interval_seconds: u64,
+    ) {
+        user.require_auth();
+
+        assert!(
+            max_amount_per_interval > 0,
+            "max_amount_per_interval must be positive"
+        );
+        assert!(
+            interval_seconds > 0,
+            "interval_seconds must be greater than zero"
+        );
+
+        let key = MeteredVaultKey::Vault(user.clone(), merchant.clone());
+        let vault = MeteredVaultData {
+            token: token.clone(),
+            max_amount_per_interval,
+            interval_seconds,
+            current_epoch_start: env.ledger().timestamp(),
+            epoch_spent: 0,
+        };
+        env.storage().persistent().set(&key, &vault);
+
+        env.events().publish(
+            (Symbol::new(&env, "metered_vault_created"), user, merchant),
+            (token, max_amount_per_interval, interval_seconds),
+        );
+
+        let (threshold, extend_to) = calculate_ttl_params(interval_seconds);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, extend_to);
+        env.storage().instance().extend_ttl(threshold, extend_to);
+    }
+
+    /// Read a metered vault. No authorization and no storage mutation.
+    pub fn get_metered_vault(
+        env: Env,
+        user: Address,
+        merchant: Address,
+    ) -> Option<MeteredVaultData> {
+        let key = MeteredVaultKey::Vault(user, merchant);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Pull a variable `amount` against the current epoch's allowance. Several
+    /// partial pulls per epoch are allowed until `max_amount_per_interval` is
+    /// reached; the allowance resets once `interval_seconds` has elapsed since
+    /// the epoch started.
+    pub fn pull_metered_funds(env: Env, user: Address, merchant: Address, amount: i128) {
+        merchant.require_auth();
+
+        assert!(amount > 0, "amount must be positive");
+
+        let key = MeteredVaultKey::Vault(user.clone(), merchant.clone());
+        let mut vault: MeteredVaultData = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Metered vault does not exist");
+
+        // Epoch rollover: a new interval resets the allowance.
+        let now = env.ledger().timestamp();
+        if now
+            >= vault
+                .current_epoch_start
+                .saturating_add(vault.interval_seconds)
+        {
+            vault.current_epoch_start = now;
+            vault.epoch_spent = 0;
+        }
+
+        let new_spent = vault
+            .epoch_spent
+            .checked_add(amount)
+            .expect("Interval spending limit exceeded");
+        assert!(
+            new_spent <= vault.max_amount_per_interval,
+            "Interval spending limit exceeded"
+        );
+
+        // Record the spend before moving funds (checks-effects-interactions).
+        vault.epoch_spent = new_spent;
+        env.storage().persistent().set(&key, &vault);
+
+        let token_client = token::Client::new(&env, &vault.token);
+        token_client.transfer_from(&env.current_contract_address(), &user, &merchant, &amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "metered_funds_pulled"), user, merchant),
+            (amount, vault.epoch_spent, vault.max_amount_per_interval),
+        );
+
+        let (threshold, extend_to) = calculate_ttl_params(vault.interval_seconds);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, extend_to);
         env.storage().instance().extend_ttl(threshold, extend_to);
     }
 
