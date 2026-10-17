@@ -61,12 +61,17 @@
       "plans": "Planos de assinatura",
       "subscribers": "Assinantes",
       "payroll": "Folha em lote",
+      "multisig": "Sala multifirma",
+      "passes": "Passes de presente",
+      "domains": "Domínios personalizados",
       "links": "Links de pagamento",
       "team": "Equipe e permissões",
       "developers": "Portal do desenvolvedor"
     },
     "badges": {
       "superpower": "Superpoder",
+      "multisig": "M-de-N",
+      "oneTime": "Pagamento único",
       "api": "API"
     },
     "titles": {
@@ -74,6 +79,9 @@
       "plans": "Planos de assinatura",
       "subscribers": "Assinantes",
       "payroll": "Motor de folha em lote",
+      "multisig": "Sala de coordenação multifirma",
+      "passes": "Links de presente e passes pré-pagos",
+      "domains": "Domínios personalizados e SSL",
       "links": "Links de pagamento",
       "team": "Equipe e permissões",
       "developers": "Portal do desenvolvedor"

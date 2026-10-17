@@ -3,6 +3,9 @@ export type DashboardTab =
   | "plans"
   | "subscribers"
   | "payroll"
+  | "multisig"
+  | "passes"
+  | "domains"
   | "links"
   | "team"
   | "developers";
@@ -129,4 +132,129 @@ export interface ApiKeyRecord {
   environment: "test" | "live";
   lastUsed: string;
   createdAt: string;
+}
+
+/* ------------------------------------------------------------------ *
+ * Multi-sig coordination room (#144)
+ * ------------------------------------------------------------------ */
+
+export type MultisigSignatureState = "approved" | "pending" | "rejected";
+
+export type MultisigProposalState =
+  | "collecting"
+  | "ready"
+  | "broadcast"
+  | "rejected"
+  | "expired";
+
+export type MultisigProposalKind = "payroll" | "plan_update" | "treasury";
+
+export interface MultisigSigner {
+  id: string;
+  name: string;
+  walletAddress: string;
+  state: MultisigSignatureState;
+  signedAt?: string;
+  signedXdr?: string;
+}
+
+export interface MultisigProposal {
+  id: string;
+  title: string;
+  description: string;
+  kind: MultisigProposalKind;
+  amount: number;
+  currency: string;
+  threshold: number;
+  signers: MultisigSigner[];
+  state: MultisigProposalState;
+  createdAt: string;
+  expiresAt: string;
+  txHash?: string;
+}
+
+/* ------------------------------------------------------------------ *
+ * Custom domain & SSL mapping (#145)
+ * ------------------------------------------------------------------ */
+
+export type DomainSslState = "active" | "pending_dns" | "issuing" | "error";
+
+export interface VanitySlug {
+  id: string;
+  slug: string;
+  planId: string;
+  planName: string;
+  createdAt: string;
+}
+
+export interface CustomDomain {
+  id: string;
+  hostname: string;
+  cnameTarget: string;
+  txtName: string;
+  txtValue: string;
+  sslState: DomainSslState;
+  verificationToken: string;
+  vanitySlugs: VanitySlug[];
+  createdAt: string;
+  verificationChecks: number;
+  lastCheckedAt?: string;
+  error?: string;
+}
+
+/* ------------------------------------------------------------------ *
+ * Gift links & pre-paid passes (#146)
+ * ------------------------------------------------------------------ */
+
+export type GiftClaimState = "unclaimed" | "claimed" | "expired";
+
+export interface GiftPass {
+  id: string;
+  code: string;
+  claimUrl: string;
+  planId: string;
+  planName: string;
+  monthlyAmount: number;
+  months: number;
+  amount: number;
+  state: GiftClaimState;
+  createdAt: string;
+  expiresAt: string;
+  claimedAt?: string;
+  claimedBy?: string;
+}
+
+/* ------------------------------------------------------------------ *
+ * Batch payroll dry-run simulation (#147)
+ * ------------------------------------------------------------------ */
+
+export type PayrollCheckState = "pass" | "warning" | "fail";
+
+export interface PayrollRecipientCheck {
+  id: string;
+  name: string;
+  walletAddress: string;
+  amount: number;
+  trustline: PayrollCheckState;
+  allowance: PayrollCheckState;
+  message?: string;
+}
+
+export interface PayrollSimulationResult {
+  simulatedAt: string;
+  source: "rpc" | "local";
+  recipientCount: number;
+  totalUsdc: number;
+  feeXlm: number;
+  cpuInstructions: number;
+  maxCpuInstructions: number;
+  transactionSizeBytes: number;
+  footprintReads: number;
+  footprintWrites: number;
+  latestLedger: number;
+  minResourceFee: string;
+  merchantAllowance: number;
+  checks: PayrollRecipientCheck[];
+  warnings: string[];
+  error?: string;
 }
