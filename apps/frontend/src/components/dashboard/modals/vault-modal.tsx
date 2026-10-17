@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { X, Wallet, CheckCircle2, Shield } from "lucide-react";
+import { useTranslations } from "next-intl";
 import { MerchantUser } from "@/lib/auth-context";
 
 interface VaultModalProps {
@@ -12,6 +13,8 @@ interface VaultModalProps {
 }
 
 export function VaultModal({ isOpen, onClose, user, onUpdateVault }: VaultModalProps) {
+  const t = useTranslations("VaultModal");
+  const tc = useTranslations("Common");
   const [stellarAddress, setStellarAddress] = useState(
     user.linkedVaults?.stellar || (user.walletAddress?.startsWith("G") ? user.walletAddress : "")
   );
@@ -41,10 +44,10 @@ export function VaultModal({ isOpen, onClose, user, onUpdateVault }: VaultModalP
             </div>
             <div>
               <h3 className="text-base font-bold text-black tracking-tight">
-                Manage Linked Settlement Vault
+                {t("title")}
               </h3>
               <p className="text-xs text-neutral-500">
-                Non-custodial destination address for recurring USDC pulls.
+                {t("description")}
               </p>
             </div>
           </div>
@@ -61,19 +64,19 @@ export function VaultModal({ isOpen, onClose, user, onUpdateVault }: VaultModalP
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <label className="text-xs font-semibold text-black uppercase tracking-wider">
-                Stellar Soroban Vault (USDC)
+                {t("stellarVault")}
               </label>
-              <span className="text-[10px] font-mono text-neutral-400">Freighter / Albedo (Starts with G)</span>
+              <span className="text-[10px] font-mono text-neutral-400">{t("walletHint")}</span>
             </div>
             <input
               type="text"
-              placeholder="e.g. GB3XQ4...94QA"
+              placeholder={t("placeholder")}
               value={stellarAddress}
               onChange={(e) => setStellarAddress(e.target.value)}
               className="w-full rounded-lg border border-black/10 px-3.5 py-2.5 text-xs font-mono text-black focus:outline-hidden focus:ring-1 focus:ring-black focus:border-black"
             />
             <p className="text-[11px] text-neutral-500 mt-1">
-              Where subscription pulls from Stellar users will settle.
+              {t("settleNote")}
             </p>
           </div>
 
@@ -81,7 +84,7 @@ export function VaultModal({ isOpen, onClose, user, onUpdateVault }: VaultModalP
           {savedSuccess && (
             <div className="p-3 rounded-lg bg-emerald-50 text-emerald-800 text-xs flex items-center gap-2">
               <CheckCircle2 size={16} className="text-emerald-600" />
-              <span>Settlement vault successfully updated.</span>
+              <span>{t("success")}</span>
             </div>
           )}
 
@@ -91,13 +94,13 @@ export function VaultModal({ isOpen, onClose, user, onUpdateVault }: VaultModalP
               onClick={onClose}
               className="button button-secondary text-xs h-9 px-4"
             >
-              Cancel
+              {tc("cancel")}
             </button>
             <button
               type="submit"
               className="button button-primary text-xs h-9 px-4"
             >
-              Save Linked Vault
+              {t("submit")}
             </button>
           </div>
         </form>

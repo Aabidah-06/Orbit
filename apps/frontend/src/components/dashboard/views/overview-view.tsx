@@ -15,6 +15,7 @@ import {
   Users,
   ExternalLink,
 } from "lucide-react";
+import { useTranslations } from "next-intl";
 import { MerchantUser, useAuth } from "@/lib/auth-context";
 import { connectFreighter } from "@/lib/freighter";
 import { DashboardTab, NetworkId, NETWORKS } from "../dashboard-types";
@@ -30,6 +31,7 @@ export function OverviewView({
   activeNetwork,
   onNavigateTab,
 }: OverviewViewProps) {
+  const t = useTranslations("Overview");
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [timeframe, setTimeframe] = useState<"7D" | "30D" | "ALL">("30D");
 
@@ -63,13 +65,13 @@ export function OverviewView({
 
   // Mock settled revenue curve data points
   const revenuePoints = [
-    { label: "Day 1", amount: 450, x: 20, y: 130 },
-    { label: "Day 5", amount: 920, x: 80, y: 110 },
-    { label: "Day 10", amount: 1480, x: 140, y: 95 },
-    { label: "Day 15", amount: 2150, x: 200, y: 80 },
-    { label: "Day 20", amount: 3200, x: 260, y: 55 },
-    { label: "Day 25", amount: 4100, x: 320, y: 38 },
-    { label: "Day 30", amount: 4820, x: 380, y: 20 },
+    { day: 1, amount: 450, x: 20, y: 130 },
+    { day: 5, amount: 920, x: 80, y: 110 },
+    { day: 10, amount: 1480, x: 140, y: 95 },
+    { day: 15, amount: 2150, x: 200, y: 80 },
+    { day: 20, amount: 3200, x: 260, y: 55 },
+    { day: 25, amount: 4100, x: 320, y: 38 },
+    { day: 30, amount: 4820, x: 380, y: 20 },
   ];
 
   const [hoveredPoint, setHoveredPoint] = useState<(typeof revenuePoints)[0] | null>(null);
@@ -85,10 +87,10 @@ export function OverviewView({
             </div>
             <div>
               <h2 className="text-base font-semibold text-black tracking-tight">
-                Settlement Treasury Vault (USDC)
+                {t("vaultTitle")}
               </h2>
               <p className="text-xs text-neutral-500 mt-0.5">
-                On-chain destination account where recurring USDC pulls and subscription revenue settle automatically.
+                {t("vaultDescription")}
               </p>
             </div>
           </div>
@@ -98,7 +100,7 @@ export function OverviewView({
             className="button button-secondary text-xs h-9 px-3 shrink-0 self-start md:self-auto inline-flex items-center gap-1.5 disabled:opacity-60"
           >
             <Wallet size={14} />
-            {isConnecting ? "Connecting..." : isConnected ? "Change Wallet" : "Connect Wallet"}
+            {isConnecting ? t("connecting") : isConnected ? t("changeWallet") : t("connectWallet")}
           </button>
         </div>
 
@@ -115,7 +117,7 @@ export function OverviewView({
             <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 shrink-0"></div>
             <div>
               <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider">
-                Active Settlement Address
+                {t("activeSettlementAddress")}
               </div>
               <div className="font-mono text-xs font-semibold text-black mt-0.5 break-all sm:break-normal">
                 {settlementAddress}
@@ -125,12 +127,12 @@ export function OverviewView({
 
           <div className="flex items-center gap-2 shrink-0">
             <span className="text-[10px] font-mono px-2.5 py-1 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 font-medium">
-              NON-CUSTODIAL · ACTIVE
+              {t("nonCustodialActive")}
             </span>
             <button
               onClick={() => copyToClipboard(settlementAddress, "vault")}
               className="p-1.5 rounded hover:bg-black/5 text-neutral-500 hover:text-black transition-colors"
-              title="Copy address"
+              title={t("copyAddress")}
             >
               {copiedKey === "vault" ? <Check size={14} className="text-emerald-600" /> : <Copy size={14} />}
             </button>
@@ -145,7 +147,7 @@ export function OverviewView({
         <div className="p-5 rounded-xl bg-white border border-black/10 shadow-xs">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">
-              Monthly Recurring (MRR)
+              {t("mrr")}
             </span>
             <span className="text-[11px] font-mono text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200 flex items-center gap-1">
               <TrendingUp size={11} /> +14.2%
@@ -155,7 +157,7 @@ export function OverviewView({
             4,820.00 <span className="text-sm font-semibold text-neutral-500 font-mono">USDC</span>
           </div>
           <div className="text-xs text-neutral-500 mt-1">
-            Across 148 active customer allowance vaults
+            {t("mrrNote")}
           </div>
         </div>
 
@@ -163,17 +165,17 @@ export function OverviewView({
         <div className="p-5 rounded-xl bg-white border border-black/10 shadow-xs">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">
-              Active Subscribers
+              {t("activeSubscribers")}
             </span>
             <span className="text-[11px] font-mono text-neutral-500">
-              100% on-chain
+              {t("onChain")}
             </span>
           </div>
           <div className="text-3xl font-bold text-black mt-2 tracking-tight">
             148
           </div>
           <div className="text-xs text-neutral-500 mt-1">
-            0 chargebacks · 0 payment processor holds
+            {t("subscribersNote")}
           </div>
         </div>
 
@@ -181,17 +183,17 @@ export function OverviewView({
         <div className="p-5 rounded-xl bg-white border border-black/10 shadow-xs">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">
-              Batch Payroll Volume
+              {t("payrollVolume")}
             </span>
             <span className="text-[11px] font-mono text-neutral-500">
-              1-click payouts
+              {t("oneClick")}
             </span>
           </div>
           <div className="text-3xl font-bold text-black mt-2 tracking-tight">
             18,450.00 <span className="text-sm font-semibold text-neutral-500 font-mono">USDC</span>
           </div>
           <div className="text-xs text-neutral-500 mt-1">
-            Disbursed across 42 global contractor wallets
+            {t("payrollNote")}
           </div>
         </div>
 
@@ -199,7 +201,7 @@ export function OverviewView({
         <div className="p-5 rounded-xl bg-white border border-black/10 shadow-xs">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">
-              Protocol Settlement
+              {t("protocolSettlement")}
             </span>
             <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
           </div>
@@ -207,7 +209,7 @@ export function OverviewView({
             &lt; 1.5s
           </div>
           <div className="text-xs text-neutral-500 mt-1">
-            Sub-cent non-custodial pull finality
+            {t("settlementNote")}
           </div>
         </div>
       </div>
@@ -219,24 +221,24 @@ export function OverviewView({
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-5 border-b border-black/5">
             <div>
               <h3 className="text-base font-semibold text-black tracking-tight">
-                Settled Revenue Volume (USDC)
+                {t("revenueTitle")}
               </h3>
               <p className="text-xs text-neutral-500 mt-0.5">
-                Verified pull settlement volume across billing cycles.
+                {t("revenueDescription")}
               </p>
             </div>
             <div className="flex items-center gap-1 bg-neutral-100 p-0.5 rounded-lg">
-              {(["7D", "30D", "ALL"] as const).map((t) => (
+              {(["7D", "30D", "ALL"] as const).map((range) => (
                 <button
-                  key={t}
-                  onClick={() => setTimeframe(t)}
+                  key={range}
+                  onClick={() => setTimeframe(range)}
                   className={`text-xs font-mono px-2.5 py-1 rounded-md transition-colors ${
-                    timeframe === t
+                    timeframe === range
                       ? "bg-white text-black font-bold shadow-2xs"
                       : "text-neutral-500 hover:text-black"
                   }`}
                 >
-                  {t}
+                  {range}
                 </button>
               ))}
             </div>
@@ -301,16 +303,15 @@ export function OverviewView({
               <div
                 className="absolute top-2 left-1/2 -translate-x-1/2 bg-black text-white text-xs px-3 py-1.5 rounded-lg shadow-md font-mono"
               >
-                {hoveredPoint.label}: <span className="font-bold text-emerald-400">{hoveredPoint.amount} USDC</span>
+                {t("day", { day: hoveredPoint.day })}: <span className="font-bold text-emerald-400">{hoveredPoint.amount} USDC</span>
               </div>
             )}
 
             {/* Bottom X-Axis labels */}
             <div className="flex justify-between text-[11px] font-mono text-neutral-400 pt-3 border-t border-black/5">
-              <span>Day 1</span>
-              <span>Day 10</span>
-              <span>Day 20</span>
-              <span>Day 30</span>
+              {[1, 10, 20, 30].map((day) => (
+                <span key={day}>{t("day", { day })}</span>
+              ))}
             </div>
           </div>
         </div>
@@ -319,10 +320,10 @@ export function OverviewView({
         <div className="p-6 rounded-xl bg-white border border-black/10 shadow-xs flex flex-col justify-between">
           <div>
             <h3 className="text-base font-semibold text-black tracking-tight">
-              Quick Operations
+              {t("quickOperations")}
             </h3>
             <p className="text-xs text-neutral-500 mt-0.5">
-              Deploy new revenue flows or trigger automated disbursements.
+              {t("quickDescription")}
             </p>
 
             <div className="space-y-3 mt-5">
@@ -336,10 +337,10 @@ export function OverviewView({
                   </div>
                   <div>
                     <div className="text-xs font-semibold text-black group-hover:text-black">
-                      Create Subscription Plan
+                      {t("createPlan")}
                     </div>
                     <div className="text-[11px] text-neutral-500">
-                      Generate checkout widget snippet
+                      {t("createPlanHint")}
                     </div>
                   </div>
                 </div>
@@ -356,10 +357,10 @@ export function OverviewView({
                   </div>
                   <div>
                     <div className="text-xs font-semibold text-black group-hover:text-black">
-                      Run Batch Payroll
+                      {t("runPayroll")}
                     </div>
                     <div className="text-[11px] text-neutral-500">
-                      Disburse global contractor cuts
+                      {t("runPayrollHint")}
                     </div>
                   </div>
                 </div>
@@ -376,10 +377,10 @@ export function OverviewView({
                   </div>
                   <div>
                     <div className="text-xs font-semibold text-black group-hover:text-black">
-                      Developer API Keys
+                      {t("apiKeys")}
                     </div>
                     <div className="text-[11px] text-neutral-500">
-                      Programmatic pulls & SDK setup
+                      {t("apiKeysHint")}
                     </div>
                   </div>
                 </div>
@@ -390,8 +391,8 @@ export function OverviewView({
 
           <div className="pt-5 mt-5 border-t border-black/5">
             <div className="flex items-center justify-between text-xs text-neutral-500">
-              <span>Protocol State:</span>
-              <span className="font-mono text-emerald-600 font-medium">Ready for Settlement</span>
+              <span>{t("protocolState")}</span>
+              <span className="font-mono text-emerald-600 font-medium">{t("readyForSettlement")}</span>
             </div>
           </div>
         </div>
@@ -402,14 +403,14 @@ export function OverviewView({
         <div className="flex items-center justify-between pb-4 border-b border-black/5">
           <div>
             <h3 className="text-base font-semibold text-black tracking-tight">
-              Recent On-Chain Activity
+              {t("activityTitle")}
             </h3>
             <p className="text-xs text-neutral-500 mt-0.5">
-              Live pull settlements and payroll disbursements.
+              {t("activityDescription")}
             </p>
           </div>
           <span className="text-xs font-mono text-neutral-500">
-            Real-time feed
+            {t("realtimeFeed")}
           </span>
         </div>
 
@@ -421,16 +422,16 @@ export function OverviewView({
               </div>
               <div>
                 <div className="text-xs font-medium text-black">
-                  Recurring Subscription Pull Settled · <span className="font-mono text-neutral-600">sub_9482</span>
+                  {t("activityPull")} · <span className="font-mono text-neutral-600">sub_9482</span>
                 </div>
                 <div className="text-[11px] font-mono text-neutral-500 mt-0.5">
-                  Vault: 0x71C...3F29 · Plan: Pro Tier (Monthly)
+                  {t("activityPullMeta")}
                 </div>
               </div>
             </div>
             <div className="sm:text-right">
               <div className="font-mono text-xs font-bold text-black">+29.00 USDC</div>
-              <div className="text-[10px] text-neutral-400">12 mins ago · 1.1s finality</div>
+              <div className="text-[10px] text-neutral-400">{t("activityPullTime")}</div>
             </div>
           </div>
 
@@ -441,16 +442,16 @@ export function OverviewView({
               </div>
               <div>
                 <div className="text-xs font-medium text-black">
-                  Batch Payroll Disbursed · <span className="font-mono text-neutral-600">batch_4401</span>
+                  {t("activityBatch")} · <span className="font-mono text-neutral-600">batch_4401</span>
                 </div>
                 <div className="text-[11px] font-mono text-neutral-500 mt-0.5">
-                  Split across 4 engineering contractor wallets in single ledger block
+                  {t("activityBatchMeta")}
                 </div>
               </div>
             </div>
             <div className="sm:text-right">
               <div className="font-mono text-xs font-bold text-black">-3,400.00 USDC</div>
-              <div className="text-[10px] text-neutral-400">1 hr ago · 1.4s finality</div>
+              <div className="text-[10px] text-neutral-400">{t("activityBatchTime")}</div>
             </div>
           </div>
 
@@ -461,16 +462,16 @@ export function OverviewView({
               </div>
               <div>
                 <div className="text-xs font-medium text-black">
-                  New Customer Allowance Vault Authorized · <span className="font-mono text-neutral-600">0x49a...bc71</span>
+                  {t("activityVault")} · <span className="font-mono text-neutral-600">0x49a...bc71</span>
                 </div>
                 <div className="text-[11px] font-mono text-neutral-500 mt-0.5">
-                  Cap: 100 USDC / 30 Days · Handshake approved via Orbit Checkout Widget
+                  {t("activityVaultMeta")}
                 </div>
               </div>
             </div>
             <div className="sm:text-right">
-              <div className="font-mono text-xs text-neutral-500">Allowance Ready</div>
-              <div className="text-[10px] text-neutral-400">3 hrs ago</div>
+              <div className="font-mono text-xs text-neutral-500">{t("allowanceReady")}</div>
+              <div className="text-[10px] text-neutral-400">{t("activityVaultTime")}</div>
             </div>
           </div>
         </div>
