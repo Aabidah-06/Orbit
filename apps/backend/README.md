@@ -27,6 +27,9 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `API_KEY_RATE_LIMIT_MAX` | Requests per window allowed for each API key on authenticated routes (defaults to 100) | `100` |
 | `IP_RATE_LIMIT_MAX` | Requests per window allowed for each client IP on every route (defaults to 300) | `300` |
 | `TRUST_PROXY` | Express `trust proxy` setting; set when behind a load balancer so rate limiting sees the client IP | `1` |
+| `ORACLE_SYNC_INTERVAL_MS` | Background worker refresh interval for the fiat → USDC rate cache (defaults to 300000 = 5 min) | `300000` |
+| `ORACLE_SLIPPAGE_TOLERANCE_BPS` | Maximum rate movement from a subscription's quoted rate that a fiat pull may settle at (defaults to 200 = 2%) | `200` |
+| `ORACLE_FETCH_TIMEOUT_MS` | Price feed request timeout in milliseconds (defaults to 6000) | `6000` |
 
 ### Running the API
 
@@ -47,6 +50,7 @@ The service runs at `http://localhost:3001`.
 | `POST` | `/plans` | API key | Create a new recurring pricing plan |
 | `GET` | `/plans/:id` | Public | Fetch plan and merchant details |
 | `GET` | `/subscribers` | API key | List active subscribers for a merchant |
+| `GET` | `/rates` | Public | Supported fiat → USDC pairs with their newest cached rate |
 | `POST` | `/trigger-pull` | API key | Prepare an unsigned merchant pull transaction |
 | `POST` | `/submit-pull` | API key | Verify and submit a wallet-signed pull transaction |
 | `POST` | `/subscriptions` | Public | Record a customer subscription after handshake |
@@ -122,7 +126,9 @@ Content-Type: `application/json`
 |---|---|---|---|
 | `merchant_id` | `string` (UUID) | No | Taken from the API key. If sent, must match the authenticated merchant (`403` otherwise). |
 | `name` | `string` | Yes | Name of the subscription plan (e.g., `"Pro Plan - 29 USDC/month"`). |
-| `usdc_amount` | `integer` | Yes | Billing amount per interval in raw token units. USDC has 7 decimals, so `290000000` is 29 USDC. This is the same unit as the contract's `amount_per_interval`. |
+| `currency` | `string` | No | Pricing currency. `USDC` (the default) requires `usdc_amount`; `USD` and `EUR` require `price_amount`. Fiat plans settle at the oracle's live rate when a pull is prepared. |
+| `usdc_amount` | `integer` | USDC plans | Billing amount per interval in raw token units. USDC has 7 decimals, so `290000000` is 29 USDC. This is the same unit as the contract's `amount_per_interval`. |
+| `price_amount` | `number` | Fiat plans | Price per interval in the plan's fiat currency (e.g. `20` for 20 USD). The oracle converts it to raw USDC units at pull time. |
 | `interval_seconds` | `number` | Yes | Cadence between billing pulls in seconds (e.g., `2592000` for 30 days). |
 
 #### Example Request
@@ -297,10 +303,11 @@ Prepares an unsigned on-chain pull payment for the merchant's registered public 
 
 The flow:
 1. Loads subscription, plan terms, and merchant wallet address from Supabase.
-2. Builds and simulates `pull_funds(user, merchant)`.
-3. Returns the transaction XDR and network passphrase for signing in the merchant wallet.
-4. The client sends the signed envelope to `POST /submit-pull`.
-5. The API verifies the merchant signature, submits it, and updates billing state after confirmation.
+2. For fiat plans (`USD`/`EUR`), resolves the live USDC rate from the oracle and rejects the pull when the rate moved more than 200 bps (2%) from the subscription's quoted rate. The response then carries `usdc_amount`, `currency`, and the `rate` used; USDC plans report their stored `usdc_amount` unchanged.
+3. Builds and simulates `pull_funds(user, merchant)`.
+4. Returns the transaction XDR and network passphrase for signing in the merchant wallet.
+5. The client sends the signed envelope to `POST /submit-pull`.
+6. The API verifies the merchant signature, submits it, and updates billing state after confirmation.
 
 #### Request Body
 Content-Type: `application/json`
@@ -357,6 +364,26 @@ Status: `200 OK`
   }
   ```
 
+- `409 Conflict`
+  Returned for a fiat plan when the live exchange rate moved more than the slippage tolerance away from the subscription's quoted rate. The pull is not simulated or locked; the response reports both rates and the move in basis points.
+  ```json
+  {
+    "error": "Exchange rate moved 500 bps from the quoted rate, exceeding the 200 bps slippage tolerance",
+    "quoted_rate": 1,
+    "current_rate": 1.05,
+    "move_bps": 500,
+    "max_bps": 200
+  }
+  ```
+
+- `503 Service Unavailable`
+  Returned for a fiat plan when no exchange rate can be resolved (cold cache and the price feed is unreachable).
+  ```json
+  {
+    "error": "Exchange rate for USD/USDC is unavailable"
+  }
+  ```
+
 - `500 Internal Server Error`
   Returned when `ORBIT_CONTRACT_ID` is not set in `.env`, or the Soroban transaction build, simulation, or submission fails (e.g., interval not elapsed, insufficient allowance).
   ```json
@@ -378,6 +405,8 @@ Status: `200 OK`
 Records a customer subscription after the customer has executed the on-chain allowance approval and vault creation handshake with the Orbit contract.
 
 Sets `next_billing_date` to the current timestamp (`new Date().toISOString()`), enabling the initial pull immediately.
+
+For fiat plans the current oracle rate is stored on the subscription as `quoted_rate`, which is the baseline the pull-time slippage guard compares against. When the rate cache is cold the subscription is still created and the first pull stores the baseline instead.
 
 #### Request Body
 Content-Type: `application/json`
@@ -438,6 +467,64 @@ Status: `201 Created`
 
 ---
 
+### 6. GET /rates
+
+#### Purpose
+Lists the supported fiat → USDC conversion pairs with their newest cached exchange rate. Fiat plan creation, subscription quoting, and pull-time pricing all read this cache, which the background oracle worker refreshes every `ORACLE_SYNC_INTERVAL_MS` (default 5 minutes).
+
+No authentication required. On a cold cache the endpoint refreshes once from the live feed; if the feed is unreachable it still answers with `rate: null` and `available: false` per pair.
+
+#### Example Request
+
+```bash
+curl http://localhost:3001/rates
+```
+
+#### Example Success Response
+Status: `200 OK`
+
+```json
+{
+  "pairs": [
+    {
+      "pair": "USD/USDC",
+      "base": "USD",
+      "quote": "USDC",
+      "rate": 1.0204081632653061,
+      "source": "coingecko",
+      "fetched_at": "2026-10-17T12:00:00.000Z",
+      "available": true
+    },
+    {
+      "pair": "EUR/USDC",
+      "base": "EUR",
+      "quote": "USDC",
+      "rate": 1.0869565217391304,
+      "source": "coingecko",
+      "fetched_at": "2026-10-17T12:00:00.000Z",
+      "available": true
+    }
+  ],
+  "supported_pairs": ["USD/USDC", "EUR/USDC"],
+  "slippage_tolerance_bps": 200,
+  "updated_at": "2026-10-17T12:00:00.000Z"
+}
+```
+
+`rate` is how many USDC one unit of the base currency buys, so `usdc_units = price_amount * rate * 10^7`.
+
+#### Error Responses
+
+- `500 Internal Server Error`
+  Returned when the `exchange_rates` table cannot be read.
+  ```json
+  {
+    "error": "permission denied for table exchange_rates"
+  }
+  ```
+
+---
+
 ## Idempotency and Concurrency
 
 ### Idempotency-Key header
@@ -476,11 +563,12 @@ SELECT cron.schedule('purge-idempotency', '0 * * * *', 'SELECT purge_expired_ide
 The API queries the tables defined in `apps/backend/schema.sql`:
 
 - `merchants`: `id` (UUID PK), `wallet_address` (VARCHAR UNIQUE), `name` (VARCHAR), `created_at` (TIMESTAMP).
-- `plans`: `id` (UUID PK), `merchant_id` (UUID FK -> `merchants.id`), `name` (VARCHAR), `usdc_amount` (NUMERIC), `interval_seconds` (BIGINT), `created_at` (TIMESTAMP).
-- `subscriptions`: `id` (UUID PK), `plan_id` (UUID FK -> `plans.id`), `customer_wallet_address` (VARCHAR), `status` (VARCHAR DEFAULT 'active'), `next_billing_date` (TIMESTAMP), `created_at` (TIMESTAMP).
+- `plans`: `id` (UUID PK), `merchant_id` (UUID FK -> `merchants.id`), `name` (VARCHAR), `currency` (`USDC` / `USD` / `EUR`), `usdc_amount` (NUMERIC), `price_amount` (NUMERIC, fiat plans), `interval_seconds` (BIGINT), `created_at` (TIMESTAMP).
+- `subscriptions`: `id` (UUID PK), `plan_id` (UUID FK -> `plans.id`), `customer_wallet_address` (VARCHAR), `status` (VARCHAR DEFAULT 'active'), `next_billing_date` (TIMESTAMP), `quoted_rate` (NUMERIC, fiat plans' slippage baseline), `created_at` (TIMESTAMP).
 - `idempotency_keys`: `id` (UUID PK), `key` (VARCHAR), `merchant_id` (UUID FK -> `merchants.id`, cascade), `request_path` (VARCHAR), `request_hash` (VARCHAR(64)), `status` (`in_progress` / `completed` / `failed`), `response_code` (INTEGER), `response_body` (JSONB), `created_at`, `updated_at`, `expires_at` (TIMESTAMP). Unique on `(merchant_id, key)`.
 - `billing_locks`: `subscription_id` (UUID PK, FK -> `subscriptions.id`), `lock_token` (UUID), `locked_until` (TIMESTAMP), `created_at` (TIMESTAMP).
 - `api_keys`: `id` (UUID PK), `merchant_id` (UUID FK -> `merchants.id`, cascade), `name` (VARCHAR), `key_prefix` (VARCHAR(16)), `key_hash` (VARCHAR(64), unique SHA-256 hex), `environment` (`live` / `test`), `last_used_at`, `created_at`, `revoked_at` (TIMESTAMP). Active while `revoked_at` is null.
+- `exchange_rates`: `base_currency` (VARCHAR), `quote_currency` (VARCHAR DEFAULT 'USDC'), `rate` (NUMERIC), `source` (VARCHAR), `fetched_at` (TIMESTAMP). Append-only history of oracle quotes; the newest row per currency wins. Indexed on `(base_currency, quote_currency, fetched_at DESC)`.
 
 Existing databases can apply the new sections of `schema.sql` (tables 4, 5 and 6, their functions, indexes, `REVOKE`s and RLS statements) as a migration.
 
@@ -491,7 +579,7 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
 1. **Backend Service Role**: The backend Express API connects with `SUPABASE_SERVICE_ROLE_KEY`. The Postgres service role possesses the `BYPASSRLS` privilege, granting the backend full authority to execute queries, create plans, record subscriptions, and advance billing schedules.
 2. **Public Anon Access (Checkout Flow)**: Direct access via the public Supabase anon key is restricted to `SELECT` on `plans` and `merchants`. This allows unauthenticated checkout widgets and client browsers to inspect plan details and the merchant's recipient address.
 3. **No Public Mutations**: Open `INSERT` and `UPDATE` policies have been removed from all tables. Clients cannot directly inject plans, alter subscriptions, or create unauthorized merchant accounts with the anon key.
-4. **Subscription Confidentiality**: The `subscriptions`, `idempotency_keys`, `billing_locks` and `api_keys` tables have **no** policies granted to public/anon roles. Postgres default-deny prevents unauthenticated or client-side anon requests from querying subscriber lists or viewing competitor customer accounts.
+4. **Subscription Confidentiality**: The `subscriptions`, `idempotency_keys`, `billing_locks`, `api_keys` and `exchange_rates` tables have **no** policies granted to public/anon roles. Postgres default-deny prevents unauthenticated or client-side anon requests from querying subscriber lists, viewing competitor customer accounts, or rewriting the rate history.
 
 ---
 

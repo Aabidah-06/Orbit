@@ -346,6 +346,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "initial_timestamp"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "interval_seconds"
                     },
                     "val": {
@@ -354,10 +362,26 @@
                   },
                   {
                     "key": {
+                      "symbol": "is_paused"
+                    },
+                    "val": {
+                      "bool": false
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "last_pull_timestamp"
                     },
                     "val": {
                       "u64": "87400"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "pull_sequence"
+                    },
+                    "val": {
+                      "u64": "1"
                     }
                   },
                   {

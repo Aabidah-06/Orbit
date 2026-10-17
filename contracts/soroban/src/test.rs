@@ -5,7 +5,7 @@ use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
     token::Client as TokenClient,
     token::StellarAssetClient,
-    Address, Env, IntoVal, Symbol, Vec,
+    Address, Env, IntoVal, String, Symbol, Vec,
 };
 
 #[test]
@@ -894,4 +894,764 @@ fn test_cancel_vault_event_published() {
         ),
     ];
     assert_eq!(env.events().all(), expected_cancel);
+}
+
+// ----------------------------------------------------------------------------
+// ISSUE #93: SUBSCRIPTION PAUSE & RESUME
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_pause_blocks_pull_and_resume_restores_billing() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = TokenClient::new(&env, &token_address);
+    let token_admin_client = StellarAssetClient::new(&env, &token_address);
+    token_admin_client.mint(&user, &100_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    let amount = 29_0000000;
+    let interval = 86400;
+
+    token_client.approve(&user, &orbit_client.address, &100_0000000, &2000000);
+    orbit_client.create_vault(&user, &merchant, &token_address, &amount, &interval);
+
+    // First settlement at t = 1000
+    env.ledger().set_timestamp(1000);
+    orbit_client.pull_funds(&user, &merchant);
+    assert_eq!(token_client.balance(&merchant), amount);
+
+    // The subscriber freezes the vault
+    orbit_client.pause_vault(&user, &merchant);
+    let paused = orbit_client
+        .get_vault(&user, &merchant)
+        .expect("vault should exist");
+    assert!(paused.is_paused);
+
+    // A full interval later the merchant still cannot pull while paused
+    env.ledger().set_timestamp(1000 + interval);
+    let res = orbit_client.try_pull_funds(&user, &merchant);
+    assert!(res.is_err());
+    assert_eq!(token_client.balance(&merchant), amount);
+    assert_eq!(token_client.balance(&user), 100_0000000 - amount);
+
+    // Resume restarts the billing clock at "now" so the interval that elapsed
+    // during the pause is not back-billed
+    orbit_client.resume_vault(&user, &merchant);
+    let resumed = orbit_client
+        .get_vault(&user, &merchant)
+        .expect("vault should exist");
+    assert!(!resumed.is_paused);
+    assert_eq!(resumed.last_pull_timestamp, 1000 + interval);
+
+    // Pulling immediately after the resume is rejected (no retro-active billing)
+    let res = orbit_client.try_pull_funds(&user, &merchant);
+    assert!(res.is_err());
+
+    // A full interval after the resume the merchant can bill again
+    env.ledger().set_timestamp(1000 + 2 * interval);
+    orbit_client.pull_funds(&user, &merchant);
+    assert_eq!(token_client.balance(&merchant), amount * 2);
+    assert_eq!(token_client.balance(&user), 100_0000000 - amount * 2);
+}
+
+#[test]
+fn test_pause_vault_authorized_by_merchant_fails() {
+    let env = Env::default();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    orbit_client.create_vault(&user, &merchant, &token, &29_0000000, &86400);
+
+    // Only the merchant is authorized, but pause_vault requires the user
+    let res = orbit_client
+        .mock_auths(&[MockAuth {
+            address: &merchant,
+            invoke: &MockAuthInvoke {
+                contract: &orbit_client.address,
+                fn_name: "pause_vault",
+                args: (&user, &merchant).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_pause_vault(&user, &merchant);
+    assert!(res.is_err());
+
+    let vault = orbit_client
+        .get_vault(&user, &merchant)
+        .expect("vault should exist");
+    assert!(!vault.is_paused);
+}
+
+#[test]
+fn test_resume_vault_authorized_by_merchant_fails() {
+    let env = Env::default();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    orbit_client.create_vault(&user, &merchant, &token, &29_0000000, &86400);
+    orbit_client.pause_vault(&user, &merchant);
+
+    let res = orbit_client
+        .mock_auths(&[MockAuth {
+            address: &merchant,
+            invoke: &MockAuthInvoke {
+                contract: &orbit_client.address,
+                fn_name: "resume_vault",
+                args: (&user, &merchant).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_resume_vault(&user, &merchant);
+    assert!(res.is_err());
+
+    let vault = orbit_client
+        .get_vault(&user, &merchant)
+        .expect("vault should exist");
+    assert!(vault.is_paused);
+}
+
+#[test]
+fn test_cancel_vault_works_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = TokenClient::new(&env, &token_address);
+    let token_admin_client = StellarAssetClient::new(&env, &token_address);
+    token_admin_client.mint(&user, &100_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    token_client.approve(&user, &orbit_client.address, &100_0000000, &2000000);
+    orbit_client.create_vault(&user, &merchant, &token_address, &29_0000000, &86400);
+
+    orbit_client.pause_vault(&user, &merchant);
+    orbit_client.cancel_vault(&user, &merchant);
+
+    assert_eq!(orbit_client.get_vault(&user, &merchant), None);
+    let res = orbit_client.try_pull_funds(&user, &merchant);
+    assert!(res.is_err());
+    assert_eq!(token_client.balance(&merchant), 0);
+    assert_eq!(token_client.balance(&user), 100_0000000);
+}
+
+#[test]
+fn test_pause_and_resume_of_unknown_vault_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    assert!(orbit_client.try_pause_vault(&user, &merchant).is_err());
+    assert!(orbit_client.try_resume_vault(&user, &merchant).is_err());
+}
+
+#[test]
+fn test_pause_and_resume_events_published() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    let amount = 29_0000000;
+    let interval = 86400;
+
+    orbit_client.create_vault(&user, &merchant, &token, &amount, &interval);
+
+    orbit_client.pause_vault(&user, &merchant);
+    let paused_topics = soroban_sdk::vec![
+        &env,
+        Symbol::new(&env, "vault_paused").to_val(),
+        user.clone().to_val(),
+        merchant.clone().to_val(),
+    ];
+    let expected_pause = soroban_sdk::vec![
+        &env,
+        (
+            orbit_client.address.clone(),
+            paused_topics,
+            ().into_val(&env),
+        ),
+    ];
+    assert_eq!(env.events().all(), expected_pause);
+
+    orbit_client.resume_vault(&user, &merchant);
+    let resumed_topics = soroban_sdk::vec![
+        &env,
+        Symbol::new(&env, "vault_resumed").to_val(),
+        user.clone().to_val(),
+        merchant.clone().to_val(),
+    ];
+    let expected_resume = soroban_sdk::vec![
+        &env,
+        (
+            orbit_client.address.clone(),
+            resumed_topics,
+            ().into_val(&env),
+        ),
+    ];
+    assert_eq!(env.events().all(), expected_resume);
+}
+
+// ----------------------------------------------------------------------------
+// ISSUE #94: MONOTONIC PULL EPOCH COUNTER
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_pull_sequence_tracks_billing_cycles_monotonically() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = TokenClient::new(&env, &token_address);
+    let token_admin_client = StellarAssetClient::new(&env, &token_address);
+    token_admin_client.mint(&user, &100_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    let amount = 29_0000000;
+    let interval = 86400;
+
+    token_client.approve(&user, &orbit_client.address, &100_0000000, &2000000);
+    orbit_client.create_vault(&user, &merchant, &token_address, &amount, &interval);
+
+    env.ledger().set_timestamp(1000);
+    orbit_client.pull_funds(&user, &merchant);
+    assert_eq!(
+        orbit_client
+            .get_vault(&user, &merchant)
+            .expect("vault should exist")
+            .pull_sequence,
+        0
+    );
+
+    env.ledger().set_timestamp(1000 + interval);
+    orbit_client.pull_funds(&user, &merchant);
+    assert_eq!(
+        orbit_client
+            .get_vault(&user, &merchant)
+            .expect("vault should exist")
+            .pull_sequence,
+        1
+    );
+
+    env.ledger().set_timestamp(1000 + 2 * interval);
+    orbit_client.pull_funds(&user, &merchant);
+    assert_eq!(
+        orbit_client
+            .get_vault(&user, &merchant)
+            .expect("vault should exist")
+            .pull_sequence,
+        2
+    );
+
+    assert_eq!(token_client.balance(&merchant), amount * 3);
+    assert_eq!(token_client.balance(&user), 100_0000000 - amount * 3);
+}
+
+#[test]
+fn test_same_epoch_second_pull_rejected_even_when_timestamp_check_is_bypassed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = TokenClient::new(&env, &token_address);
+    let token_admin_client = StellarAssetClient::new(&env, &token_address);
+    token_admin_client.mint(&user, &100_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    let amount = 29_0000000;
+    let interval = 86400;
+
+    token_client.approve(&user, &orbit_client.address, &100_0000000, &2000000);
+    orbit_client.create_vault(&user, &merchant, &token_address, &amount, &interval);
+
+    // Settle at ledger timestamp 0: last_pull_timestamp stays 0, which
+    // bypasses the legacy "Too early to pull funds" check entirely.
+    orbit_client.pull_funds(&user, &merchant);
+    assert_eq!(token_client.balance(&merchant), amount);
+
+    // Later in the SAME computed cycle the epoch guard alone must reject the
+    // second pull, keeping the single-pull-per-cycle invariant deterministic.
+    env.ledger().set_timestamp(interval / 2);
+    let res = orbit_client.try_pull_funds(&user, &merchant);
+    assert!(res.is_err());
+    assert_eq!(token_client.balance(&merchant), amount);
+    assert_eq!(token_client.balance(&user), 100_0000000 - amount);
+
+    // The next cycle opens and billing resumes exactly once
+    env.ledger().set_timestamp(interval);
+    orbit_client.pull_funds(&user, &merchant);
+    assert_eq!(token_client.balance(&merchant), amount * 2);
+    assert_eq!(
+        orbit_client
+            .get_vault(&user, &merchant)
+            .expect("vault should exist")
+            .pull_sequence,
+        1
+    );
+}
+
+#[test]
+fn test_clock_jitter_cannot_double_pull_within_an_epoch() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = TokenClient::new(&env, &token_address);
+    let token_admin_client = StellarAssetClient::new(&env, &token_address);
+    token_admin_client.mint(&user, &100_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    let amount = 29_0000000;
+    let interval = 86400;
+
+    token_client.approve(&user, &orbit_client.address, &100_0000000, &2000000);
+    orbit_client.create_vault(&user, &merchant, &token_address, &amount, &interval);
+
+    // Settle inside billing cycle 1
+    env.ledger().set_timestamp(100_000);
+    orbit_client.pull_funds(&user, &merchant);
+    assert_eq!(
+        orbit_client
+            .get_vault(&user, &merchant)
+            .expect("vault should exist")
+            .pull_sequence,
+        1
+    );
+
+    // Sequencer clock steps backwards: no pull can be smuggled through
+    env.ledger().set_timestamp(50_000);
+    assert!(orbit_client.try_pull_funds(&user, &merchant).is_err());
+
+    // Still inside the same computed cycle as the last settlement
+    env.ledger().set_timestamp(172_799);
+    assert!(orbit_client.try_pull_funds(&user, &merchant).is_err());
+
+    assert_eq!(token_client.balance(&merchant), amount);
+
+    // The next cycle opens exactly one interval after the settlement
+    env.ledger().set_timestamp(100_000 + interval);
+    orbit_client.pull_funds(&user, &merchant);
+    assert_eq!(
+        orbit_client
+            .get_vault(&user, &merchant)
+            .expect("vault should exist")
+            .pull_sequence,
+        2
+    );
+
+    // A duplicate attempt at the very same instant is rejected deterministically
+    env.ledger().set_timestamp(100_000 + interval);
+    assert!(orbit_client.try_pull_funds(&user, &merchant).is_err());
+
+    assert_eq!(token_client.balance(&merchant), amount * 2);
+    assert_eq!(token_client.balance(&user), 100_0000000 - amount * 2);
+}
+
+// ----------------------------------------------------------------------------
+// ISSUE #95: DECENTRALIZED PLAN CATALOG & PLAN-LINKED VAULTS
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_register_plan_and_read_it_back() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let plan_id = String::from_str(&env, "plan-pro");
+    let name = String::from_str(&env, "Pro Plan");
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    // Unknown plan ids read back as None without panicking
+    assert_eq!(
+        orbit_client.get_plan(&String::from_str(&env, "missing")),
+        None
+    );
+
+    orbit_client.register_plan(&merchant, &plan_id, &token, &29_0000000, &86400, &name);
+
+    let plan = orbit_client.get_plan(&plan_id).expect("plan should exist");
+    assert_eq!(plan.merchant, merchant);
+    assert_eq!(plan.token, token);
+    assert_eq!(plan.amount_per_interval, 29_0000000);
+    assert_eq!(plan.interval_seconds, 86400);
+    assert_eq!(plan.name, name);
+    assert!(plan.is_active);
+}
+
+#[test]
+fn test_register_plan_requires_merchant_authorization() {
+    let env = Env::default();
+
+    let merchant = Address::generate(&env);
+    let other = Address::generate(&env);
+    let token = Address::generate(&env);
+    let plan_id = String::from_str(&env, "plan-pro");
+    let name = String::from_str(&env, "Pro Plan");
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    let res = orbit_client
+        .mock_auths(&[MockAuth {
+            address: &other,
+            invoke: &MockAuthInvoke {
+                contract: &orbit_client.address,
+                fn_name: "register_plan",
+                args: (&merchant, &plan_id, &token, &29_0000000, &86400, &name).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_register_plan(&merchant, &plan_id, &token, &29_0000000, &86400, &name);
+    assert!(res.is_err());
+    assert_eq!(orbit_client.get_plan(&plan_id), None);
+}
+
+#[test]
+#[should_panic]
+fn test_register_plan_rejects_zero_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    orbit_client.register_plan(
+        &merchant,
+        &String::from_str(&env, "plan-pro"),
+        &token,
+        &0,
+        &86400,
+        &String::from_str(&env, "Pro Plan"),
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_register_plan_rejects_zero_interval() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    orbit_client.register_plan(
+        &merchant,
+        &String::from_str(&env, "plan-pro"),
+        &token,
+        &29_0000000,
+        &0,
+        &String::from_str(&env, "Pro Plan"),
+    );
+}
+
+#[test]
+fn test_register_plan_rejects_plan_id_owned_by_another_merchant() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let merchant_a = Address::generate(&env);
+    let merchant_b = Address::generate(&env);
+    let token = Address::generate(&env);
+    let plan_id = String::from_str(&env, "plan-pro");
+    let name = String::from_str(&env, "Pro Plan");
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    orbit_client.register_plan(&merchant_a, &plan_id, &token, &29_0000000, &86400, &name);
+
+    // Another merchant cannot hijack the id
+    let res = orbit_client.try_register_plan(
+        &merchant_b,
+        &plan_id,
+        &token,
+        &40_0000000,
+        &172800,
+        &String::from_str(&env, "Hijacked"),
+    );
+    assert!(res.is_err());
+
+    let plan = orbit_client.get_plan(&plan_id).expect("plan should exist");
+    assert_eq!(plan.merchant, merchant_a);
+    assert_eq!(plan.amount_per_interval, 29_0000000);
+
+    // The owner can refresh the terms, which also reactivates the plan
+    orbit_client.deactivate_plan(&merchant_a, &plan_id);
+    assert!(!orbit_client.get_plan(&plan_id).expect("plan exists").is_active);
+
+    orbit_client.register_plan(&merchant_a, &plan_id, &token, &40_0000000, &172800, &name);
+    let plan = orbit_client.get_plan(&plan_id).expect("plan should exist");
+    assert_eq!(plan.amount_per_interval, 40_0000000);
+    assert_eq!(plan.interval_seconds, 172800);
+    assert!(plan.is_active);
+}
+
+#[test]
+fn test_deactivate_plan_requires_owning_merchant() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let merchant = Address::generate(&env);
+    let other = Address::generate(&env);
+    let token = Address::generate(&env);
+    let plan_id = String::from_str(&env, "plan-pro");
+    let name = String::from_str(&env, "Pro Plan");
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    orbit_client.register_plan(&merchant, &plan_id, &token, &29_0000000, &86400, &name);
+
+    let res = orbit_client
+        .mock_auths(&[MockAuth {
+            address: &other,
+            invoke: &MockAuthInvoke {
+                contract: &orbit_client.address,
+                fn_name: "deactivate_plan",
+                args: (&other, &plan_id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_deactivate_plan(&other, &plan_id);
+    assert!(res.is_err());
+    assert!(orbit_client.get_plan(&plan_id).expect("plan exists").is_active);
+}
+
+#[test]
+fn test_deactivate_plan_blocks_new_vaults_but_existing_vaults_keep_billing() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let new_user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = TokenClient::new(&env, &token_address);
+    let token_admin_client = StellarAssetClient::new(&env, &token_address);
+    token_admin_client.mint(&user, &100_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    let amount = 29_0000000;
+    let interval = 86400;
+    let plan_id = String::from_str(&env, "plan-pro");
+
+    orbit_client.register_plan(
+        &merchant,
+        &plan_id,
+        &token_address,
+        &amount,
+        &interval,
+        &String::from_str(&env, "Pro Plan"),
+    );
+
+    // A user opens a vault from the on-chain plan terms
+    token_client.approve(&user, &orbit_client.address, &100_0000000, &2000000);
+    orbit_client.create_vault_from_plan(&user, &plan_id);
+
+    let vault = orbit_client
+        .get_vault(&user, &merchant)
+        .expect("vault should exist");
+    assert_eq!(vault.token, token_address);
+    assert_eq!(vault.amount_per_interval, amount);
+    assert_eq!(vault.interval_seconds, interval);
+    assert!(!vault.is_paused);
+
+    env.ledger().set_timestamp(1000);
+    orbit_client.pull_funds(&user, &merchant);
+    assert_eq!(token_client.balance(&merchant), amount);
+
+    // Merchant deactivates the plan: no NEW subscriptions, existing ones live
+    orbit_client.deactivate_plan(&merchant, &plan_id);
+    assert!(!orbit_client.get_plan(&plan_id).expect("plan exists").is_active);
+
+    let res = orbit_client.try_create_vault_from_plan(&new_user, &plan_id);
+    assert!(res.is_err());
+    assert_eq!(orbit_client.get_vault(&new_user, &merchant), None);
+
+    // The pre-existing vault keeps billing on schedule
+    env.ledger().set_timestamp(1000 + interval);
+    orbit_client.pull_funds(&user, &merchant);
+    assert_eq!(token_client.balance(&merchant), amount * 2);
+    assert_eq!(token_client.balance(&user), 100_0000000 - amount * 2);
+}
+
+#[test]
+fn test_create_vault_from_plan_requires_user_authorization() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let other = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let plan_id = String::from_str(&env, "plan-pro");
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    orbit_client.register_plan(
+        &merchant,
+        &plan_id,
+        &token,
+        &29_0000000,
+        &86400,
+        &String::from_str(&env, "Pro Plan"),
+    );
+
+    let res = orbit_client
+        .mock_auths(&[MockAuth {
+            address: &other,
+            invoke: &MockAuthInvoke {
+                contract: &orbit_client.address,
+                fn_name: "create_vault_from_plan",
+                args: (&user, &plan_id).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_create_vault_from_plan(&user, &plan_id);
+    assert!(res.is_err());
+    assert_eq!(orbit_client.get_vault(&user, &merchant), None);
+}
+
+#[test]
+fn test_create_vault_from_unknown_plan_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    let res = orbit_client.try_create_vault_from_plan(&user, &String::from_str(&env, "missing"));
+    assert!(res.is_err());
+    assert_eq!(orbit_client.get_vault(&user, &merchant), None);
+}
+
+#[test]
+fn test_deactivate_unknown_plan_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let merchant = Address::generate(&env);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    let res = orbit_client.try_deactivate_plan(&merchant, &String::from_str(&env, "missing"));
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_create_vault_from_plan_emits_vault_created_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let plan_id = String::from_str(&env, "plan-pro");
+    let name = String::from_str(&env, "Pro Plan");
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    let amount = 29_0000000;
+    let interval = 86400;
+
+    orbit_client.register_plan(&merchant, &plan_id, &token, &amount, &interval, &name);
+    orbit_client.create_vault_from_plan(&user, &plan_id);
+
+    let vault_topics = soroban_sdk::vec![
+        &env,
+        Symbol::new(&env, "vault_created").to_val(),
+        user.clone().to_val(),
+        merchant.clone().to_val(),
+    ];
+    let expected = soroban_sdk::vec![
+        &env,
+        (
+            orbit_client.address.clone(),
+            vault_topics,
+            (token.clone(), amount, interval).into_val(&env),
+        ),
+    ];
+    assert_eq!(env.events().all(), expected);
 }
