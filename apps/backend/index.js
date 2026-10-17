@@ -24,6 +24,9 @@ const {
     markSubscriptionPastDue,
     processDunningRetries,
 } = require('./dunning');
+const { registerComplianceRoutes } = require('./compliance');
+const { registerSigningSessionRoutes } = require('./signing-sessions');
+const { registerFailureRecoveryRoutes } = require('./failure-recovery');
 
 const app = express();
 // Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
@@ -1448,6 +1451,21 @@ app.post('/webhooks/test', async (req, res) => {
     }
 });
 
+// Rotate without downtime: keep the old secret for in-flight retries and use
+// the new one for all subsequent deliveries.
+app.post('/webhooks/:id/rotate-secret', async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase client not initialized' });
+    const secret = generateSigningSecret();
+    const { data, error } = await supabase.from('webhooks').update({ previous_signing_secret: req.body?.signing_secret || null, signing_secret: secret, secret_rotated_at: new Date().toISOString() }).eq('id', req.params.id).select('id,secret_rotated_at').single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ webhook: data, signing_secret: secret });
+});
+
+registerComplianceRoutes(app, getSupabase, authenticateMerchant);
+registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
+registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
+
 const PORT = process.env.PORT || 3001;
 if (require.main === module) {
     app.listen(PORT, () => {
@@ -1456,3 +1474,4 @@ if (require.main === module) {
 }
 
 module.exports = app;
+

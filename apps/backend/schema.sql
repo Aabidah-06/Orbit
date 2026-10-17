@@ -147,6 +147,34 @@ CREATE INDEX webhook_deliveries_merchant_id_idx ON webhook_deliveries (merchant_
 CREATE INDEX webhook_deliveries_webhook_id_idx ON webhook_deliveries (webhook_id);
 CREATE INDEX webhook_deliveries_created_at_idx ON webhook_deliveries (created_at DESC);
 
+-- Secret rotation retains the previous key until in-flight deliveries expire.
+ALTER TABLE webhooks ADD COLUMN IF NOT EXISTS previous_signing_secret VARCHAR(255);
+ALTER TABLE webhooks ADD COLUMN IF NOT EXISTS secret_rotated_at TIMESTAMP WITH TIME ZONE;
+
+CREATE TABLE IF NOT EXISTS tax_transactions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    recipient_wallet VARCHAR(255) NOT NULL,
+    amount NUMERIC NOT NULL,
+    currency VARCHAR(32) NOT NULL,
+    tax_type VARCHAR(32) NOT NULL DEFAULT '1099',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS tax_transactions_merchant_date_idx ON tax_transactions (merchant_id, created_at);
+
+CREATE TABLE IF NOT EXISTS signing_sessions (
+    id UUID PRIMARY KEY,
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    xdr TEXT NOT NULL,
+    required_signers INTEGER NOT NULL CHECK (required_signers > 0),
+    signatures JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS signing_sessions_merchant_status_idx ON signing_sessions (merchant_id, status);
+ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMP WITH TIME ZONE;
+
 -- Atomically claims an idempotency key. Returns {"claimed": true, "record": ...}
 -- when the caller now owns the key and must execute the request, or
 -- {"claimed": false, "record": ...} with the existing record otherwise.
@@ -366,3 +394,4 @@ CREATE POLICY "Allow public read access to plans for checkout"
 -- webhook_deliveries or relayer_fee_usage:
 -- default-deny prevents anon key access.
 -- No open INSERT or UPDATE policies: all mutations require backend service role.
+
