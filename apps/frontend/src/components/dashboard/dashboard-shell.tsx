@@ -3,6 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { useTranslations } from "next-intl";
 import {
   LayoutDashboard,
   Package,
@@ -22,6 +23,7 @@ import {
   Check,
   Pencil,
   Bell,
+  UserCog,
 } from "lucide-react";
 import { Brand } from "@/components/layout/brand";
 import { useAuth } from "@/lib/auth-context";
@@ -33,11 +35,15 @@ import { SubscribersView } from "./views/subscribers-view";
 import { PayrollView } from "./views/payroll-view";
 import { PaymentLinksView } from "./views/payment-links-view";
 import { DevelopersView } from "./views/developers-view";
+import { TeamView } from "./views/team-view";
+import { LocaleSwitcher } from "@/components/layout/locale-switcher";
 import { VaultModal } from "./modals/vault-modal";
 import { NotificationDrawer } from "./drawers/notification-drawer";
 import { DOCS_URL } from "@/lib/links";
 
 export function DashboardShell() {
+  const t = useTranslations("Dashboard");
+  const tc = useTranslations("Common");
   const router = useRouter();
   const { user, signOut, updateVault, updateBusinessName } = useAuth();
   const { unreadCount, toggleDrawer } = useNotifications();
@@ -74,39 +80,45 @@ export function DashboardShell() {
   const navItems = [
     {
       id: "overview" as DashboardTab,
-      label: "Overview",
+      label: t("nav.overview"),
       icon: LayoutDashboard,
       badge: null,
     },
     {
       id: "plans" as DashboardTab,
-      label: "Subscription Plans",
+      label: t("nav.plans"),
       icon: Package,
       badge: "3",
     },
     {
       id: "subscribers" as DashboardTab,
-      label: "Subscribers",
+      label: t("nav.subscribers"),
       icon: Users,
       badge: "148",
     },
     {
       id: "payroll" as DashboardTab,
-      label: "Batch Payroll",
+      label: t("nav.payroll"),
       icon: SendHorizontal,
-      badge: "Superpower",
+      badge: t("badges.superpower"),
     },
     {
       id: "links" as DashboardTab,
-      label: "Payment Links",
+      label: t("nav.links"),
       icon: Link2,
       badge: null,
     },
     {
+      id: "team" as DashboardTab,
+      label: t("nav.team"),
+      icon: UserCog,
+      badge: null,
+    },
+    {
       id: "developers" as DashboardTab,
-      label: "Developer Portal",
+      label: t("nav.developers"),
       icon: Code2,
-      badge: "API",
+      badge: t("badges.api"),
     },
   ];
 
@@ -131,7 +143,7 @@ export function DashboardShell() {
           <div className="h-16 px-6 border-b border-black/10 flex items-center justify-between">
             <Brand variant="black" />
             <span className="font-mono text-[10px] px-2 py-0.5 rounded-full bg-black/5 text-neutral-600 border border-black/10">
-              MERCHANT
+              {t("merchantBadge")}
             </span>
           </div>
 
@@ -140,7 +152,7 @@ export function DashboardShell() {
             <div className="p-3.5 rounded-lg bg-neutral-50 border border-black/5">
               <div className="flex items-center justify-between">
                 <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider">
-                  Business Entity
+                  {t("businessEntity")}
                 </div>
                 {!isEditingBusinessName && (
                   <button
@@ -149,10 +161,10 @@ export function DashboardShell() {
                       setIsEditingBusinessName(true);
                     }}
                     className="text-[10px] text-neutral-400 hover:text-black flex items-center gap-1 font-medium transition-colors"
-                    title="Rename Company"
+                    title={t("renameCompany")}
                   >
                     <Pencil size={10} />
-                    <span>Edit</span>
+                    <span>{tc("edit")}</span>
                   </button>
                 )}
               </div>
@@ -166,7 +178,7 @@ export function DashboardShell() {
                   <input
                     type="text"
                     required
-                    placeholder="e.g. Drips Labs, Orbit Corp"
+                    placeholder={t("businessNamePlaceholder")}
                     value={businessNameInput}
                     onChange={(e) => setBusinessNameInput(e.target.value)}
                     className="w-full text-xs font-bold border border-black/20 rounded px-2 py-1 bg-white text-black focus:outline-hidden focus:ring-1 focus:ring-black"
@@ -178,13 +190,13 @@ export function DashboardShell() {
                       onClick={() => setIsEditingBusinessName(false)}
                       className="text-[10px] px-2 py-0.5 rounded border border-black/10 hover:bg-black/5"
                     >
-                      Cancel
+                      {tc("cancel")}
                     </button>
                     <button
                       type="submit"
                       className="text-[10px] px-2.5 py-0.5 rounded bg-black text-white hover:bg-neutral-800 font-semibold"
                     >
-                      Save
+                      {tc("save")}
                     </button>
                   </div>
                 </form>
@@ -193,7 +205,7 @@ export function DashboardShell() {
               <button
                 onClick={copyMerchantId}
                 className="hover:text-black font-mono text-[10px] text-neutral-500 flex items-center gap-1 mt-2 transition-colors"
-                title="Copy Merchant ID"
+                title={t("copyMerchantId")}
               >
                 <span>ID: {user.id}</span>
                 {copiedId ? (
@@ -254,12 +266,12 @@ export function DashboardShell() {
             <div className="flex items-center justify-between">
               <span className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider flex items-center gap-1.5">
                 <ShieldCheck size={12} className="text-emerald-600" />
-                Settlement Vault
+                {t("settlementVault")}
               </span>
-              <span className="text-[10px] font-mono text-emerald-600 font-bold">READY</span>
+              <span className="text-[10px] font-mono text-emerald-600 font-bold">{t("ready")}</span>
             </div>
             <div className="text-[11px] text-neutral-600 truncate mt-1">
-              Non-Custodial USDC Treasury
+              {t("treasuryDescription")}
             </div>
           </button>
 
@@ -271,7 +283,7 @@ export function DashboardShell() {
             <button
               onClick={handleSignOut}
               className="p-1.5 rounded hover:bg-black/5 text-neutral-500 hover:text-black transition-colors"
-              title="Sign Out"
+              title={t("signOut")}
             >
               <LogOut size={14} />
             </button>
@@ -292,7 +304,7 @@ export function DashboardShell() {
             </button>
             <div>
               <h1 className="text-base font-bold text-black tracking-tight capitalize">
-                {activeTab === "payroll" ? "Batch Payroll Engine" : activeTab}
+                {t(`titles.${activeTab}`)}
               </h1>
             </div>
           </div>
@@ -301,8 +313,8 @@ export function DashboardShell() {
             <button
               onClick={toggleDrawer}
               className="relative p-2 rounded-lg border border-black/10 hover:border-black/25 bg-white text-neutral-600 hover:text-black transition-colors"
-              title="Transaction Notifications"
-              aria-label="Transaction Notifications"
+              title={t("notifications")}
+              aria-label={t("notifications")}
             >
               <Bell size={16} />
               {unreadCount > 0 && (
@@ -311,16 +323,17 @@ export function DashboardShell() {
                 </span>
               )}
             </button>
+            <LocaleSwitcher className="hidden sm:inline-flex" />
             <Link
               href={`${DOCS_URL}/checkout/widget`}
               className="button button-secondary text-xs h-8 px-3 flex items-center gap-1"
             >
-              <span>SDK Docs</span>
+              <span>{t("sdkDocs")}</span>
               <ArrowUpRight size={12} />
             </Link>
             <div className="hidden sm:flex items-center gap-2 px-3 py-1 rounded-full bg-neutral-100 text-neutral-800 border border-black/5 text-xs font-mono">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-              <span>USDC Settlement Engine</span>
+              <span>{t("settlementEngine")}</span>
             </div>
           </div>
         </header>
@@ -344,6 +357,8 @@ export function DashboardShell() {
           {activeTab === "links" && (
             <PaymentLinksView businessName={user.businessName} />
           )}
+
+          {activeTab === "team" && <TeamView />}
 
           {activeTab === "developers" && <DevelopersView />}
         </main>

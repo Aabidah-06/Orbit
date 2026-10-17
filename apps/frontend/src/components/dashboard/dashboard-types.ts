@@ -4,6 +4,7 @@ export type DashboardTab =
   | "subscribers"
   | "payroll"
   | "links"
+  | "team"
   | "developers";
 
 export type NetworkId = "stellar-testnet";

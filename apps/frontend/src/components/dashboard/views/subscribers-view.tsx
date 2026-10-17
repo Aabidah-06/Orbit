@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslations } from "next-intl";
 import { useEffect, useState, useCallback } from "react";
 import {
   Users,
@@ -94,6 +95,7 @@ export const INITIAL_SUBSCRIBERS: SubscriberRecord[] = [
 ];
 
 export function SubscribersView() {
+  const t = useTranslations("Tables");
   const { user } = useAuth();
   const [subscribers, setSubscribers] = useState<SubscriberRecord[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
@@ -498,13 +500,13 @@ export function SubscribersView() {
             <table className="w-full text-left text-xs">
               <thead className="bg-neutral-50/80 border-b border-black/10 text-neutral-500 uppercase tracking-wider font-semibold text-[10px]">
                 <tr>
-                  <th className="py-3.5 px-5">Subscriber Vault</th>
-                  <th className="py-3.5 px-4">Plan Tier</th>
-                  <th className="py-3.5 px-4">Allowance Rate</th>
-                  <th className="py-3.5 px-4">Total Settled</th>
-                  <th className="py-3.5 px-4">Next Pull</th>
-                  <th className="py-3.5 px-4">Vault Status</th>
-                  <th className="py-3.5 px-5 text-right">Actions</th>
+                  <th className="py-3.5 px-5">{t("subscribers.vault")}</th>
+                  <th className="py-3.5 px-4">{t("subscribers.plan")}</th>
+                  <th className="py-3.5 px-4">{t("subscribers.rate")}</th>
+                  <th className="py-3.5 px-4">{t("subscribers.settled")}</th>
+                  <th className="py-3.5 px-4">{t("subscribers.nextPull")}</th>
+                  <th className="py-3.5 px-4">{t("subscribers.status")}</th>
+                  <th className="py-3.5 px-5 text-right">{t("subscribers.actions")}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-black/5 text-neutral-700">
