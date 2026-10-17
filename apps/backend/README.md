@@ -1,5 +1,9 @@
 # Orbit Merchant API
 
+See [Merchant operations](../../Docs/MERCHANT_OPERATIONS.md) for the persistent
+event indexer, `/health/ready`, federated `/graphql` API, wallet authentication,
+billing recovery endpoints, and required migrations for existing databases.
+
 The Orbit Merchant API (`apps/backend/index.js`) is an Express service that manages pricing plans, customer subscriptions, and automated on-chain pull executions on Stellar Soroban. Data is persisted in Supabase using the tables defined in `apps/backend/schema.sql` (`merchants`, `plans`, `subscriptions`).
 
 ## Setup and Configuration
@@ -623,3 +627,41 @@ reconciliation error and is **not** represented as a verified settlement.
 The export does not backfill old transfers or recover missing events: operators
 should plan a ledger indexing/reconciliation job before using reports as a
 complete accounting ledger. Stellar RPC history retention is limited.
+## Customer Portal (#74)
+
+See [CUSTOMER_PORTAL.md](CUSTOMER_PORTAL.md) for challenge signing, wallet-scoped routes, cancellation, database migrations and security considerations.
+
+## Coupons and promotional quotes (#75 — experimental)
+
+Merchant API-key routes: `POST /coupons`, `GET /coupons`, `PATCH /coupons/:id`
+(soft-disable with `{"active":false}`). Coupon codes are unique within each
+merchant, case-insensitive at the API boundary. Use `discount_type` `percent`
+(maximum 99%) or `amount` (in the plan's billing denomination). `duration_months`
+is 1–120; `max_redemptions` and `expires_at` are optional.
+
+Checkout calls `POST /coupons/validate` with `{"plan_id":"...","code":"WELCOME20"}`.
+The response provides the first-period discounted quote in raw USDC units or
+fiat major units and the promotion's calendar-month duration. Validating a
+code does **not** reserve a redemption. `POST /subscriptions` accepts optional
+`coupon_code`; the `redeem_coupon_subscription` Postgres function revalidates
+and atomically enforces redemption limits and creates the subscription.
+
+Migration: run `apps/backend/coupons-migration.sql` in the Supabase SQL editor
+on existing databases. The same schema is appended to `schema.sql` for fresh
+installs. Execute it before starting a backend with coupons enabled. Both the
+coupons table and the redemption function are private to the service role.
+
+**Critical on-chain limitation:** Orbit's current Soroban `pull_funds` charges
+`VaultData.amount_per_interval` from the existing user-authorized vault. A
+coupon quote and off-chain promotion record do NOT modify that amount or
+automatically revert it after `duration_months`. Coupon subscriptions are
+therefore created with `status=pending_promo`,
+`promotion_onchain_verified=false`, and the pull API refuses to charge them.
+A compatible, wallet-authorized contract/checkout migration plus verification
+of the on-chain promotion schedule is needed before activating discounted
+recurring billing. This backend-only implementation is not a complete
+end-to-end promotional billing feature. Don't deploy it as finished billing.
+
+The public legacy subscription creation route does not itself authenticate a
+wallet; production coupon redemption must be coupled to proof of a confirmed
+vault handshake to prevent malicious consumption of finite coupon inventories.

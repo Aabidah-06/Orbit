@@ -1,5 +1,7 @@
 "use client";
 
+import { useTranslations } from "next-intl";
+import { useTeam } from "@/lib/team-context";
 import { useState, useEffect, useCallback } from "react";
 import {
   Key,
@@ -162,7 +164,10 @@ const INITIAL_DELIVERIES: WebhookDeliveryLog[] = [
 ];
 
 export function DevelopersView() {
+  const t = useTranslations("Tables");
   const { user } = useAuth();
+  const { can } = useTeam();
+  const canManageKeys = can("manageKeys");
 
   // API Keys state
   const [keys, setKeys] = useState<ApiKeyRecord[]>(INITIAL_KEYS);
@@ -579,20 +584,22 @@ print(f"Settled on Stellar: {pull.tx_hash}")`;
             </div>
             <div>
               <h3 className="text-base font-bold text-black tracking-tight">
-                API Secret Keys
+                {t("keys.title")}
               </h3>
               <p className="text-xs text-neutral-500">
-                Bearer tokens used to authenticate server-side pull execution and programmatic triggers.
+                {t("keys.description")}
               </p>
             </div>
           </div>
 
           <button
             onClick={() => setIsCreateKeyModalOpen(true)}
-            className="button button-primary text-xs h-9 px-4 flex items-center gap-1.5 self-start sm:self-auto shrink-0 shadow-xs"
+            disabled={!canManageKeys}
+            title={canManageKeys ? undefined : t("keys.noPermissionGenerate")}
+            className="button button-primary text-xs h-9 px-4 flex items-center gap-1.5 self-start sm:self-auto shrink-0 shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Plus size={14} />
-            <span>Generate Secret Key</span>
+            <span>{t("keys.generate")}</span>
           </button>
         </div>
 
@@ -601,11 +608,11 @@ print(f"Settled on Stellar: {pull.tx_hash}")`;
           <table className="w-full text-left text-xs">
             <thead className="bg-neutral-50/80 border-b border-black/10 text-neutral-500 uppercase tracking-wider font-semibold text-[10px]">
               <tr>
-                <th className="py-3 px-4">Key Label</th>
-                <th className="py-3 px-4">Secret Key Token</th>
-                <th className="py-3 px-4">Environment</th>
-                <th className="py-3 px-4">Last Used</th>
-                <th className="py-3 px-4 text-right">Actions</th>
+                <th className="py-3 px-4">{t("keys.label")}</th>
+                <th className="py-3 px-4">{t("keys.token")}</th>
+                <th className="py-3 px-4">{t("keys.environment")}</th>
+                <th className="py-3 px-4">{t("keys.lastUsed")}</th>
+                <th className="py-3 px-4 text-right">{t("keys.actions")}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-black/5 text-neutral-700">
@@ -670,8 +677,9 @@ print(f"Settled on Stellar: {pull.tx_hash}")`;
                     <td className="py-3.5 px-4 text-right">
                       <button
                         onClick={() => setKeys((prev) => prev.filter((item) => item.id !== k.id))}
-                        className="p-1 text-neutral-400 hover:text-red-600 transition-colors"
-                        title="Revoke key"
+                        disabled={!canManageKeys}
+                        className="p-1 text-neutral-400 hover:text-red-600 transition-colors disabled:opacity-30 disabled:hover:text-neutral-400 disabled:cursor-not-allowed"
+                        title={canManageKeys ? t("keys.revoke") : t("keys.noPermissionGenerate")}
                       >
                         <Trash2 size={13} />
                       </button>
@@ -1000,12 +1008,12 @@ print(f"Settled on Stellar: {pull.tx_hash}")`;
           <table className="w-full text-left text-xs">
             <thead className="bg-neutral-50/80 border-b border-black/10 text-neutral-500 uppercase tracking-wider font-semibold text-[10px]">
               <tr>
-                <th className="py-3 px-4">Status</th>
-                <th className="py-3 px-4">Event Type</th>
-                <th className="py-3 px-4">Target Endpoint</th>
-                <th className="py-3 px-4">Dispatched At</th>
-                <th className="py-3 px-4">Attempts</th>
-                <th className="py-3 px-4 text-right">Actions</th>
+                <th className="py-3 px-4">{t("deliveries.status")}</th>
+                <th className="py-3 px-4">{t("deliveries.event")}</th>
+                <th className="py-3 px-4">{t("deliveries.endpoint")}</th>
+                <th className="py-3 px-4">{t("deliveries.dispatched")}</th>
+                <th className="py-3 px-4">{t("deliveries.attempts")}</th>
+                <th className="py-3 px-4 text-right">{t("deliveries.actions")}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-black/5 text-neutral-700">
