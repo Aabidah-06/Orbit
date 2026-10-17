@@ -355,6 +355,9 @@ $$;
 REVOKE EXECUTE ON FUNCTION reserve_relayer_fee(UUID, BIGINT, BIGINT) FROM PUBLIC, anon, authenticated;
 REVOKE EXECUTE ON FUNCTION adjust_relayer_fee(UUID, DATE, BIGINT, INTEGER) FROM PUBLIC, anon, authenticated;
 
+-- Backend-only: RLS with no policies denies anon/authenticated access.
+ALTER TABLE relayer_fee_usage ENABLE ROW LEVEL SECURITY;
+
 -- ==============================================================================
 -- Row Level Security (RLS) Configuration
 -- ==============================================================================
@@ -379,7 +382,6 @@ ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhooks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhook_deliveries ENABLE ROW LEVEL SECURITY;
-ALTER TABLE relayer_fee_usage ENABLE ROW LEVEL SECURITY;
 
 -- Public checkout read access for plans and merchant public identifiers
 CREATE POLICY "Allow public read access to merchants for checkout"
@@ -390,8 +392,7 @@ CREATE POLICY "Allow public read access to plans for checkout"
     ON plans FOR SELECT
     USING (true);
 
--- No public policies for subscriptions, idempotency_keys, billing_locks, api_keys, audit_logs, webhooks,
--- webhook_deliveries or relayer_fee_usage:
+-- No public policies for subscriptions, idempotency_keys, billing_locks, api_keys, audit_logs, webhooks, or webhook_deliveries:
 -- default-deny prevents anon key access.
 -- No open INSERT or UPDATE policies: all mutations require backend service role.
 
