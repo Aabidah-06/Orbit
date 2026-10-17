@@ -35,13 +35,8 @@ pub fn calculate_ttl_params(interval_seconds: u64) -> (u32, u32) {
 // DATA STRUCTURES
 // ----------------------------------------------------------------------------
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VaultKey {
-    pub user: Address,
-    pub merchant: Address,
-}
-
+/// Vault terms as returned by `get_vault`. On the ledger they are stored as a
+/// `StoredVault` instead; see `save_vault`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultData {
@@ -56,6 +51,67 @@ pub struct VaultData {
 pub struct PaymentSplit {
     pub recipient: Address,
     pub amount: i128,
+}
+
+// ----------------------------------------------------------------------------
+// STORAGE LAYOUT
+// ----------------------------------------------------------------------------
+//
+// Vaults are the contract's only ledger state, and they are long-lived, so they
+// stay in persistent storage. Every byte of a persistent entry is paid for on
+// each write and for every ledger of rent, so entries are encoded positionally:
+//
+//   key:   (user, merchant)                                         an ScVec
+//   value: StoredVault(token, amount, interval, last_pull)          an ScVec
+//
+// A named struct is encoded as an ScMap that repeats its field names ("user",
+// "merchant", "amount_per_interval", ...) in every entry; tuples do not. The
+// contract has no upgrade entrypoint, so every deployment starts from empty
+// storage and there is no older layout to migrate.
+
+/// On-ledger form of `VaultData`: (token, amount_per_interval, interval_seconds,
+/// last_pull_timestamp).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredVault(pub Address, pub i128, pub u64, pub u64);
+
+impl From<StoredVault> for VaultData {
+    fn from(stored: StoredVault) -> Self {
+        VaultData {
+            token: stored.0,
+            amount_per_interval: stored.1,
+            interval_seconds: stored.2,
+            last_pull_timestamp: stored.3,
+        }
+    }
+}
+
+impl From<VaultData> for StoredVault {
+    fn from(vault: VaultData) -> Self {
+        StoredVault(
+            vault.token,
+            vault.amount_per_interval,
+            vault.interval_seconds,
+            vault.last_pull_timestamp,
+        )
+    }
+}
+
+fn vault_key(user: &Address, merchant: &Address) -> (Address, Address) {
+    (user.clone(), merchant.clone())
+}
+
+fn load_vault(env: &Env, key: &(Address, Address)) -> Option<VaultData> {
+    env.storage()
+        .persistent()
+        .get::<_, StoredVault>(key)
+        .map(VaultData::from)
+}
+
+fn save_vault(env: &Env, key: &(Address, Address), vault: VaultData) {
+    env.storage()
+        .persistent()
+        .set(key, &StoredVault::from(vault));
 }
 
 // ----------------------------------------------------------------------------
@@ -88,10 +144,7 @@ impl OrbitContract {
             "interval_seconds must be greater than zero"
         );
 
-        let key = VaultKey {
-            user: user.clone(),
-            merchant: merchant.clone(),
-        };
+        let key = vault_key(&user, &merchant);
 
         let vault_data = VaultData {
             token: token.clone(),
@@ -100,7 +153,7 @@ impl OrbitContract {
             last_pull_timestamp: 0,
         };
 
-        env.storage().persistent().set(&key, &vault_data);
+        save_vault(&env, &key, vault_data);
 
         // Emit contract event
         env.events().publish(
@@ -116,9 +169,7 @@ impl OrbitContract {
     /// Read the current terms for a user/merchant vault.
     /// This entrypoint requires no authorization and does not modify storage.
     pub fn get_vault(env: Env, user: Address, merchant: Address) -> Option<VaultData> {
-        let key = VaultKey { user, merchant };
-
-        env.storage().persistent().get(&key)
+        load_vault(&env, &vault_key(&user, &merchant))
     }
 
     /// Close a vault so the merchant can no longer pull from it.
@@ -126,13 +177,12 @@ impl OrbitContract {
     pub fn cancel_vault(env: Env, user: Address, merchant: Address) {
         user.require_auth();
 
-        let key = VaultKey {
-            user: user.clone(),
-            merchant: merchant.clone(),
-        };
+        let key = vault_key(&user, &merchant);
 
         assert!(env.storage().persistent().has(&key), "Vault does not exist");
 
+        // The vault is the only entry kept per (user, merchant), so removing it
+        // returns all of the pair's ledger state and stops its rent
         env.storage().persistent().remove(&key);
 
         // Emit contract event
@@ -145,15 +195,8 @@ impl OrbitContract {
     pub fn pull_funds(env: Env, user: Address, merchant: Address) {
         merchant.require_auth();
 
-        let key = VaultKey {
-            user: user.clone(),
-            merchant: merchant.clone(),
-        };
-        let mut vault: VaultData = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Vault does not exist");
+        let key = vault_key(&user, &merchant);
+        let mut vault = load_vault(&env, &key).expect("Vault does not exist");
         let current_time = env.ledger().timestamp();
 
         if vault.last_pull_timestamp != 0 {
@@ -172,15 +215,17 @@ impl OrbitContract {
         );
 
         vault.last_pull_timestamp = current_time;
-        env.storage().persistent().set(&key, &vault);
+        let amount_per_interval = vault.amount_per_interval;
+        let interval_seconds = vault.interval_seconds;
+        save_vault(&env, &key, vault);
 
         // Emit contract event
         env.events().publish(
             (Symbol::new(&env, "funds_pulled"), user, merchant),
-            (vault.amount_per_interval, current_time),
+            (amount_per_interval, current_time),
         );
         // Extend TTL on each pull for both the vault entry and the contract instance
-        let (threshold, extend_to) = calculate_ttl_params(vault.interval_seconds);
+        let (threshold, extend_to) = calculate_ttl_params(interval_seconds);
         env.storage().persistent().extend_ttl(&key, threshold, extend_to);
         env.storage().instance().extend_ttl(threshold, extend_to);
     }
@@ -227,3 +272,6 @@ impl OrbitContract {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod test_storage;
