@@ -24,6 +24,8 @@ import {
   Pencil,
   Bell,
   UserCog,
+  UsersRound,
+  Gift,
 } from "lucide-react";
 import { Brand } from "@/components/layout/brand";
 import { useAuth } from "@/lib/auth-context";
@@ -33,6 +35,9 @@ import { OverviewView } from "./views/overview-view";
 import { PlansView } from "./views/plans-view";
 import { SubscribersView } from "./views/subscribers-view";
 import { PayrollView } from "./views/payroll-view";
+import { MultisigView } from "./views/multisig-view";
+import { GiftPassesView } from "./views/gift-passes-view";
+import { DomainsView } from "./views/domains-view";
 import { PaymentLinksView } from "./views/payment-links-view";
 import { DevelopersView } from "./views/developers-view";
 import { TeamView } from "./views/team-view";
@@ -101,6 +106,24 @@ export function DashboardShell() {
       label: t("nav.payroll"),
       icon: SendHorizontal,
       badge: t("badges.superpower"),
+    },
+    {
+      id: "multisig" as DashboardTab,
+      label: t("nav.multisig"),
+      icon: UsersRound,
+      badge: t("badges.multisig"),
+    },
+    {
+      id: "passes" as DashboardTab,
+      label: t("nav.passes"),
+      icon: Gift,
+      badge: t("badges.oneTime"),
+    },
+    {
+      id: "domains" as DashboardTab,
+      label: t("nav.domains"),
+      icon: Globe,
+      badge: null,
     },
     {
       id: "links" as DashboardTab,
@@ -353,6 +376,12 @@ export function DashboardShell() {
           {activeTab === "subscribers" && <SubscribersView />}
 
           {activeTab === "payroll" && <PayrollView />}
+
+          {activeTab === "multisig" && <MultisigView />}
+
+          {activeTab === "passes" && <GiftPassesView />}
+
+          {activeTab === "domains" && <DomainsView />}
 
           {activeTab === "links" && (
             <PaymentLinksView businessName={user.businessName} />

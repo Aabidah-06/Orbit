@@ -17,14 +17,17 @@ import {
   FileSpreadsheet,
   ShieldCheck,
   X,
+  FlaskConical,
 } from "lucide-react";
 import { useTranslations } from "next-intl";
 import Papa from "papaparse";
 import { StrKey } from "@stellar/stellar-sdk";
-import { PayrollRecipient } from "../dashboard-types";
+import { PayrollRecipient, PayrollSimulationResult } from "../dashboard-types";
 import { useTeam } from "@/lib/team-context";
 import { useAuth } from "@/lib/auth-context";
 import { Contractor, duplicateWallets, mergeDuplicateRecipients, filterAndSortRecipients, parsePayrollAmount } from "@/lib/payroll";
+import { simulatePayrollRun } from "@/lib/payroll-simulation";
+import { PayrollSimulationModal } from "../modals/payroll-simulation-modal";
 
 const SAMPLE_RECIPIENTS: PayrollRecipient[] = [
   {
@@ -86,6 +89,9 @@ export function PayrollView() {
   const [recipients, setRecipients] = useState<PayrollRecipient[]>(SAMPLE_RECIPIENTS);
   const [isExecuting, setIsExecuting] = useState(false);
   const [disbursedSuccess, setDisbursedSuccess] = useState<string | null>(null);
+  const [isSimulating, setIsSimulating] = useState(false);
+  const [isSimulationOpen, setIsSimulationOpen] = useState(false);
+  const [simulationResult, setSimulationResult] = useState<PayrollSimulationResult | null>(null);
   const [uploadErrors, setUploadErrors] = useState<RowValidationError[]>([]);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -339,6 +345,22 @@ export function PayrollView() {
     }, 1300);
   };
 
+  // #147 — Read-only pre-flight: build the batch_disburse envelope, simulate it
+  // on Soroban RPC and surface fees, instruction limits and per-recipient checks
+  // without ever prompting for a wallet signature.
+  const handleSimulatePayroll = async () => {
+    if (readyCount === 0) return;
+    setIsSimulationOpen(true);
+    setIsSimulating(true);
+    setSimulationResult(null);
+    const result = await simulatePayrollRun({
+      recipients,
+      sender: user?.walletAddress || user?.linkedVaults?.stellar,
+    });
+    setSimulationResult(result);
+    setIsSimulating(false);
+  };
+
   return (
     <div className="space-y-6">
       {/* 1. Header with Actions */}
@@ -386,6 +408,15 @@ export function PayrollView() {
           >
             <Plus size={13} />
             <span>Add Row</span>
+          </button>
+          <button
+            onClick={handleSimulatePayroll}
+            disabled={isSimulating || isExecuting || readyCount === 0}
+            title="Simulate the batch against Soroban RPC without signing"
+            className="button button-secondary text-xs h-9 px-3 flex items-center gap-1.5 disabled:opacity-50"
+          >
+            {isSimulating ? <RotateCw size={13} className="animate-spin" /> : <FlaskConical size={13} />}
+            <span>Simulate Payroll Run</span>
           </button>
           <button
             onClick={handleLoadSampleCSV}
@@ -732,6 +763,14 @@ export function PayrollView() {
           {" "}Unlike traditional chains where payouts happen as N individual transactions that can partially fail, Orbit&apos;s Soroban smart contract (<code className="font-mono text-[11px] text-black">batch_disburse</code>) executes all transfers atomically. Either every single contractor gets paid, or the transaction safely rolls back.
         </div>
       </div>
+
+      {/* Dry-run simulation inspector (#147) */}
+      <PayrollSimulationModal
+        isOpen={isSimulationOpen}
+        isLoading={isSimulating}
+        result={simulationResult}
+        onClose={() => setIsSimulationOpen(false)}
+      />
     </div>
   );
 }
