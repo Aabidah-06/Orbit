@@ -1,0 +1,35 @@
+name: Soroban contract CI
+
+on:
+  push:
+    branches:
+      - main
+      - feat/123-126-subscription-badges-swaps-escrow-bitmap
+  pull_request:
+    paths:
+      - "contracts/soroban/**"
+      - ".github/workflows/soroban.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts/soroban
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts/soroban
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Unit and integration tests
+        run: cargo test --locked -j 2
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -j 2 -- -D warnings
