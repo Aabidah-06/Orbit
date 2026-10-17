@@ -26,7 +26,23 @@ const {
 } = require('./dunning');
 const { registerComplianceRoutes } = require('./compliance');
 const { registerSigningSessionRoutes } = require('./signing-sessions');
+const { registerTransactionExportRoute } = require('./transaction-report');
+const { registerCustomerPortalRoutes } = require('./customer-portal');
 const { registerFailureRecoveryRoutes } = require('./failure-recovery');
+const { registerCouponRoutes, normalizeCode } = require('./coupons');
+const { registerGraphql } = require('./graphql');
+const { configuredIndexer, registerIndexerRoutes } = require('./ledger-indexer');
+const { recordPullFailure, registerBillingResolutionRoutes } = require('./billing-resolution');
+const {
+    isFiatCurrency,
+    getRate,
+    calculateUsdcUnits,
+    quoteUsdcAmount,
+    getSupportedRates,
+    startOracleWorker,
+    SlippageError,
+    RateUnavailableError,
+} = require('./oracle');
 
 const app = express();
 // Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
@@ -131,15 +147,41 @@ const stellarAddressSchema = z.string().refine(
 // merchant_id is taken from the API key; a client-supplied value is only checked against it
 const optionalMerchantIdSchema = z.string().uuid("merchant_id must be a valid UUID").optional();
 
-const createPlanSchema = z.object({
+// USDC plans store raw token units (USDC has 7 decimals, so 290000000 = 29
+// USDC), same as the contract's amount_per_interval. Fiat plans (USD/EUR) store
+// a price_amount in that currency, which the exchange rate oracle converts to
+// raw USDC units at the moment of pull (#96).
+const usdcPlanSchema = z.object({
     merchant_id: optionalMerchantIdSchema,
     name: z.string().trim().min(1, "name cannot be empty"),
-    // Raw token units (USDC has 7 decimals, so 290000000 = 29 USDC), same as the contract's amount_per_interval
     usdc_amount: z.coerce.number()
         .int("usdc_amount must be an integer in raw token units")
         .positive("usdc_amount must be greater than 0"),
     interval_seconds: z.coerce.number().int().positive("interval_seconds must be a positive integer"),
+    currency: z.enum(['USDC']).default('USDC'),
 });
+
+const fiatPlanSchema = z.object({
+    merchant_id: optionalMerchantIdSchema,
+    name: z.string().trim().min(1, "name cannot be empty"),
+    price_amount: z.coerce.number()
+        .positive("price_amount must be greater than 0"),
+    interval_seconds: z.coerce.number().int().positive("interval_seconds must be a positive integer"),
+    currency: z.enum(['USD', 'EUR']),
+});
+
+// Validates the body against the schema for its pricing currency, so a USDC
+// plan still requires usdc_amount and a fiat plan still requires price_amount.
+const parseCreatePlanBody = (body) => {
+    const currencyResult = z
+        .object({ currency: z.enum(['USDC', 'USD', 'EUR']) })
+        .safeParse({ currency: body?.currency ?? 'USDC' });
+    if (!currencyResult.success) return currencyResult;
+
+    return currencyResult.data.currency === 'USDC'
+        ? usdcPlanSchema.safeParse(body)
+        : fiatPlanSchema.safeParse(body);
+};
 
 const getPlanParamsSchema = z.object({
     id: z.string().uuid("id parameter must be a valid UUID"),
@@ -153,6 +195,7 @@ const createSubscriptionSchema = z.object({
     plan_id: z.string().uuid("plan_id must be a valid UUID"),
     customer_wallet_address: stellarAddressSchema,
     metadata: z.record(z.any()).optional().default({}),
+    coupon_code: z.string().trim().min(3).max(32).regex(/^[A-Za-z0-9_-]+$/).optional(),
 });
 
 const triggerPullSchema = z.object({
@@ -203,13 +246,13 @@ const MERCHANT_MISMATCH_ERROR = { error: "merchant_id does not match the authent
 // ROUTE 1: POST /plans (Create a new pricing plan)
 // ==========================================
 app.post('/plans', authenticateMerchant, async (req, res) => {
-    const parseResult = createPlanSchema.safeParse(req.body);
+    const parseResult = parseCreatePlanBody(req.body);
     if (!parseResult.success) {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
     }
     if (merchantMismatch(req, parseResult.data.merchant_id)) return res.status(403).json(MERCHANT_MISMATCH_ERROR);
 
-    const { name, usdc_amount, interval_seconds } = parseResult.data;
+    const { name, currency, interval_seconds } = parseResult.data;
     const merchant_id = req.merchant.id;
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
@@ -220,9 +263,30 @@ app.post('/plans', authenticateMerchant, async (req, res) => {
         label: "creating plan",
         resolveMerchant: () => ({ merchantId: merchant_id }),
     }, async () => {
+        // Fiat plans: cache the current USDC equivalent for dashboards. The
+        // authoritative amount is always recalculated at the moment of pull;
+        // when the cache is cold the placeholder stays 0 until the oracle
+        // worker publishes the first rate.
+        let usdc_amount = parseResult.data.usdc_amount;
+        const price_amount = parseResult.data.price_amount;
+        if (isFiatCurrency(currency)) {
+            usdc_amount = 0;
+            try {
+                const rateInfo = await getRate({
+                    supabase,
+                    fetchImpl: app.locals.fetchImpl,
+                    currency,
+                    allowNetwork: false,
+                });
+                if (rateInfo) usdc_amount = calculateUsdcUnits({ amount: price_amount, rate: rateInfo.rate });
+            } catch (err) {
+                console.error("Error deriving plan usdc_amount from oracle cache:", err.message);
+            }
+        }
+
         const { data, error } = await supabase
             .from('plans')
-            .insert([{ merchant_id, name, usdc_amount, interval_seconds }])
+            .insert([{ merchant_id, name, currency, usdc_amount, price_amount, interval_seconds }])
             .select()
             .single();
 
@@ -310,6 +374,24 @@ app.get('/subscribers', authenticateMerchant, async (req, res) => {
 });
 
 // ==========================================
+// ROUTE: GET /rates (Exchange rate oracle)
+// ==========================================
+// Returns the supported fiat->USDC conversion pairs with their newest cached
+// rate, refreshed from the live feed on a cold cache (#96).
+app.get('/rates', async (req, res) => {
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const rates = await getSupportedRates({ supabase, fetchImpl: app.locals.fetchImpl });
+        res.status(200).json(rates);
+    } catch (err) {
+        console.error("Error fetching exchange rates:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==========================================
 // ROUTE 4: POST /trigger-pull (The Blockchain Bridge)
 // ==========================================
 // Loads a subscription owned by the authenticated merchant. Another merchant's
@@ -319,7 +401,7 @@ const loadPullContext = async (supabase, subscriptionId, merchant) => {
         .from('subscriptions')
         .select(`
             *,
-            plans ( merchant_id, usdc_amount, interval_seconds )
+            plans ( merchant_id, usdc_amount, interval_seconds, currency, price_amount )
         `)
         .eq('id', subscriptionId)
         .single();
@@ -327,6 +409,10 @@ const loadPullContext = async (supabase, subscriptionId, merchant) => {
     if (isNoRowsError(subError) || !sub) return { status: 404, error: "Subscription not found" };
     if (subError) throw subError;
     if (sub.plans?.merchant_id !== merchant.id) return { status: 404, error: "Subscription not found" };
+    // A coupon quote must not silently charge the fixed-price legacy Soroban vault.
+    if (sub.coupon_id && !sub.promotion_onchain_verified) {
+        return { status: 409, error: "Promotional vault terms are not verified on-chain; billing is blocked" };
+    }
 
     return { sub, merchant };
 };
@@ -409,6 +495,7 @@ app.post('/trigger-pull', authenticateMerchant, async (req, res) => {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
     }
 
+    let ownedSubscriptionId;
     try {
         const { subscription_id } = parseResult.data;
         const supabase = getSupabase();
@@ -417,67 +504,111 @@ app.post('/trigger-pull', authenticateMerchant, async (req, res) => {
         const context = await loadPullContext(supabase, subscription_id, req.merchant);
         if (context.error) return res.status(context.status).json({ error: context.error });
         const { sub, merchant } = context;
+        ownedSubscriptionId = subscription_id;
 
         const result = await executeIdempotently({
             supabase,
             req,
             label: "preparing pull",
             resolveMerchant: () => ({ merchantId: sub.plans.merchant_id }),
-        }, () => withBillingLock({
-            supabase,
-            subscriptionId: subscription_id,
-            ttlSeconds: PREPARE_LOCK_TTL_SECONDS,
         }, async () => {
-            const ORBIT_CONTRACT_ID = process.env.ORBIT_CONTRACT_ID;
-            if (!ORBIT_CONTRACT_ID) {
-                return { status: 500, body: { error: "ORBIT_CONTRACT_ID not set in .env" } };
+            // Price the pull (#96): fiat plans convert price_amount into raw
+            // USDC units at the live rate and are rejected when the rate moved
+            // more than the slippage tolerance away from the quoted rate.
+            let pricing;
+            try {
+                pricing = await quoteUsdcAmount({
+                    supabase,
+                    plan: sub.plans,
+                    subscription: sub,
+                    fetchImpl: app.locals.fetchImpl,
+                });
+            } catch (err) {
+                if (err instanceof SlippageError) {
+                    return { status: 409, body: { error: err.message, ...err.details } };
+                }
+                if (err instanceof RateUnavailableError) {
+                    return { status: 503, body: { error: err.message } };
+                }
+                throw err;
             }
 
-            const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
-            const server = getSorobanServer(rpcUrl);
-            const contract = new Contract(ORBIT_CONTRACT_ID);
+            // A fiat subscription created while the rate cache was cold has no
+            // quote yet: store this pull's rate so the next one is guarded.
+            if (
+                isFiatCurrency(sub.plans?.currency) &&
+                pricing.rate != null &&
+                (sub.quoted_rate === null || sub.quoted_rate === undefined)
+            ) {
+                const { error: quoteError } = await supabase
+                    .from('subscriptions')
+                    .update({ quoted_rate: pricing.rate })
+                    .eq('id', subscription_id);
+                if (quoteError) console.error("Failed to persist subscription quote:", quoteError.message);
+            }
 
-            // 3. Build the Soroban Transaction
-            const account = await server.getAccount(merchant.wallet_address);
+            return withBillingLock({
+                supabase,
+                subscriptionId: subscription_id,
+                ttlSeconds: PREPARE_LOCK_TTL_SECONDS,
+            }, async () => {
+                const ORBIT_CONTRACT_ID = process.env.ORBIT_CONTRACT_ID;
+                if (!ORBIT_CONTRACT_ID) {
+                    return { status: 500, body: { error: "ORBIT_CONTRACT_ID not set in .env" } };
+                }
 
-            const tx = new TransactionBuilder(account, {
-                fee: "1000000",
-                networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET
-            })
-            .addOperation(contract.call("pull_funds",
-                Address.fromString(sub.customer_wallet_address).toScVal(),
-                Address.fromString(merchant.wallet_address).toScVal()
-            ))
-            .setTimeout(30)
-            .build();
+                const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
+                const server = getSorobanServer(rpcUrl);
+                const contract = new Contract(ORBIT_CONTRACT_ID);
 
-            // Simulate and return an unsigned envelope. The merchant signs it in their wallet.
-            const preparedTx = await server.prepareTransaction(tx);
+                // 3. Build the Soroban Transaction
+                const account = await server.getAccount(merchant.wallet_address);
 
-            await writeAuditLog(supabase, {
-                merchantId: sub.plans.merchant_id,
-                actorAddress: getActorAddress(req, merchant.wallet_address),
-                action: 'pull.prepare',
-                resourceType: 'subscription',
-                resourceId: subscription_id,
-                ipAddress: getClientIp(req),
-                changesBefore: null,
-                changesAfter: { subscription_id, merchant_address: merchant.wallet_address },
+                const tx = new TransactionBuilder(account, {
+                    fee: "1000000",
+                    networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET
+                })
+                .addOperation(contract.call("pull_funds",
+                    Address.fromString(sub.customer_wallet_address).toScVal(),
+                    Address.fromString(merchant.wallet_address).toScVal()
+                ))
+                .setTimeout(30)
+                .build();
+
+                // Simulate and return an unsigned envelope. The merchant signs it in their wallet.
+                const preparedTx = await server.prepareTransaction(tx);
+
+                await writeAuditLog(supabase, {
+                    merchantId: sub.plans.merchant_id,
+                    actorAddress: getActorAddress(req, merchant.wallet_address),
+                    action: 'pull.prepare',
+                    resourceType: 'subscription',
+                    resourceId: subscription_id,
+                    ipAddress: getClientIp(req),
+                    changesBefore: null,
+                    changesAfter: { subscription_id, merchant_address: merchant.wallet_address },
+                });
+
+                return {
+                    status: 200,
+                    body: {
+                        transaction_xdr: preparedTx.toXDR(),
+                        network_passphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+                        merchant_address: merchant.wallet_address,
+                        subscription_id,
+                        // Amount to settle this cycle (raw USDC units)
+                        usdc_amount: pricing.usdc_amount,
+                        currency: pricing.currency,
+                        rate: pricing.rate,
+                    },
+                };
             });
-
-            return {
-                status: 200,
-                body: {
-                    transaction_xdr: preparedTx.toXDR(),
-                    network_passphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
-                    merchant_address: merchant.wallet_address,
-                    subscription_id,
-                },
-            };
-        }));
+        });
+        if (result.status >= 500) await recordPullFailure(supabase, subscription_id, result.body?.error || 'Pull preparation failed');
         sendResult(res, result);
     } catch (err) {
         console.error("Error preparing pull:", err);
+        if (ownedSubscriptionId) await recordPullFailure(getSupabase(), ownedSubscriptionId, err.message).catch(console.error);
         res.status(500).json({ error: err.message });
     }
 });
@@ -487,6 +618,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
     const parseResult = submitPullSchema.safeParse(req.body);
     if (!parseResult.success) return res.status(400).json({ error: formatZodError(parseResult.error) });
 
+    let ownedSubscriptionId;
     try {
         const { subscription_id, signed_xdr } = parseResult.data;
         const supabase = getSupabase();
@@ -494,6 +626,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
         const context = await loadPullContext(supabase, subscription_id, req.merchant);
         if (context.error) return res.status(context.status).json({ error: context.error });
         const { sub, merchant } = context;
+        ownedSubscriptionId = subscription_id;
 
         const pollTimeoutMs = app.locals.txPollTimeoutMs ?? TX_POLL_TIMEOUT_MS;
 
@@ -577,6 +710,113 @@ const relayerErrorResult = (err) => ({
 });
 
 const RELAYER_NOT_CONFIGURED = { error: "Gas sponsorship relayer is not configured", code: "relayer_unavailable" };
+                if (confirmation.status === "SUCCESS") {
+                    const pullTime = new Date();
+                    const nextBilling = new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
+
+                    await supabase
+                        .from('subscriptions')
+                        .update({
+                            next_billing_date: nextBilling.toISOString(),
+                            status: 'active',
+                            retry_count: 0,
+                            dunning_status: null,
+                            next_dunning_retry_at: null,
+                            last_failure: null,
+                        })
+                        .eq('id', subscription_id);
+
+                    await writeAuditLog(supabase, {
+                        merchantId: sub.plans.merchant_id,
+                        actorAddress: getActorAddress(req, merchant.wallet_address),
+                        action: 'pull.execute',
+                        resourceType: 'subscription',
+                        resourceId: subscription_id,
+                        ipAddress: getClientIp(req),
+                        changesBefore: { next_billing_date: sub.next_billing_date, status: sub.status },
+                        changesAfter: { next_billing_date: nextBilling.toISOString(), status: 'active', txHash, amount: String(sub.plans.usdc_amount) },
+                    });
+
+                    if (sub.plans.merchant_id) {
+                        // Fiat plans report the settled amount in raw USDC units
+                        // converted at the current cached rate (#96)
+                        let settledAmount = sub.plans.usdc_amount;
+                        if (isFiatCurrency(sub.plans?.currency)) {
+                            try {
+                                const quote = await quoteUsdcAmount({
+                                    supabase,
+                                    plan: sub.plans,
+                                    subscription: sub,
+                                    fetchImpl: app.locals.fetchImpl,
+                                    allowNetwork: false,
+                                    enforceSlippage: false,
+                                });
+                                settledAmount = quote.usdc_amount;
+                            } catch {
+                                // Keep the stored plan amount when the cache cannot price it
+                            }
+                        }
+
+                        // Only record amounts independently verified from the
+                        // successful on-chain funds_pulled event. Plan and oracle
+                        // quotes are not necessarily the vault's actual transfer.
+                        const verifiedAmount = require('./transaction-report').confirmedSettlementAmount(
+                            confirmation,
+                            { customerWallet: sub.customer_wallet_address,
+                              merchantWallet: merchant.wallet_address,
+                              contractId: process.env.ORBIT_CONTRACT_ID },
+                        );
+                        if (verifiedAmount === null) {
+                            console.error('CRITICAL: confirmed transfer missing verified amount; reconcile transaction:', txHash);
+                        } else {
+                            const { error: paymentError } = await supabase.from('payment_transactions').insert([{
+                                merchant_id: sub.plans.merchant_id,
+                                subscription_id,
+                                plan_id: sub.plan_id,
+                                customer_wallet_address: sub.customer_wallet_address,
+                                amount_usdc_units: verifiedAmount,
+                                status: 'settled',
+                                tx_hash: txHash,
+                                settled_at: pullTime.toISOString(),
+                            }]);
+                            if (paymentError && paymentError.code !== '23505') {
+                                console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
+                            }
+                        }
+
+                        await dispatchWebhookEvent(supabase, {
+                            merchantId: sub.plans.merchant_id,
+                            eventType: 'payment.settled',
+                            payload: {
+                                event: 'payment.settled',
+                                subscription_id,
+                                customer_wallet_address: sub.customer_wallet_address,
+                                amount: settledAmount,
+                                txHash,
+                                settled_at: pullTime.toISOString(),
+                            },
+                            fetchImpl: app.locals.fetchImpl,
+                        });
+                    }
+
+                    return {
+                        status: 200,
+                        body: { message: "Successfully pulled funds on-chain!", txHash },
+                    };
+                }
+
+                if (confirmation.status === "FAILED") {
+                    let failureReason = 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.';
+                    try {
+                        const simulation = await server.simulateTransaction(signedTx);
+                        if (simulation.error) failureReason = simulation.error;
+                    } catch { /* keep the original failure when RPC diagnostics are unavailable */ }
+                    await recordPullFailure(supabase, subscription_id, failureReason, txHash);
+                    await markSubscriptionPastDue(supabase, subscription_id, {
+                        actorAddress: merchant.wallet_address,
+                        ipAddress: getClientIp(req),
+                        fetchImpl: app.locals.fetchImpl,
+                    });
 
 app.post('/relay/prepare-pull', authenticateMerchant, relayRateLimit, async (req, res) => {
     const parseResult = triggerPullSchema.safeParse(req.body);
@@ -682,8 +922,17 @@ app.post('/relay/submit-pull', authenticateMerchant, relayRateLimit, async (req,
                         attempts: outcome.attempts,
                     },
                 });
+                // Still NOT_FOUND after the timeout: outcome unknown, let the caller poll later.
+                // Keep the lease until it expires so no second pull races the one still in flight.
+                await recordPullFailure(supabase, subscription_id, 'RPC timeout: transaction submitted but not yet confirmed. Do not retry until its outcome is known.', txHash);
+                return {
+                    status: 202,
+                    body: { message: "Transaction submitted but not yet confirmed; check back later", txHash },
+                    holdLock: true,
+                };
             });
         });
+        if (result.status >= 500 && !result.body?.txHash) await recordPullFailure(supabase, subscription_id, result.body?.error || 'Pull submission failed');
         sendResult(res, result);
     } catch (err) {
         console.error("Error relaying pull:", err);
@@ -700,6 +949,8 @@ app.get('/relay/budget', authenticateMerchant, async (req, res) => {
         res.status(200).json({ budget: await relayer.budgetStatus(req.merchant.id) });
     } catch (err) {
         console.error("Error fetching relayer budget:", err);
+        console.error("Error submitting pull:", err);
+        if (ownedSubscriptionId) await recordPullFailure(getSupabase(), ownedSubscriptionId, err.message).catch(console.error);
         res.status(500).json({ error: err.message });
     }
 });
@@ -713,7 +964,7 @@ app.post('/subscriptions', async (req, res) => {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
     }
 
-    const { plan_id, customer_wallet_address, metadata } = parseResult.data;
+    const { plan_id, customer_wallet_address, metadata, coupon_code } = parseResult.data;
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
 
@@ -735,6 +986,21 @@ app.post('/subscriptions', async (req, res) => {
     }, async () => {
         const nextBillingDate = new Date().toISOString();
 
+        // Look up the plan so fiat plans can capture the oracle rate as their
+        // slippage quote. Non-fatal: the insert below still verifies the plan
+        // through its foreign key.
+        let planRow = null;
+        try {
+            const { data: planData, error: planLookupError } = await supabase
+                .from('plans')
+                .select('merchant_id, currency, price_amount, usdc_amount')
+                .eq('id', plan_id);
+            if (planLookupError) throw planLookupError;
+            planRow = Array.isArray(planData) ? planData[0] : planData || null;
+        } catch (err) {
+            console.error("Error loading plan for subscription:", err.message);
+        }
+
         const insertPayload = {
             plan_id,
             customer_wallet_address,
@@ -742,11 +1008,44 @@ app.post('/subscriptions', async (req, res) => {
             metadata: metadata || {},
         };
 
-        const { data, error } = await supabase
-            .from('subscriptions')
-            .insert([insertPayload])
-            .select()
-            .single();
+        // Fiat plans: quote the fiat->USDC rate now. The pull flow later
+        // rejects settlements whose live rate moves more than 2% from it.
+        if (isFiatCurrency(planRow?.currency)) {
+            try {
+                const quote = await quoteUsdcAmount({
+                    supabase,
+                    plan: planRow,
+                    fetchImpl: app.locals.fetchImpl,
+                    allowNetwork: false,
+                    enforceSlippage: false,
+                });
+                insertPayload.quoted_rate = quote.rate;
+            } catch (err) {
+                // Cold rate cache: subscribe without a quote; the first pull stores one
+                console.error("Unable to quote subscription exchange rate:", err.message);
+            }
+        }
+
+        // A SQL function locks the coupon and atomically creates the
+        // subscription and increments redemptions_count; no read-then-write race.
+        let data, error;
+        if (coupon_code) {
+            const redeemed = await supabase.rpc('redeem_coupon_subscription', {
+                p_plan_id: plan_id,
+                p_customer_wallet_address: customer_wallet_address,
+                p_metadata: metadata || {},
+                p_code: normalizeCode(coupon_code),
+                p_quoted_rate: insertPayload.quoted_rate ?? null,
+            });
+            data = Array.isArray(redeemed.data) ? redeemed.data[0] : redeemed.data;
+            error = redeemed.error;
+            if (error?.code === 'P7501') return { status: 422, body: { error: 'Coupon invalid or incompatible with plan' } };
+            if (error?.code === 'P7502') return { status: 409, body: { error: 'Coupon redemption limit reached' } };
+            if (error?.code === 'P7503') return { status: 404, body: { error: 'Plan not found' } };
+        } else {
+            ({ data, error } = await supabase.from('subscriptions')
+                .insert([insertPayload]).select().single());
+        }
 
         if (isForeignKeyError(error)) return { status: 404, body: { error: "Plan not found" } };
         if (isUniqueViolation(error)) {
@@ -963,7 +1262,7 @@ app.post('/dunning/process', async (req, res) => {
     }
 });
 
-app.post('/subscriptions/:id/recovery-link', async (req, res) => {
+app.post('/subscriptions/:id/recovery-link', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const supabase = getSupabase();
@@ -977,8 +1276,14 @@ app.post('/subscriptions/:id/recovery-link', async (req, res) => {
 
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
 
-        const recovery = generateRecoveryLink(id);
+        if (sub.plans?.merchant_id !== req.merchant.id) return res.status(404).json({ error: 'Subscription not found' });
+
+        const recovery = generateRecoveryLink(id, { planId: sub.plan_id });
         res.status(200).json(recovery);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -988,7 +1293,7 @@ app.post('/subscriptions/:id/recovery-link', async (req, res) => {
 // ==========================================
 // ROUTE 8: CUSTOMER MANAGEMENT ACTIONS
 // ==========================================
-app.post('/subscriptions/:id/cancel', async (req, res) => {
+app.post('/subscriptions/:id/cancel', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const supabase = getSupabase();
@@ -1002,6 +1307,10 @@ app.post('/subscriptions/:id/cancel', async (req, res) => {
 
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
 
         const changesBefore = { status: sub.status };
         const changesAfter = { status: 'cancelled', next_dunning_retry_at: null };
@@ -1048,7 +1357,7 @@ app.post('/subscriptions/:id/cancel', async (req, res) => {
     }
 });
 
-app.post('/subscriptions/:id/refund', async (req, res) => {
+app.post('/subscriptions/:id/refund', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const { amount, reason, prorated } = req.body || {};
@@ -1063,6 +1372,10 @@ app.post('/subscriptions/:id/refund', async (req, res) => {
 
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
 
         const merchantId = sub.plans?.merchant_id;
         const refundAmount = amount ?? sub.plans?.usdc_amount;
@@ -1109,7 +1422,7 @@ app.post('/subscriptions/:id/refund', async (req, res) => {
     }
 });
 
-app.get('/subscriptions/:id/timeline', async (req, res) => {
+app.get('/subscriptions/:id/timeline', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const supabase = getSupabase();
@@ -1123,6 +1436,10 @@ app.get('/subscriptions/:id/timeline', async (req, res) => {
 
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
 
         const { data: logs } = await supabase
             .from('audit_logs')
@@ -1464,10 +1781,51 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
 
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
+registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
+registerCouponRoutes(app, getSupabase, authenticateMerchant);
+registerBillingResolutionRoutes(app, getSupabase, authenticateMerchant, loadPullContext, getSorobanServer);
+registerIndexerRoutes(app);
+app.locals.graphqlServer = registerGraphql(app, getSupabase, authenticateMerchant);
+
+// PostgreSQL protocol cursor: unlike Supabase REST pagination, the cursor
+// never materializes the full transaction table in application memory.
+let reportPool;
+const getReportPool = () => {
+    if (app.locals.reportPool) return app.locals.reportPool;
+    if (!process.env.DATABASE_URL) return null;
+    if (!reportPool) {
+        const { Pool } = require('pg');
+        reportPool = new Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
+    }
+    return reportPool;
+};
+registerTransactionExportRoute(
+    app, authenticateMerchant, getReportPool,
+    (sql, values) => {
+        const Cursor = require('pg-cursor');
+        return new Cursor(sql, values);
+    },
+);
 
 const PORT = process.env.PORT || 3001;
 if (require.main === module) {
+    if (getSupabase() && process.env.INDEXER_START_LEDGER) {
+        app.locals.ledgerIndexer = configuredIndexer(getSupabase());
+        app.locals.indexerWorker = app.locals.ledgerIndexer.start(Number(process.env.INDEXER_INTERVAL_MS) || 5000);
+    }
+    // Background oracle worker (#96): refreshes the fiat->USDC rate cache on a
+    // schedule so /rates and dynamic fiat billing always read fresh quotes.
+    const oracleSupabase = getSupabase();
+    if (oracleSupabase) {
+        app.locals.oracleWorker = startOracleWorker({
+            supabase: oracleSupabase,
+            fetchImpl: app.locals.fetchImpl,
+        });
+    } else {
+        console.warn("Oracle worker not started: Supabase client not initialized");
+    }
+
     app.listen(PORT, () => {
         console.log(`Orbit Merchant API running on http://localhost:${PORT}`);
     });

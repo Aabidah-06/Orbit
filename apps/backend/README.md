@@ -1,5 +1,9 @@
 # Orbit Merchant API
 
+See [Merchant operations](../../Docs/MERCHANT_OPERATIONS.md) for the persistent
+event indexer, `/health/ready`, federated `/graphql` API, wallet authentication,
+billing recovery endpoints, and required migrations for existing databases.
+
 The Orbit Merchant API (`apps/backend/index.js`) is an Express service that manages pricing plans, customer subscriptions, and automated on-chain pull executions on Stellar Soroban. Data is persisted in Supabase using the tables defined in `apps/backend/schema.sql` (`merchants`, `plans`, `subscriptions`).
 
 ## Setup and Configuration
@@ -36,6 +40,9 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `RELAYER_QUEUE_TIMEOUT_MS` | Longest a relay waits for a free channel before `503` (defaults to 30000) | `30000` |
 | `RELAYER_AUTH_VALIDITY_LEDGERS` | Ledgers a prepared merchant authorization remains signable (defaults to 100, ~8 minutes) | `100` |
 | `RELAYER_RATE_LIMIT_MAX` / `RELAYER_RATE_LIMIT_WINDOW_MS` | Relay requests allowed per merchant per window (defaults to 10 per 60000 ms) | `10` |
+| `ORACLE_SYNC_INTERVAL_MS` | Background worker refresh interval for the fiat → USDC rate cache (defaults to 300000 = 5 min) | `300000` |
+| `ORACLE_SLIPPAGE_TOLERANCE_BPS` | Maximum rate movement from a subscription's quoted rate that a fiat pull may settle at (defaults to 200 = 2%) | `200` |
+| `ORACLE_FETCH_TIMEOUT_MS` | Price feed request timeout in milliseconds (defaults to 6000) | `6000` |
 
 ### Running the API
 
@@ -56,6 +63,7 @@ The service runs at `http://localhost:3001`.
 | `POST` | `/plans` | API key | Create a new recurring pricing plan |
 | `GET` | `/plans/:id` | Public | Fetch plan and merchant details |
 | `GET` | `/subscribers` | API key | List active subscribers for a merchant |
+| `GET` | `/rates` | Public | Supported fiat → USDC pairs with their newest cached rate |
 | `POST` | `/trigger-pull` | API key | Prepare an unsigned merchant pull transaction |
 | `POST` | `/submit-pull` | API key | Verify and submit a wallet-signed pull transaction |
 | `POST` | `/relay/prepare-pull` | API key | Get the authorization entry for a gas-sponsored pull |
@@ -134,7 +142,9 @@ Content-Type: `application/json`
 |---|---|---|---|
 | `merchant_id` | `string` (UUID) | No | Taken from the API key. If sent, must match the authenticated merchant (`403` otherwise). |
 | `name` | `string` | Yes | Name of the subscription plan (e.g., `"Pro Plan - 29 USDC/month"`). |
-| `usdc_amount` | `integer` | Yes | Billing amount per interval in raw token units. USDC has 7 decimals, so `290000000` is 29 USDC. This is the same unit as the contract's `amount_per_interval`. |
+| `currency` | `string` | No | Pricing currency. `USDC` (the default) requires `usdc_amount`; `USD` and `EUR` require `price_amount`. Fiat plans settle at the oracle's live rate when a pull is prepared. |
+| `usdc_amount` | `integer` | USDC plans | Billing amount per interval in raw token units. USDC has 7 decimals, so `290000000` is 29 USDC. This is the same unit as the contract's `amount_per_interval`. |
+| `price_amount` | `number` | Fiat plans | Price per interval in the plan's fiat currency (e.g. `20` for 20 USD). The oracle converts it to raw USDC units at pull time. |
 | `interval_seconds` | `number` | Yes | Cadence between billing pulls in seconds (e.g., `2592000` for 30 days). |
 
 #### Example Request
@@ -309,10 +319,11 @@ Prepares an unsigned on-chain pull payment for the merchant's registered public 
 
 The flow:
 1. Loads subscription, plan terms, and merchant wallet address from Supabase.
-2. Builds and simulates `pull_funds(user, merchant)`.
-3. Returns the transaction XDR and network passphrase for signing in the merchant wallet.
-4. The client sends the signed envelope to `POST /submit-pull`.
-5. The API verifies the merchant signature, submits it, and updates billing state after confirmation.
+2. For fiat plans (`USD`/`EUR`), resolves the live USDC rate from the oracle and rejects the pull when the rate moved more than 200 bps (2%) from the subscription's quoted rate. The response then carries `usdc_amount`, `currency`, and the `rate` used; USDC plans report their stored `usdc_amount` unchanged.
+3. Builds and simulates `pull_funds(user, merchant)`.
+4. Returns the transaction XDR and network passphrase for signing in the merchant wallet.
+5. The client sends the signed envelope to `POST /submit-pull`.
+6. The API verifies the merchant signature, submits it, and updates billing state after confirmation.
 
 #### Request Body
 Content-Type: `application/json`
@@ -369,6 +380,26 @@ Status: `200 OK`
   }
   ```
 
+- `409 Conflict`
+  Returned for a fiat plan when the live exchange rate moved more than the slippage tolerance away from the subscription's quoted rate. The pull is not simulated or locked; the response reports both rates and the move in basis points.
+  ```json
+  {
+    "error": "Exchange rate moved 500 bps from the quoted rate, exceeding the 200 bps slippage tolerance",
+    "quoted_rate": 1,
+    "current_rate": 1.05,
+    "move_bps": 500,
+    "max_bps": 200
+  }
+  ```
+
+- `503 Service Unavailable`
+  Returned for a fiat plan when no exchange rate can be resolved (cold cache and the price feed is unreachable).
+  ```json
+  {
+    "error": "Exchange rate for USD/USDC is unavailable"
+  }
+  ```
+
 - `500 Internal Server Error`
   Returned when `ORBIT_CONTRACT_ID` is not set in `.env`, or the Soroban transaction build, simulation, or submission fails (e.g., interval not elapsed, insufficient allowance).
   ```json
@@ -390,6 +421,8 @@ Status: `200 OK`
 Records a customer subscription after the customer has executed the on-chain allowance approval and vault creation handshake with the Orbit contract.
 
 Sets `next_billing_date` to the current timestamp (`new Date().toISOString()`), enabling the initial pull immediately.
+
+For fiat plans the current oracle rate is stored on the subscription as `quoted_rate`, which is the baseline the pull-time slippage guard compares against. When the rate cache is cold the subscription is still created and the first pull stores the baseline instead.
 
 #### Request Body
 Content-Type: `application/json`
@@ -447,6 +480,64 @@ Status: `201 Created`
 
 - `500 Internal Server Error`
   Returned if the database query fails.
+
+---
+
+### 6. GET /rates
+
+#### Purpose
+Lists the supported fiat → USDC conversion pairs with their newest cached exchange rate. Fiat plan creation, subscription quoting, and pull-time pricing all read this cache, which the background oracle worker refreshes every `ORACLE_SYNC_INTERVAL_MS` (default 5 minutes).
+
+No authentication required. On a cold cache the endpoint refreshes once from the live feed; if the feed is unreachable it still answers with `rate: null` and `available: false` per pair.
+
+#### Example Request
+
+```bash
+curl http://localhost:3001/rates
+```
+
+#### Example Success Response
+Status: `200 OK`
+
+```json
+{
+  "pairs": [
+    {
+      "pair": "USD/USDC",
+      "base": "USD",
+      "quote": "USDC",
+      "rate": 1.0204081632653061,
+      "source": "coingecko",
+      "fetched_at": "2026-10-17T12:00:00.000Z",
+      "available": true
+    },
+    {
+      "pair": "EUR/USDC",
+      "base": "EUR",
+      "quote": "USDC",
+      "rate": 1.0869565217391304,
+      "source": "coingecko",
+      "fetched_at": "2026-10-17T12:00:00.000Z",
+      "available": true
+    }
+  ],
+  "supported_pairs": ["USD/USDC", "EUR/USDC"],
+  "slippage_tolerance_bps": 200,
+  "updated_at": "2026-10-17T12:00:00.000Z"
+}
+```
+
+`rate` is how many USDC one unit of the base currency buys, so `usdc_units = price_amount * rate * 10^7`.
+
+#### Error Responses
+
+- `500 Internal Server Error`
+  Returned when the `exchange_rates` table cannot be read.
+  ```json
+  {
+    "error": "permission denied for table exchange_rates"
+  }
+  ```
 
 ---
 
@@ -508,12 +599,13 @@ Errors carry a machine-readable `code`: `invalid_authorization` (400), `authoriz
 The API queries the tables defined in `apps/backend/schema.sql`:
 
 - `merchants`: `id` (UUID PK), `wallet_address` (VARCHAR UNIQUE), `name` (VARCHAR), `created_at` (TIMESTAMP).
-- `plans`: `id` (UUID PK), `merchant_id` (UUID FK -> `merchants.id`), `name` (VARCHAR), `usdc_amount` (NUMERIC), `interval_seconds` (BIGINT), `created_at` (TIMESTAMP).
-- `subscriptions`: `id` (UUID PK), `plan_id` (UUID FK -> `plans.id`), `customer_wallet_address` (VARCHAR), `status` (VARCHAR DEFAULT 'active'), `next_billing_date` (TIMESTAMP), `created_at` (TIMESTAMP).
+- `plans`: `id` (UUID PK), `merchant_id` (UUID FK -> `merchants.id`), `name` (VARCHAR), `currency` (`USDC` / `USD` / `EUR`), `usdc_amount` (NUMERIC), `price_amount` (NUMERIC, fiat plans), `interval_seconds` (BIGINT), `created_at` (TIMESTAMP).
+- `subscriptions`: `id` (UUID PK), `plan_id` (UUID FK -> `plans.id`), `customer_wallet_address` (VARCHAR), `status` (VARCHAR DEFAULT 'active'), `next_billing_date` (TIMESTAMP), `quoted_rate` (NUMERIC, fiat plans' slippage baseline), `created_at` (TIMESTAMP).
 - `idempotency_keys`: `id` (UUID PK), `key` (VARCHAR), `merchant_id` (UUID FK -> `merchants.id`, cascade), `request_path` (VARCHAR), `request_hash` (VARCHAR(64)), `status` (`in_progress` / `completed` / `failed`), `response_code` (INTEGER), `response_body` (JSONB), `created_at`, `updated_at`, `expires_at` (TIMESTAMP). Unique on `(merchant_id, key)`.
 - `billing_locks`: `subscription_id` (UUID PK, FK -> `subscriptions.id`), `lock_token` (UUID), `locked_until` (TIMESTAMP), `created_at` (TIMESTAMP).
 - `api_keys`: `id` (UUID PK), `merchant_id` (UUID FK -> `merchants.id`, cascade), `name` (VARCHAR), `key_prefix` (VARCHAR(16)), `key_hash` (VARCHAR(64), unique SHA-256 hex), `environment` (`live` / `test`), `last_used_at`, `created_at`, `revoked_at` (TIMESTAMP). Active while `revoked_at` is null.
 - `relayer_fee_usage`: `merchant_id` (UUID FK -> `merchants.id`, cascade), `usage_date` (DATE, UTC), `fee_stroops` (BIGINT), `tx_count` (INTEGER), `updated_at` (TIMESTAMP). Primary key `(merchant_id, usage_date)`. Daily sponsored fees per merchant, updated through `reserve_relayer_fee` / `adjust_relayer_fee`.
+- `exchange_rates`: `base_currency` (VARCHAR), `quote_currency` (VARCHAR DEFAULT 'USDC'), `rate` (NUMERIC), `source` (VARCHAR), `fetched_at` (TIMESTAMP). Append-only history of oracle quotes; the newest row per currency wins. Indexed on `(base_currency, quote_currency, fetched_at DESC)`.
 
 Existing databases can apply the new sections of `schema.sql` (tables 4, 5 and 6, their functions, indexes, `REVOKE`s and RLS statements) as a migration.
 
@@ -524,7 +616,7 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
 1. **Backend Service Role**: The backend Express API connects with `SUPABASE_SERVICE_ROLE_KEY`. The Postgres service role possesses the `BYPASSRLS` privilege, granting the backend full authority to execute queries, create plans, record subscriptions, and advance billing schedules.
 2. **Public Anon Access (Checkout Flow)**: Direct access via the public Supabase anon key is restricted to `SELECT` on `plans` and `merchants`. This allows unauthenticated checkout widgets and client browsers to inspect plan details and the merchant's recipient address.
 3. **No Public Mutations**: Open `INSERT` and `UPDATE` policies have been removed from all tables. Clients cannot directly inject plans, alter subscriptions, or create unauthorized merchant accounts with the anon key.
-4. **Subscription Confidentiality**: The `subscriptions`, `idempotency_keys`, `billing_locks` and `api_keys` tables have **no** policies granted to public/anon roles. Postgres default-deny prevents unauthenticated or client-side anon requests from querying subscriber lists or viewing competitor customer accounts.
+4. **Subscription Confidentiality**: The `subscriptions`, `idempotency_keys`, `billing_locks`, `api_keys` and `exchange_rates` tables have **no** policies granted to public/anon roles. Postgres default-deny prevents unauthenticated or client-side anon requests from querying subscriber lists, viewing competitor customer accounts, or rewriting the rate history.
 
 ---
 
@@ -539,3 +631,70 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
     "error": "Error description message"
   }
   ```
+
+## Streaming transaction CSV export (#76)
+
+Authenticated merchants can download settled on-chain payments using
+`GET /reports/transactions/export` with `Authorization: Bearer <MERCHANT_API_KEY>`.
+Optional query parameters: `start_date` and `end_date` (`YYYY-MM-DD`, inclusive),
+`plan_id` (UUID), and `status=settled`. Data is sorted by settlement timestamp.
+The response is RFC 4180 CSV with CRLF line endings and the
+`orbit-transactions.csv` attachment filename. Empty reports have a header row.
+
+This endpoint uses a PostgreSQL server-side cursor; set **server-only**
+`DATABASE_URL` to a PostgreSQL connection string for the same Supabase database
+used by `SUPABASE_URL`. Do not expose `DATABASE_URL` or the service-role key in
+browser/public environment variables or commit them to git. Connection errors
+return HTTP 503. Customer and plan fields remain scoped to the authenticated
+merchant; supplying another merchant's ID does not grant access.
+
+**Migration:** create the `payment_transactions` table, indexes, and RLS shown
+in `schema.sql` before enabling the endpoint. For an existing database, use
+only that new migration section in your normal SQL migration workflow; the
+complete bootstrap `schema.sql` also creates tables that may already exist.
+
+**Accounting integrity:** amounts are stored in raw USDC units and only when
+a successful pull transaction includes the expected `funds_pulled` contract
+event. A successful transaction without a decodable matching event logs a
+reconciliation error and is **not** represented as a verified settlement.
+The export does not backfill old transfers or recover missing events: operators
+should plan a ledger indexing/reconciliation job before using reports as a
+complete accounting ledger. Stellar RPC history retention is limited.
+## Customer Portal (#74)
+
+See [CUSTOMER_PORTAL.md](CUSTOMER_PORTAL.md) for challenge signing, wallet-scoped routes, cancellation, database migrations and security considerations.
+
+## Coupons and promotional quotes (#75 — experimental)
+
+Merchant API-key routes: `POST /coupons`, `GET /coupons`, `PATCH /coupons/:id`
+(soft-disable with `{"active":false}`). Coupon codes are unique within each
+merchant, case-insensitive at the API boundary. Use `discount_type` `percent`
+(maximum 99%) or `amount` (in the plan's billing denomination). `duration_months`
+is 1–120; `max_redemptions` and `expires_at` are optional.
+
+Checkout calls `POST /coupons/validate` with `{"plan_id":"...","code":"WELCOME20"}`.
+The response provides the first-period discounted quote in raw USDC units or
+fiat major units and the promotion's calendar-month duration. Validating a
+code does **not** reserve a redemption. `POST /subscriptions` accepts optional
+`coupon_code`; the `redeem_coupon_subscription` Postgres function revalidates
+and atomically enforces redemption limits and creates the subscription.
+
+Migration: run `apps/backend/coupons-migration.sql` in the Supabase SQL editor
+on existing databases. The same schema is appended to `schema.sql` for fresh
+installs. Execute it before starting a backend with coupons enabled. Both the
+coupons table and the redemption function are private to the service role.
+
+**Critical on-chain limitation:** Orbit's current Soroban `pull_funds` charges
+`VaultData.amount_per_interval` from the existing user-authorized vault. A
+coupon quote and off-chain promotion record do NOT modify that amount or
+automatically revert it after `duration_months`. Coupon subscriptions are
+therefore created with `status=pending_promo`,
+`promotion_onchain_verified=false`, and the pull API refuses to charge them.
+A compatible, wallet-authorized contract/checkout migration plus verification
+of the on-chain promotion schedule is needed before activating discounted
+recurring billing. This backend-only implementation is not a complete
+end-to-end promotional billing feature. Don't deploy it as finished billing.
+
+The public legacy subscription creation route does not itself authenticate a
+wallet; production coupon redemption must be coupled to proof of a confirmed
+vault handshake to prevent malicious consumption of finite coupon inventories.

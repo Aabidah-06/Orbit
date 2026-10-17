@@ -162,6 +162,26 @@ CREATE TABLE IF NOT EXISTS tax_transactions (
 );
 CREATE INDEX IF NOT EXISTS tax_transactions_merchant_date_idx ON tax_transactions (merchant_id, created_at);
 
+-- #76: immutable on-chain settlement ledger, keyed on transaction hash to
+-- prevent duplicate export rows on idempotent retries. Amounts are raw USDC
+-- token units and never reconstructed from mutable plan prices.
+CREATE TABLE IF NOT EXISTS payment_transactions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    subscription_id UUID NOT NULL REFERENCES subscriptions(id) ON DELETE RESTRICT,
+    plan_id UUID NOT NULL REFERENCES plans(id) ON DELETE RESTRICT,
+    customer_wallet_address VARCHAR(255) NOT NULL,
+    amount_usdc_units NUMERIC NOT NULL CHECK (amount_usdc_units >= 0),
+    status VARCHAR(32) NOT NULL DEFAULT 'settled' CHECK (status IN ('settled')),
+    tx_hash VARCHAR(128) NOT NULL UNIQUE,
+    settled_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
+CREATE INDEX IF NOT EXISTS payment_transactions_merchant_date_idx
+    ON payment_transactions (merchant_id, settled_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS payment_transactions_merchant_plan_idx
+    ON payment_transactions (merchant_id, plan_id, settled_at DESC);
+ALTER TABLE payment_transactions ENABLE ROW LEVEL SECURITY;
+
 CREATE TABLE IF NOT EXISTS signing_sessions (
     id UUID PRIMARY KEY,
     merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
@@ -174,6 +194,36 @@ CREATE TABLE IF NOT EXISTS signing_sessions (
 );
 CREATE INDEX IF NOT EXISTS signing_sessions_merchant_status_idx ON signing_sessions (merchant_id, status);
 ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMP WITH TIME ZONE;
+
+-- Fiat-denominated plans & exchange rate oracle cache (#96)
+--
+-- Plans are priced either directly in USDC (raw token units in usdc_amount)
+-- or in a supported fiat currency (currency + price_amount). Fiat plans are
+-- converted to raw USDC units at the moment of pull using the newest cached
+-- oracle rate, guarded by the subscription's quoted_rate slippage limit.
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS currency VARCHAR(8) NOT NULL DEFAULT 'USDC'
+    CHECK (currency IN ('USDC', 'USD', 'EUR'));
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS price_amount NUMERIC CHECK (price_amount > 0);
+
+-- Fiat->USDC rate quoted when the subscription was created; the pull flow
+-- rejects settlements whose live rate drifted more than 2% from this quote.
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS quoted_rate NUMERIC;
+
+-- Timestamped historical exchange rate cache written by the oracle worker.
+-- One row per sync per pair; readers always take the newest row per base.
+CREATE TABLE IF NOT EXISTS exchange_rates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    base_currency VARCHAR(8) NOT NULL,
+    quote_currency VARCHAR(8) NOT NULL DEFAULT 'USDC',
+    rate NUMERIC NOT NULL CHECK (rate > 0),
+    source VARCHAR(32) NOT NULL,
+    fetched_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS exchange_rates_pair_fetched_at_idx
+    ON exchange_rates (base_currency, quote_currency, fetched_at DESC);
+-- Backend-only: service role bypasses RLS, no public policy is defined.
+ALTER TABLE exchange_rates ENABLE ROW LEVEL SECURITY;
 
 -- Atomically claims an idempotency key. Returns {"claimed": true, "record": ...}
 -- when the caller now owns the key and must execute the request, or
@@ -396,3 +446,310 @@ CREATE POLICY "Allow public read access to plans for checkout"
 -- default-deny prevents anon key access.
 -- No open INSERT or UPDATE policies: all mutations require backend service role.
 
+-- Issue #74: backend-only customer portal wallet sign-in and session revocation.
+-- Execute with a DB migration tool in environments with existing deployments.
+CREATE TABLE IF NOT EXISTS customer_portal_challenges (
+    id UUID PRIMARY KEY,
+    wallet_address VARCHAR(56) NOT NULL,
+    message TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS portal_challenges_expiry_idx
+    ON customer_portal_challenges (expires_at);
+CREATE TABLE IF NOT EXISTS customer_portal_sessions (
+    id UUID PRIMARY KEY,
+    wallet_address VARCHAR(56) NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS portal_sessions_wallet_idx
+    ON customer_portal_sessions (wallet_address, expires_at);
+
+-- A receipt is only formed from a confirmed pull.execute audit event.
+-- The wallet predicate is applied in the view before pagination by backend queries.
+-- Do not claim an exact amount: old audit entries do not contain a verified amount.
+CREATE OR REPLACE VIEW customer_portal_receipts WITH (security_invoker = true) AS
+SELECT a.id, s.id AS subscription_id, s.customer_wallet_address,
+       p.name AS plan_name, m.name AS merchant_name,
+       a.created_at, a.changes_after->>'txHash' AS tx_hash
+FROM audit_logs AS a
+JOIN subscriptions AS s ON a.resource_id = s.id::text
+JOIN plans AS p ON s.plan_id = p.id
+JOIN merchants AS m ON p.merchant_id = m.id
+WHERE a.action = 'pull.execute'
+  AND a.changes_after->>'txHash' IS NOT NULL;
+
+ALTER TABLE customer_portal_challenges ENABLE ROW LEVEL SECURITY;
+ALTER TABLE customer_portal_sessions ENABLE ROW LEVEL SECURITY;
+-- Backend service-role only: the view must never bypass subscription RLS
+-- for anon users or leak transaction history through a public endpoint.
+REVOKE ALL ON TABLE customer_portal_challenges FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON TABLE customer_portal_sessions FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON TABLE customer_portal_receipts FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON customer_portal_challenges TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON customer_portal_sessions TO service_role;
+GRANT SELECT ON customer_portal_receipts TO service_role;
+-- Optional housekeeping job: periodically DELETE expired rows.
+
+
+-- Issue #75: append after existing schema.sql (fiat plan columns are already defined).
+-- Application coupon values are in the plan's denomination:
+-- USDC plans use raw 7-decimal token units; USD/EUR plans use major fiat units.
+CREATE TABLE IF NOT EXISTS coupons (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    code VARCHAR(32) NOT NULL CHECK (code ~ '^[A-Z0-9_-]{3,32}$'),
+    discount_type VARCHAR(16) NOT NULL CHECK (discount_type IN ('percent', 'amount')),
+    discount_value NUMERIC NOT NULL CHECK (discount_value > 0),
+    duration_months INTEGER NOT NULL DEFAULT 1 CHECK (duration_months BETWEEN 1 AND 120),
+    max_redemptions INTEGER CHECK (max_redemptions IS NULL OR max_redemptions > 0),
+    redemptions_count INTEGER NOT NULL DEFAULT 0 CHECK (redemptions_count >= 0),
+    expires_at TIMESTAMP WITH TIME ZONE,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT coupons_percent_cap CHECK (discount_type <> 'percent' OR discount_value <= 99),
+    CONSTRAINT coupons_limit_floor CHECK (max_redemptions IS NULL OR max_redemptions >= redemptions_count)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS coupons_merchant_code_idx ON coupons (merchant_id, code);
+CREATE INDEX IF NOT EXISTS coupons_expiry_idx ON coupons (expires_at);
+ALTER TABLE coupons ENABLE ROW LEVEL SECURITY;
+-- No public RLS policies: merchant access is enforced through backend API keys.
+
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS coupon_id UUID REFERENCES coupons(id) ON DELETE SET NULL;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS promotion_original_amount NUMERIC;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS promotion_discounted_amount NUMERIC;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS promotion_currency VARCHAR(8);
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS promotion_duration_months INTEGER;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS promotion_expires_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS promotion_onchain_verified BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Atomic redemption: coupon is locked for the full transaction, and insertion
+-- and redemption-count increment roll back together on duplicate subscription.
+-- Call through the backend using the Supabase service role only.
+CREATE OR REPLACE FUNCTION redeem_coupon_subscription(
+    p_plan_id UUID,
+    p_customer_wallet_address VARCHAR,
+    p_metadata JSONB,
+    p_code VARCHAR,
+    p_quoted_rate NUMERIC DEFAULT NULL
+) RETURNS subscriptions
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_plan plans%ROWTYPE;
+    v_coupon coupons%ROWTYPE;
+    v_original NUMERIC;
+    v_discounted NUMERIC;
+    v_currency VARCHAR(8);
+    v_sub subscriptions%ROWTYPE;
+BEGIN
+    SELECT * INTO v_plan FROM plans WHERE id = p_plan_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Plan not found' USING ERRCODE = 'P7503';
+    END IF;
+    -- Concurrent redemptions serialize on the coupon row.
+    SELECT * INTO v_coupon FROM coupons
+      WHERE merchant_id = v_plan.merchant_id AND code = UPPER(TRIM(p_code))
+      FOR UPDATE;
+    IF NOT FOUND OR NOT v_coupon.active OR
+       (v_coupon.expires_at IS NOT NULL AND v_coupon.expires_at <= NOW()) THEN
+        RAISE EXCEPTION 'Coupon invalid or expired' USING ERRCODE = 'P7501';
+    END IF;
+    IF v_coupon.max_redemptions IS NOT NULL AND
+       v_coupon.redemptions_count >= v_coupon.max_redemptions THEN
+        RAISE EXCEPTION 'Coupon redemption limit reached' USING ERRCODE = 'P7502';
+    END IF;
+    v_currency := COALESCE(v_plan.currency, 'USDC');
+    IF v_currency = 'USDC' THEN
+        v_original := v_plan.usdc_amount;
+    ELSIF v_currency IN ('USD', 'EUR') THEN
+        v_original := v_plan.price_amount;
+    ELSE
+        RAISE EXCEPTION 'Unsupported plan currency' USING ERRCODE = 'P7501';
+    END IF;
+    IF v_original IS NULL OR v_original <= 0 THEN
+        RAISE EXCEPTION 'Invalid plan price' USING ERRCODE = 'P7501';
+    END IF;
+    v_discounted := CASE WHEN v_coupon.discount_type = 'percent' THEN
+        v_original * (100 - v_coupon.discount_value) / 100
+      ELSE v_original - v_coupon.discount_value END;
+    v_discounted := TRUNC(v_discounted, CASE WHEN v_currency = 'USDC' THEN 0 ELSE 2 END);
+    IF v_discounted <= 0 OR v_discounted >= v_original THEN
+        RAISE EXCEPTION 'Discount is not valid for this plan price' USING ERRCODE = 'P7501';
+    END IF;
+    -- No on-chain authorization has been verified at checkout yet. The legacy
+    -- contract uses a fixed vault amount, so never label a coupon checkout as
+    -- an activated discounted subscription without confirming compatible terms.
+    INSERT INTO subscriptions (
+        plan_id, customer_wallet_address, metadata, next_billing_date, status,
+        quoted_rate, coupon_id, promotion_original_amount, promotion_discounted_amount,
+        promotion_currency, promotion_duration_months, promotion_expires_at,
+        promotion_onchain_verified
+    ) VALUES (
+        p_plan_id, p_customer_wallet_address, COALESCE(p_metadata, '{}'::jsonb), NOW(), 'pending_promo',
+        p_quoted_rate, v_coupon.id, v_original, v_discounted,
+        v_currency, v_coupon.duration_months, NOW() + make_interval(months => v_coupon.duration_months),
+        FALSE
+    ) RETURNING * INTO v_sub;
+    UPDATE coupons SET redemptions_count = redemptions_count + 1 WHERE id = v_coupon.id;
+    RETURN v_sub;
+END;
+$$;
+REVOKE ALL ON FUNCTION redeem_coupon_subscription(UUID, VARCHAR, JSONB, VARCHAR, NUMERIC)
+    FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION redeem_coupon_subscription(UUID, VARCHAR, JSONB, VARCHAR, NUMERIC)
+    TO service_role;
+
+-- 101-ledger-checkpoints.sql
+-- Apply once to existing Supabase projects before enabling the indexer.
+CREATE TABLE IF NOT EXISTS ledger_checkpoints (
+    stream_id TEXT PRIMARY KEY,
+    last_processed_ledger_sequence BIGINT NOT NULL CHECK (last_processed_ledger_sequence >= 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS contract_events (
+    stream_id TEXT NOT NULL REFERENCES ledger_checkpoints(stream_id),
+    id TEXT NOT NULL,
+    ledger_sequence BIGINT NOT NULL,
+    transaction_hash TEXT NOT NULL,
+    contract_id TEXT NOT NULL,
+    event_name TEXT NOT NULL,
+    merchant_address TEXT,
+    topics JSONB NOT NULL,
+    value JSONB NOT NULL,
+    closed_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (stream_id, id)
+);
+CREATE INDEX IF NOT EXISTS contract_events_merchant_ledger_idx ON contract_events (merchant_address, ledger_sequence);
+ALTER TABLE ledger_checkpoints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE contract_events ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION commit_ledger_batch(
+    p_stream_id TEXT, p_expected_sequence BIGINT, p_last_sequence BIGINT, p_events JSONB
+) RETURNS VOID LANGUAGE plpgsql AS $$
+DECLARE v_saved BIGINT;
+BEGIN
+    IF p_expected_sequence < 0 OR p_last_sequence <= p_expected_sequence THEN
+        RAISE EXCEPTION 'Invalid checkpoint range';
+    END IF;
+    INSERT INTO ledger_checkpoints (stream_id, last_processed_ledger_sequence)
+        VALUES (p_stream_id, p_expected_sequence) ON CONFLICT DO NOTHING;
+    SELECT last_processed_ledger_sequence INTO v_saved FROM ledger_checkpoints
+        WHERE stream_id = p_stream_id FOR UPDATE;
+    IF v_saved <> p_expected_sequence THEN
+        RAISE EXCEPTION 'Checkpoint changed; reload before retrying';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_array_elements(p_events) e
+        WHERE (e->>'ledger_sequence')::BIGINT <= p_expected_sequence
+           OR (e->>'ledger_sequence')::BIGINT > p_last_sequence) THEN
+        RAISE EXCEPTION 'Event outside checkpoint range';
+    END IF;
+    INSERT INTO contract_events (stream_id, id, ledger_sequence, transaction_hash,
+        contract_id, event_name, merchant_address, topics, value, closed_at)
+    SELECT p_stream_id, e.id, e.ledger_sequence, e.transaction_hash, e.contract_id,
+        e.event_name, e.merchant_address, e.topics, e.value, e.closed_at
+    FROM jsonb_to_recordset(p_events) AS e(id TEXT, ledger_sequence BIGINT,
+        transaction_hash TEXT, contract_id TEXT, event_name TEXT, merchant_address TEXT,
+        topics JSONB, value JSONB, closed_at TIMESTAMPTZ)
+    ON CONFLICT (stream_id, id) DO NOTHING;
+    UPDATE ledger_checkpoints SET last_processed_ledger_sequence = p_last_sequence,
+        updated_at = NOW() WHERE stream_id = p_stream_id;
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION commit_ledger_batch(TEXT, BIGINT, BIGINT, JSONB) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION commit_ledger_batch(TEXT, BIGINT, BIGINT, JSONB) TO service_role;
+
+-- 102-merchant-analytics.sql
+-- Batches nested payment pages in one query. Payment amounts are raw USDC units.
+CREATE OR REPLACE FUNCTION graphql_subscription_payments(p_merchant_id UUID, p_requests JSONB)
+RETURNS TABLE(request_index INTEGER, payment JSONB) LANGUAGE sql STABLE AS $$
+    SELECT (r.ordinality - 1)::INTEGER, to_jsonb(a)
+    FROM jsonb_array_elements(p_requests) WITH ORDINALITY r(request, ordinality)
+    CROSS JOIN LATERAL (
+        SELECT * FROM audit_logs a WHERE a.merchant_id = p_merchant_id
+          AND a.action = 'pull.execute' AND a.resource_type = 'subscription'
+          AND a.resource_id = r.request->>'id'
+        ORDER BY a.created_at DESC, a.id
+        LIMIT LEAST(GREATEST((r.request->>'limit')::INTEGER, 1), 100)
+        OFFSET LEAST(GREATEST((r.request->>'offset')::INTEGER, 0), 100000)
+    ) a;
+$$;
+
+CREATE OR REPLACE FUNCTION merchant_analytics(p_merchant_id UUID, p_from TIMESTAMPTZ, p_to TIMESTAMPTZ)
+RETURNS JSONB LANGUAGE sql STABLE AS $$
+    SELECT jsonb_build_object(
+        'activeSubscribers', (SELECT COUNT(*) FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+            WHERE p.merchant_id = p_merchant_id AND s.status = 'active'),
+        'settledPayments', COUNT(*),
+        'settledAmount', COALESCE(SUM((changes_after->>'amount')::NUMERIC), 0)::TEXT
+    ) FROM audit_logs WHERE merchant_id = p_merchant_id AND action = 'pull.execute'
+        AND created_at >= p_from AND created_at < p_to;
+$$;
+REVOKE EXECUTE ON FUNCTION graphql_subscription_payments(UUID, JSONB) FROM PUBLIC, anon, authenticated;
+REVOKE EXECUTE ON FUNCTION merchant_analytics(UUID, TIMESTAMPTZ, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION graphql_subscription_payments(UUID, JSONB) TO service_role;
+GRANT EXECUTE ON FUNCTION merchant_analytics(UUID, TIMESTAMPTZ, TIMESTAMPTZ) TO service_role;
+
+-- 105-billing-resolution.sql
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS last_failure JSONB;
+
+-- The audit record and billing-date advancement either both commit or both roll back.
+CREATE OR REPLACE FUNCTION waive_subscription_interval(p_subscription_id UUID, p_merchant_id UUID, p_actor_address TEXT)
+RETURNS JSONB LANGUAGE plpgsql AS $$
+DECLARE v_sub subscriptions; v_interval BIGINT; v_before JSONB;
+BEGIN
+    SELECT s.* INTO v_sub FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+        WHERE s.id = p_subscription_id AND p.merchant_id = p_merchant_id FOR UPDATE OF s;
+    IF NOT FOUND OR v_sub.status <> 'past_due' THEN RETURN NULL; END IF;
+    IF v_sub.last_failure->>'code' = 'rpc_timeout' AND v_sub.last_failure->>'transaction_hash' IS NOT NULL THEN RETURN NULL; END IF;
+    SELECT interval_seconds INTO v_interval FROM plans WHERE id = v_sub.plan_id;
+    v_before := to_jsonb(v_sub);
+    UPDATE subscriptions SET status = 'active', retry_count = 0,
+        dunning_status = NULL, next_dunning_retry_at = NULL, last_failure = NULL,
+        next_billing_date = GREATEST(next_billing_date, NOW()) + make_interval(secs => v_interval::DOUBLE PRECISION)
+        WHERE id = p_subscription_id RETURNING * INTO v_sub;
+    INSERT INTO audit_logs (merchant_id, actor_address, action, resource_type, resource_id, changes_before, changes_after)
+        VALUES (p_merchant_id, p_actor_address, 'subscription.interval_waived', 'subscription',
+            p_subscription_id::TEXT, v_before, to_jsonb(v_sub));
+    RETURN to_jsonb(v_sub);
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION waive_subscription_interval(UUID, UUID, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION waive_subscription_interval(UUID, UUID, TEXT) TO service_role;
+
+-- Reconcile an RPC timeout exactly once, using only the hash previously stored
+-- by the backend. The HTTP route verifies its outcome with Soroban RPC first.
+CREATE OR REPLACE FUNCTION resolve_pending_pull(p_subscription_id UUID, p_merchant_id UUID,
+    p_transaction_hash TEXT, p_succeeded BOOLEAN, p_settled_at TIMESTAMPTZ)
+RETURNS JSONB LANGUAGE plpgsql AS $$
+DECLARE v_sub subscriptions; v_plan plans; v_before JSONB;
+BEGIN
+    SELECT s.* INTO v_sub FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+        WHERE s.id = p_subscription_id AND p.merchant_id = p_merchant_id FOR UPDATE OF s;
+    IF NOT FOUND OR v_sub.last_failure->>'code' IS DISTINCT FROM 'rpc_timeout'
+        OR v_sub.last_failure->>'transaction_hash' IS DISTINCT FROM p_transaction_hash THEN RETURN NULL; END IF;
+    v_before := to_jsonb(v_sub);
+    SELECT * INTO v_plan FROM plans WHERE id = v_sub.plan_id;
+    IF p_succeeded THEN
+        UPDATE subscriptions SET status = 'active', retry_count = 0, dunning_status = NULL,
+            next_dunning_retry_at = NULL, last_failure = NULL,
+            next_billing_date = p_settled_at + make_interval(secs => v_plan.interval_seconds::DOUBLE PRECISION)
+            WHERE id = p_subscription_id RETURNING * INTO v_sub;
+        INSERT INTO audit_logs (merchant_id, actor_address, action, resource_type, resource_id, changes_before, changes_after)
+            VALUES (p_merchant_id, NULL, 'pull.execute', 'subscription', p_subscription_id::TEXT,
+                v_before, jsonb_build_object('txHash', p_transaction_hash, 'amount', v_plan.usdc_amount::TEXT,
+                    'status', v_sub.status, 'next_billing_date', v_sub.next_billing_date));
+    ELSE
+        UPDATE subscriptions SET last_failure = jsonb_build_object('code', 'unknown',
+            'message', 'The previously pending transaction failed on-chain. A fresh retry can now be prepared.',
+            'transaction_hash', p_transaction_hash, 'occurred_at', NOW())
+            WHERE id = p_subscription_id RETURNING * INTO v_sub;
+    END IF;
+    RETURN to_jsonb(v_sub);
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION resolve_pending_pull(UUID, UUID, TEXT, BOOLEAN, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION resolve_pending_pull(UUID, UUID, TEXT, BOOLEAN, TIMESTAMPTZ) TO service_role;
