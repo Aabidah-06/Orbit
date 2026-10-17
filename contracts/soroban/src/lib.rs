@@ -265,7 +265,11 @@ fn pull_payment(env: &Env, user: &Address, merchant: &Address, vault: &VaultData
         if received > vault.amount_per_interval {
             output.transfer(&contract, user, &(received - vault.amount_per_interval));
         }
-        output.transfer(&contract, recipient, &vault.amount_per_interval);
+        // Escrow settlement is already held by this contract; avoid a
+        // redundant self-transfer and keep the received balance unchanged.
+        if recipient != &contract {
+            output.transfer(&contract, recipient, &vault.amount_per_interval);
+        }
         extend_key(env, &config_key, vault.interval_seconds);
     } else {
         token::Client::new(env, &vault.token).transfer_from(
