@@ -280,13 +280,9 @@ fn test_create_vault_overwrites_existing_terms_and_resets_last_pull_timestamp() 
     orbit_client.create_vault(&user, &merchant, &token_address, &40_0000000, &172800);
 
     // Check persistent storage to verify overwritten terms and reset last_pull_timestamp = 0
-    let key = VaultKey {
-        user: user.clone(),
-        merchant: merchant.clone(),
-    };
-    let vault_before_pull: VaultData = env.as_contract(&contract_id, || {
-        env.storage().persistent().get(&key).unwrap()
-    });
+    let key = vault_key(&user, &merchant);
+    let vault_before_pull: VaultData =
+        env.as_contract(&contract_id, || load_vault(&env, &key).unwrap());
     assert_eq!(vault_before_pull.amount_per_interval, 40_0000000);
     assert_eq!(vault_before_pull.interval_seconds, 172800);
     assert_eq!(vault_before_pull.last_pull_timestamp, 0);

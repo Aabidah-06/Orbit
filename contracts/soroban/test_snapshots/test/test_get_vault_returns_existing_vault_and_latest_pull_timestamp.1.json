@@ -314,37 +314,29 @@
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
               "key": {
-                "map": [
+                "vec": [
                   {
-                    "key": {
-                      "symbol": "merchant"
-                    },
-                    "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                    }
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                   },
                   {
-                    "key": {
-                      "symbol": "user"
-                    },
-                    "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                    }
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "map": [
+                "vec": [
                   {
-                    "key": {
-                      "symbol": "amount_per_interval"
-                    },
-                    "val": {
-                      "i128": "200000000"
-                    }
+                    "address": "CCABDO7UZXYE4W6GVSEGSNNZTKSLFQGKXXQTH6OX7M7GKZ4Z6CUJNGZN"
                   },
                   {
+                    "i128": "200000000"
+                  },
+                  {
+                    "u64": "86400"
+                  },
+                  {
+                    "u64": "87400"
                     "key": {
                       "symbol": "initial_timestamp"
                     },
