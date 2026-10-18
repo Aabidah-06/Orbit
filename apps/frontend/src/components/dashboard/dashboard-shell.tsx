@@ -26,6 +26,7 @@ import {
   UserCog,
   UsersRound,
   Gift,
+  Sparkles,
 } from "lucide-react";
 import { Brand } from "@/components/layout/brand";
 import { useAuth } from "@/lib/auth-context";
@@ -43,6 +44,7 @@ import { DevelopersView } from "./views/developers-view";
 import { TeamView } from "./views/team-view";
 import { LocaleSwitcher } from "@/components/layout/locale-switcher";
 import { VaultModal } from "./modals/vault-modal";
+import { DeployVaultModal } from "./modals/deploy-vault-modal";
 import { NotificationDrawer } from "./drawers/notification-drawer";
 import { DOCS_URL } from "@/lib/links";
 
@@ -62,6 +64,7 @@ export function DashboardShell() {
   const [isNetworkDropdownOpen, setIsNetworkDropdownOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isVaultModalOpen, setIsVaultModalOpen] = useState(false);
+  const [isDeployModalOpen, setIsDeployModalOpen] = useState(false);
   const [copiedId, setCopiedId] = useState(false);
   const [isEditingBusinessName, setIsEditingBusinessName] = useState(false);
   const [businessNameInput, setBusinessNameInput] = useState("");
@@ -289,12 +292,14 @@ export function DashboardShell() {
             <div className="flex items-center justify-between">
               <span className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider flex items-center gap-1.5">
                 <ShieldCheck size={12} className="text-emerald-600" />
-                {t("settlementVault")}
+                {user.customContractId ? "Custom Vault" : t("settlementVault")}
               </span>
-              <span className="text-[10px] font-mono text-emerald-600 font-bold">{t("ready")}</span>
+              <span className="text-[10px] font-mono text-emerald-600 font-bold">
+                {user.customContractId ? "Active" : t("ready")}
+              </span>
             </div>
-            <div className="text-[11px] text-neutral-600 truncate mt-1">
-              {t("treasuryDescription")}
+            <div className="text-[11px] font-mono text-neutral-600 truncate mt-1">
+              {user.customContractId || t("treasuryDescription")}
             </div>
           </button>
 
@@ -354,6 +359,25 @@ export function DashboardShell() {
               <span>{t("sdkDocs")}</span>
               <ArrowUpRight size={12} />
             </Link>
+            {user.customContractId ? (
+              <button
+                onClick={() => setIsDeployModalOpen(true)}
+                className="hidden sm:flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 text-xs font-mono hover:bg-emerald-100 transition-colors"
+                title={`Active Custom Contract: ${user.customContractId}`}
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                <span>Vault: {user.customContractId.slice(0, 4)}...{user.customContractId.slice(-4)}</span>
+              </button>
+            ) : (
+              <button
+                onClick={() => setIsDeployModalOpen(true)}
+                className="button button-secondary text-xs h-8 px-3 flex items-center gap-1.5"
+                title="Deploy custom branded Soroban vault"
+              >
+                <Sparkles size={13} className="text-black" />
+                <span className="hidden sm:inline">Deploy Vault</span>
+              </button>
+            )}
             <div className="hidden sm:flex items-center gap-2 px-3 py-1 rounded-full bg-neutral-100 text-neutral-800 border border-black/5 text-xs font-mono">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
               <span>{t("settlementEngine")}</span>
@@ -399,6 +423,12 @@ export function DashboardShell() {
         onClose={() => setIsVaultModalOpen(false)}
         user={user}
         onUpdateVault={updateVault}
+      />
+
+      {/* Custom Branded Soroban Vault Deployment Wizard Modal (#143) */}
+      <DeployVaultModal
+        isOpen={isDeployModalOpen}
+        onClose={() => setIsDeployModalOpen(false)}
       />
 
       {/* Real-time Notifications Drawer */}
