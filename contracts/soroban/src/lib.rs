@@ -143,12 +143,32 @@ pub struct PayrollProposal {
     pub executed: bool,
 }
 
+/// A payroll deposit held in contract escrow until the recipient claims it or the
+/// sender reclaims what is left after `expiration_timestamp` (#188).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayrollEscrow {
+    pub id: u64,
+    pub sender: Address,
+    pub recipient: Address,
+    pub token: Address,
+    pub total_deposited: i128,
+    pub claimed_amount: i128,
+    pub expiration_timestamp: u64,
+    /// Set once the sender reclaims the unclaimed balance. Blocks any further
+    /// claim or reclaim, so the remaining funds can never be withdrawn twice.
+    pub reclaimed: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     /// Id the next payroll proposal will receive
     NextProposalId,
     Proposal(u64),
+    /// Id the next payroll escrow deposit will receive
+    NextPayrollEscrowId,
+    PayrollEscrow(u64),
 }
 
 /// Storage key for a metered (usage-based) vault (#46). An enum on purpose:
@@ -1717,6 +1737,143 @@ impl OrbitContract {
     }
 
     // --------------------------------------------------------------------
+    // PAYROLL ESCROW & UNCLAIMED RECLAMATION (#188)
+    // --------------------------------------------------------------------
+
+    /// Deposit `amount` of `token` into contract escrow for `recipient`. The
+    /// recipient may claim until `expiration_timestamp`; after that the sender can
+    /// reclaim whatever was never claimed. Returns the new payroll id.
+    pub fn create_payroll_escrow(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        amount: i128,
+        expiration_timestamp: u64,
+    ) -> u64 {
+        sender.require_auth();
+        assert!(amount > 0, "amount must be positive");
+        let now = env.ledger().timestamp();
+        assert!(
+            expiration_timestamp > now,
+            "expiration_timestamp must be in the future"
+        );
+
+        let counter_key = DataKey::NextPayrollEscrowId;
+        let id: u64 = env.storage().instance().get(&counter_key).unwrap_or(0);
+        env.storage().instance().set(
+            &counter_key,
+            &id.checked_add(1).expect("Payroll escrow ID exhausted"),
+        );
+
+        // Pull the deposit into the contract before recording it, so a failed
+        // transfer reverts the whole call and leaves no record behind.
+        token::Client::new(&env, &token).transfer_from(
+            &env.current_contract_address(),
+            &sender,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let escrow = PayrollEscrow {
+            id,
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            token: token.clone(),
+            total_deposited: amount,
+            claimed_amount: 0,
+            expiration_timestamp,
+            reclaimed: false,
+        };
+        save_payroll_escrow(&env, &escrow);
+
+        env.events().publish(
+            (Symbol::new(&env, "payroll_escrow_created"), sender, id),
+            (recipient, token, amount, expiration_timestamp),
+        );
+        id
+    }
+
+    /// Recipient withdraws up to the unclaimed balance. Claims are only accepted
+    /// while `now <= expiration_timestamp`.
+    pub fn claim_payroll_escrow(env: Env, recipient: Address, payroll_id: u64, amount: i128) {
+        recipient.require_auth();
+        assert!(amount > 0, "amount must be positive");
+
+        let mut escrow = load_payroll_escrow(&env, payroll_id);
+        assert!(escrow.recipient == recipient, "Not the payroll recipient");
+        assert!(!escrow.reclaimed, "Payroll escrow already reclaimed");
+        assert!(
+            env.ledger().timestamp() <= escrow.expiration_timestamp,
+            "Claim window has expired"
+        );
+        let unclaimed = escrow.total_deposited - escrow.claimed_amount;
+        assert!(amount <= unclaimed, "amount exceeds unclaimed balance");
+
+        escrow.claimed_amount += amount;
+        save_payroll_escrow(&env, &escrow);
+
+        token::Client::new(&env, &escrow.token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "payroll_escrow_claimed"),
+                recipient,
+                payroll_id,
+            ),
+            (escrow.token, amount),
+        );
+    }
+
+    /// Returns the unclaimed balance of a payroll escrow to its sender once the
+    /// claim window has closed (`now > expiration_timestamp`). The escrow is marked
+    /// reclaimed before any transfer, so it can only ever be reclaimed once.
+    pub fn reclaim_unclaimed_payroll(env: Env, sender: Address, payroll_id: u64) -> i128 {
+        sender.require_auth();
+
+        let mut escrow = load_payroll_escrow(&env, payroll_id);
+        assert!(escrow.sender == sender, "Not the payroll sender");
+        assert!(!escrow.reclaimed, "Payroll escrow already reclaimed");
+        assert!(
+            env.ledger().timestamp() > escrow.expiration_timestamp,
+            "Expiration timestamp has not passed"
+        );
+
+        let unclaimed = escrow.total_deposited - escrow.claimed_amount;
+        assert!(unclaimed > 0, "No unclaimed balance to reclaim");
+
+        escrow.reclaimed = true;
+        save_payroll_escrow(&env, &escrow);
+
+        token::Client::new(&env, &escrow.token).transfer(
+            &env.current_contract_address(),
+            &sender,
+            &unclaimed,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "payroll_escrow_reclaimed"),
+                sender,
+                payroll_id,
+            ),
+            (escrow.token, unclaimed),
+        );
+        unclaimed
+    }
+
+    /// Read a payroll escrow record. Requires no authorization.
+    pub fn get_payroll_escrow(env: Env, payroll_id: u64) -> Option<PayrollEscrow> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PayrollEscrow(payroll_id))
+    }
+
+    // --------------------------------------------------------------------
     // ON-CHAIN PLAN CATALOG (#95)
     // --------------------------------------------------------------------
 
@@ -1877,6 +2034,27 @@ fn load_proposal(env: &Env, proposal_id: u64) -> PayrollProposal {
         .persistent()
         .get(&DataKey::Proposal(proposal_id))
         .expect("Proposal does not exist")
+}
+
+fn load_payroll_escrow(env: &Env, payroll_id: u64) -> PayrollEscrow {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PayrollEscrow(payroll_id))
+        .expect("Payroll escrow does not exist")
+}
+
+/// Persists a payroll escrow and keeps it alive until its expiration (plus the
+/// standard margin), so a recipient can still claim right up to the deadline.
+fn save_payroll_escrow(env: &Env, escrow: &PayrollEscrow) {
+    let key = DataKey::PayrollEscrow(escrow.id);
+    env.storage().persistent().set(&key, escrow);
+    let remaining = escrow
+        .expiration_timestamp
+        .saturating_sub(env.ledger().timestamp());
+    let (threshold, extend_to) = calculate_ttl_params(remaining);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, threshold, extend_to);
 }
 
 fn save_proposal(env: &Env, proposal: &PayrollProposal) {

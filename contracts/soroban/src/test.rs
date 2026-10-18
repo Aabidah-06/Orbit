@@ -2781,3 +2781,127 @@ fn test_cross_asset_swap_exact_output_refund_and_slippage_rejection() {
     assert_eq!(payment_token.balance(&user), 800);
     assert_eq!(settlement_token.balance(&merchant), 100);
 }
+
+
+// ----------------------------------------------------------------------------
+// #188: PAYROLL ESCROW EXPIRATION & UNCLAIMED RECLAMATION
+// ----------------------------------------------------------------------------
+
+/// Sets up a funded sender, a recipient and an orbit contract with a 100 token
+/// allowance. Returns (sender, recipient, token, orbit contract id).
+fn payroll_setup(env: &Env) -> (Address, Address, Address, Address) {
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let sender = Address::generate(env);
+    let recipient = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    StellarAssetClient::new(env, &token).mint(&sender, &100_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    TokenClient::new(env, &token).approve(&sender, &contract_id, &100_0000000, &2000000);
+    (sender, recipient, token, contract_id)
+}
+
+#[test]
+fn test_payroll_reclaim_returns_only_unclaimed_balance_after_expiration() {
+    let env = Env::default();
+    let (sender, recipient, token, contract_id) = payroll_setup(&env);
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    let token_client = TokenClient::new(&env, &token);
+
+    let expiration = 2_000;
+    let id = orbit.create_payroll_escrow(&sender, &recipient, &token, &60_0000000, &expiration);
+
+    // Recipient claims 25 of the 60 before the window closes.
+    orbit.claim_payroll_escrow(&recipient, &id, &25_0000000);
+    assert_eq!(token_client.balance(&recipient), 25_0000000);
+
+    // The sender cannot reclaim while the claim window is still open.
+    assert!(orbit.try_reclaim_unclaimed_payroll(&sender, &id).is_err());
+
+    env.ledger().with_mut(|l| l.timestamp = expiration + 1);
+    let reclaimed = orbit.reclaim_unclaimed_payroll(&sender, &id);
+
+    assert_eq!(reclaimed, 35_0000000);
+    assert_eq!(token_client.balance(&sender), 100_0000000 - 25_0000000);
+    let escrow = orbit.get_payroll_escrow(&id).unwrap();
+    assert!(escrow.reclaimed);
+    assert_eq!(escrow.claimed_amount, 25_0000000);
+}
+
+#[test]
+fn test_payroll_claim_rejected_once_expiration_has_passed() {
+    let env = Env::default();
+    let (sender, recipient, token, contract_id) = payroll_setup(&env);
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+
+    let id = orbit.create_payroll_escrow(&sender, &recipient, &token, &10_0000000, &2_000);
+
+    env.ledger().with_mut(|l| l.timestamp = 2_001);
+    assert!(orbit
+        .try_claim_payroll_escrow(&recipient, &id, &1_0000000)
+        .is_err());
+}
+
+#[test]
+fn test_payroll_reclaim_is_one_shot_and_blocks_later_claims() {
+    let env = Env::default();
+    let (sender, recipient, token, contract_id) = payroll_setup(&env);
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    let token_client = TokenClient::new(&env, &token);
+
+    let id = orbit.create_payroll_escrow(&sender, &recipient, &token, &10_0000000, &2_000);
+
+    env.ledger().with_mut(|l| l.timestamp = 2_001);
+    orbit.reclaim_unclaimed_payroll(&sender, &id);
+
+    assert!(orbit.try_reclaim_unclaimed_payroll(&sender, &id).is_err());
+    assert!(orbit
+        .try_claim_payroll_escrow(&recipient, &id, &1_0000000)
+        .is_err());
+    assert_eq!(token_client.balance(&sender), 100_0000000);
+}
+
+#[test]
+fn test_payroll_reclaim_requires_original_sender() {
+    let env = Env::default();
+    let (sender, recipient, token, contract_id) = payroll_setup(&env);
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+
+    let id = orbit.create_payroll_escrow(&sender, &recipient, &token, &10_0000000, &2_000);
+    env.ledger().with_mut(|l| l.timestamp = 2_001);
+
+    let stranger = Address::generate(&env);
+    assert!(orbit.try_reclaim_unclaimed_payroll(&stranger, &id).is_err());
+}
+
+#[test]
+fn test_payroll_reclaim_fails_when_fully_claimed() {
+    let env = Env::default();
+    let (sender, recipient, token, contract_id) = payroll_setup(&env);
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+
+    let id = orbit.create_payroll_escrow(&sender, &recipient, &token, &10_0000000, &2_000);
+    orbit.claim_payroll_escrow(&recipient, &id, &10_0000000);
+
+    env.ledger().with_mut(|l| l.timestamp = 2_001);
+    assert!(orbit.try_reclaim_unclaimed_payroll(&sender, &id).is_err());
+}
+
+#[test]
+fn test_payroll_create_rejects_past_expiration_and_zero_amount() {
+    let env = Env::default();
+    let (sender, recipient, token, contract_id) = payroll_setup(&env);
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+
+    assert!(orbit
+        .try_create_payroll_escrow(&sender, &recipient, &token, &1_0000000, &1_000)
+        .is_err());
+    assert!(orbit
+        .try_create_payroll_escrow(&sender, &recipient, &token, &0, &2_000)
+        .is_err());
+}
