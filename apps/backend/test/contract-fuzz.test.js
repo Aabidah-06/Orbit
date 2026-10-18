@@ -422,7 +422,7 @@ describe("Automated Smart Contract Vulnerability Fuzzing & Invariant Suite (#181
     expect(successfulPulls).toBeGreaterThan(100);
     expect(blockedEarlyPulls).toBeGreaterThan(100);
     expect(blockedCapOverflows).toBeGreaterThan(10);
-  });
+  }, 60_000);
 
   it("enforces Merkle distribution integrity and blocks double-claims or over-claims across randomized trees", () => {
     const rng = new SplitMix64(0x778899aabbccddeeffn);

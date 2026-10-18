@@ -65,9 +65,10 @@ const {
 } = require('./contract-state-snapshot');
 const { getDatabaseManager } = require('./db');
 const { registerPrivacyRoutes } = require('./privacy');
-const { createPayoutSplitDispatcher, registerPayoutSplitRoutes } = require('./payout-splits');
-const { createPriceIndexationWorker, registerPriceIndexationRoutes } = require('./price-indexation');
 const { registerProofRoutes } = require('./proofs');
+const { captureStripeRawBody, registerStripeBillingRoutes } = require('./stripe-billing');
+const { registerCredentialRoutes } = require('./credentials');
+const { checkSchemaOnStartup } = require('./migrate');
 
 const app = express();
 // Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
@@ -114,7 +115,8 @@ app.locals.rateLimiters = { ip: ipRateLimit, apiKey: apiKeyRateLimit };
 app.locals.reputation = reputation;
 
 app.use(ipRateLimit);
-app.use(express.json());
+// Keeps the raw bytes of Stripe webhooks, which are signed over the exact body (#131)
+app.use(express.json({ verify: captureStripeRawBody }));
 
 // Multi-region database manager with read-replica failover (#139)
 const dbManager = getDatabaseManager();
@@ -123,7 +125,7 @@ const getReadSupabase = (appInstance = app) => dbManager.getReadClient(appInstan
 const getSupabase = () => getPrimarySupabase(app);
 
 // Merchant routes: authenticate the API key, then apply its rate limit
-const authenticateMerchant = [requireApiKey(getSupabase), apiKeyRateLimit];
+const authenticateMerchant = [requireApiKey(getSupabase), reputation.markAuthenticated, apiKeyRateLimit];
 registerAnalyticsRoutes(app, getSupabase);
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
@@ -514,7 +516,6 @@ const applyPullOutcome = async ({
     signedTx = null,
     extraBody = {},
 }) => {
-const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id, txHash, status, confirmation, extraBody = {} }) => {
     if (status === "SUCCESS") {
         const pullTime = new Date();
         const nextBilling = new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
@@ -592,30 +593,6 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
                     if (paymentError && paymentError.code !== '23505') {
                         console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
                     }
-            // Only record amounts independently verified from the
-            // successful on-chain funds_pulled event. Plan and oracle
-            // quotes are not necessarily the vault's actual transfer.
-            const verifiedAmount = confirmedSettlementAmount(
-                confirmation,
-                { customerWallet: sub.customer_wallet_address,
-                  merchantWallet: merchant.wallet_address,
-                  contractId: process.env.ORBIT_CONTRACT_ID },
-            );
-            if (verifiedAmount === null) {
-                console.error('CRITICAL: confirmed transfer missing verified amount; reconcile transaction:', txHash);
-            } else {
-                const { error: paymentError } = await supabase.from('payment_transactions').insert([{
-                    merchant_id: sub.plans.merchant_id,
-                    subscription_id,
-                    plan_id: sub.plan_id,
-                    customer_wallet_address: sub.customer_wallet_address,
-                    amount_usdc_units: verifiedAmount,
-                    status: 'settled',
-                    tx_hash: txHash,
-                    settled_at: pullTime.toISOString(),
-                }]);
-                if (paymentError && paymentError.code !== '23505') {
-                    console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
                 }
             }
 
@@ -668,7 +645,6 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
             }
             await recordPullFailure(supabase, subscription_id, failureReason, txHash);
         }
-        await recordPullFailure(supabase, subscription_id, 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.', txHash);
         await markSubscriptionPastDue(supabase, subscription_id, {
             actorAddress: merchant.wallet_address,
             ipAddress: getClientIp(req),
@@ -691,7 +667,6 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
             txHash,
         );
     }
-    await recordPullFailure(supabase, subscription_id, 'RPC timeout: transaction submitted but not yet confirmed. Do not retry until its outcome is known.', txHash);
     return {
         status: 202,
         body: { message: "Transaction submitted but not yet confirmed; check back later", txHash, ...extraBody },
@@ -909,7 +884,6 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                     server,
                     signedTx,
                 });
-                return applyPullOutcome({ supabase, req, sub, merchant, subscription_id, txHash, status: confirmation.status, confirmation });
             });
         });
         sendResult(res, result);
@@ -1459,6 +1433,15 @@ app.post('/subscriptions/:id/cancel', authenticateMerchant, async (req, res) => 
 
         if (updateErr) throw updateErr;
 
+        // Cancelled subscribers lose their verifiable credentials immediately (#132).
+        // Verification also re-checks subscription status, so a failure here only
+        // delays the revocation record, never access.
+        try {
+            await credentialService.revocations.revokeSubscription(supabase, id, 'subscription_cancelled');
+        } catch (revokeErr) {
+            console.error("Error revoking credentials for cancelled subscription:", id, revokeErr);
+        }
+
         const merchantId = sub.plans?.merchant_id;
         await writeAuditLog(supabase, {
             merchantId,
@@ -1970,6 +1953,8 @@ registerPayoutSplitRoutes(app, getSupabase, authenticateMerchant, {
 registerPriceIndexationRoutes(app, getSupabase, authenticateMerchant);
 registerSnapshotRoutes(app, getSupabase, authenticateMerchant, getSorobanServer);
 registerIndexerRoutes(app);
+registerStripeBillingRoutes(app, getSupabase, authenticateMerchant);
+const credentialService = registerCredentialRoutes(app, getSupabase, authenticateMerchant);
 app.locals.graphqlServer = registerGraphql(app, getSupabase, authenticateMerchant);
 
 // Merchant profile & custom contract persistence (#143)
@@ -2030,7 +2015,7 @@ registerTransactionExportRoute(
 );
 
 const PORT = process.env.PORT || 3001;
-if (require.main === module) {
+function startServer() {
     if (getSupabase() && process.env.INDEXER_START_LEDGER) {
         app.locals.ledgerIndexer = configuredIndexer(getSupabase());
         app.locals.indexerWorker = app.locals.ledgerIndexer.start(Number(process.env.INDEXER_INTERVAL_MS) || 5000);
@@ -2076,5 +2061,15 @@ if (require.main === module) {
     });
 }
 
-module.exports = app;
+// Pre-flight schema guard (#157): never serve against a database whose
+// migrations don't match this build.
+if (require.main === module) {
+    checkSchemaOnStartup()
+        .then(startServer)
+        .catch((err) => {
+            console.error(`Startup aborted: ${err.message}`);
+            process.exit(1);
+        });
+}
 
+module.exports = app;
