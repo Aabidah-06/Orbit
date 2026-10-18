@@ -28,6 +28,7 @@ const {
     processDunningRetries,
 } = require('./dunning');
 const { registerComplianceRoutes } = require('./compliance');
+const { registerDunningWorkflowRoutes, loadDunningWorkflow } = require('./dunning-workflow');
 const { registerSigningSessionRoutes } = require('./signing-sessions');
 const { registerTransactionExportRoute, confirmedSettlementAmount } = require('./transaction-report');
 const { registerCustomerPortalRoutes } = require('./customer-portal');
@@ -1269,9 +1270,12 @@ app.post('/dunning/process', async (req, res) => {
         const supabase = getSupabase();
         if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
         const merchant_id = req.body?.merchant_id;
+        // Use the merchant's saved dunning workflow when one exists (#190)
+        const workflow = await loadDunningWorkflow(supabase, merchant_id);
         const result = await processDunningRetries(supabase, {
             merchantId: merchant_id,
             fetchImpl: app.locals.fetchImpl,
+            workflowSteps: workflow?.steps || null,
         });
         res.status(200).json(result);
     } catch (err) {
@@ -1803,6 +1807,9 @@ registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
 
 // Webhook incident alerting: Slack / PagerDuty / email channels and failure telemetry (#189)
 registerWebhookAlertRoutes(app, getSupabase, authenticateMerchant);
+
+// Dunning workflow builder: saved retry cadence, email templates and recovery funnel (#190)
+registerDunningWorkflowRoutes(app, getSupabase, authenticateMerchant);
 setDeliveryObserver(createDeliveryAlertObserver(getSupabase));
 registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
