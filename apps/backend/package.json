@@ -21,9 +21,10 @@
     "dataloader": "^2.2.3",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "graphql": "^16.14.2",
+    "ioredis": "^5.11.1",
     "pg": "^8.23.1",
     "pg-cursor": "^2.22.1",
-    "graphql": "^16.14.2",
     "zod": "^4.6.5"
   },
   "devDependencies": {

@@ -6,7 +6,8 @@ const { z } = require('zod');
 const { StrKey, Keypair, rpc, Networks, TransactionBuilder, Contract, Address } = require('@stellar/stellar-sdk');
 const { executeIdempotently, withBillingLock, sendResult } = require('./idempotency');
 const { API_KEY_ENVIRONMENTS, issueApiKey, requireApiKey } = require('./apiKeys');
-const { createRateLimiter } = require('./rateLimit');
+const { createRateLimiter, createStoreFromEnv } = require('./rateLimit');
+const { createReputationScorer, createHorizonWalletLookup } = require('./reputation');
 const { isRelayerError, createRelayerFromEnv } = require('./relayer');
 const { getAuditLogsQuerySchema, getClientIp, getActorAddress, writeAuditLog } = require('./audit');
 const {
@@ -50,21 +51,43 @@ if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY);
 app.use(cors());
 
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000;
-// Coarse per-IP limit on every route, public or not, so unauthenticated traffic
-// (including floods of invalid API keys) cannot exhaust the database
-const ipRateLimit = createRateLimiter({
-    windowMs: RATE_LIMIT_WINDOW_MS,
-    limit: Number(process.env.IP_RATE_LIMIT_MAX) || 300,
-    keyGenerator: (req) => req.ip,
+// Shared by every limiter and the reputation scorer: Redis (with an in-memory
+// fallback) when REDIS_URL is set, so limits hold across all API instances
+const rateLimitStore = createStoreFromEnv();
+// Wallet age is scored only when Horizon is configured; tests inject app.locals.walletLookup
+const horizonWalletLookup = process.env.HORIZON_URL
+    ? createHorizonWalletLookup({ horizonUrl: process.env.HORIZON_URL })
+    : null;
+const reputation = createReputationScorer({
+    store: rateLimitStore,
+    walletLookup: async (address) => {
+        const lookup = app.locals.walletLookup || horizonWalletLookup;
+        return lookup ? lookup(address) : null;
+    },
+    ipTrustAfterMs: Number(process.env.REPUTATION_IP_TRUST_AFTER_MS) || undefined,
 });
-// Per-API-key limit on authenticated merchant routes
-const apiKeyRateLimit = createRateLimiter({
+// Coarse per-IP limit on every route, public or not, so unauthenticated traffic
+// (including floods of invalid API keys) cannot exhaust the database. Scaled by the
+// IP's reputation: new IPs and repeat offenders get less, merchant IPs more.
+const ipRateLimit = createRateLimiter({
+    name: 'ip',
+    store: rateLimitStore,
     windowMs: RATE_LIMIT_WINDOW_MS,
-    limit: Number(process.env.API_KEY_RATE_LIMIT_MAX) || 100,
+    limit: reputation.ipLimit(Number(process.env.IP_RATE_LIMIT_MAX) || 300),
+    keyGenerator: (req) => req.ip,
+    onLimitReached: (req) => reputation.recordViolation(req.ip),
+});
+// Per-API-key limit on authenticated merchant routes, scaled by key tier and wallet age
+const apiKeyRateLimit = createRateLimiter({
+    name: 'key',
+    store: rateLimitStore,
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: reputation.apiKeyLimit(Number(process.env.API_KEY_RATE_LIMIT_MAX) || 100),
     keyGenerator: (req) => req.apiKey?.id,
     message: "API key rate limit exceeded, please retry later",
 });
 app.locals.rateLimiters = { ip: ipRateLimit, apiKey: apiKeyRateLimit };
+app.locals.reputation = reputation;
 
 app.use(ipRateLimit);
 app.use(express.json());
@@ -79,8 +102,8 @@ if (supabaseUrl && supabaseKey) {
 
 const getSupabase = () => app.locals.supabase || defaultSupabase;
 
-// Merchant routes: authenticate the API key, then apply its rate limit
-const authenticateMerchant = [requireApiKey(getSupabase), apiKeyRateLimit];
+// Merchant routes: authenticate the API key, mark the IP as a merchant's, then apply the key's rate limit
+const authenticateMerchant = [requireApiKey(getSupabase), reputation.markAuthenticated, apiKeyRateLimit];
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
 const getSorobanServer = (rpcUrl) => app.locals.sorobanServer || new rpc.Server(rpcUrl);
@@ -101,6 +124,8 @@ const getRelayer = () => {
 
 // Per-merchant throttle on relay requests, on top of the general API key limit
 const relayRateLimit = createRateLimiter({
+    name: 'relay',
+    store: rateLimitStore,
     windowMs: Number(process.env.RELAYER_RATE_LIMIT_WINDOW_MS) || 60 * 1000,
     limit: Number(process.env.RELAYER_RATE_LIMIT_MAX) || 10,
     keyGenerator: (req) => req.merchant?.id,
