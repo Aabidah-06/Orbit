@@ -5,10 +5,12 @@
   "main": "index.js",
   "scripts": {
     "test": "vitest run",
+    "test:fuzz": "vitest run test/contract-fuzz.test.js",
     "create-api-key": "node scripts/create-api-key.js",
     "inspect-contract": "node scripts/inspect-contract.js",
     "generate:contract-sdk": "node scripts/generate-contract-sdk.js",
-    "reconcile": "node reconciliation.js"
+    "reconcile": "node reconciliation.js",
+    "db:restore-from-ledger": "node scripts/restore-from-ledger.js"
   },
   "keywords": [],
   "author": "",
