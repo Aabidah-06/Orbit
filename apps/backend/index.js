@@ -68,6 +68,7 @@ const { registerPrivacyRoutes } = require('./privacy');
 const { registerProofRoutes } = require('./proofs');
 const { captureStripeRawBody, registerStripeBillingRoutes } = require('./stripe-billing');
 const { registerCredentialRoutes } = require('./credentials');
+const { registerPaymentLinkRoutes } = require('./payment-links');
 const { checkSchemaOnStartup } = require('./migrate');
 
 const app = express();
@@ -127,6 +128,7 @@ const getSupabase = () => getPrimarySupabase(app);
 // Merchant routes: authenticate the API key, then apply its rate limit
 const authenticateMerchant = [requireApiKey(getSupabase), reputation.markAuthenticated, apiKeyRateLimit];
 registerAnalyticsRoutes(app, getSupabase);
+registerPaymentLinkRoutes(app, getSupabase, authenticateMerchant);
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
 const getSorobanServer = (rpcUrl) => app.locals.sorobanServer || new rpc.Server(rpcUrl);
