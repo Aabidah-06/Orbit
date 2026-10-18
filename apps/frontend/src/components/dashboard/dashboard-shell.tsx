@@ -29,6 +29,7 @@ import {
   Sparkles,
   FileSpreadsheet,
 } from "lucide-react";
+import { useDashboardTheme, type ThemePreference } from "@/lib/dashboard-theme";
 import { useFiatRates, type FiatCurrency } from "@/lib/fiat-rates";
 import { Brand } from "@/components/layout/brand";
 import { useAuth } from "@/lib/auth-context";
@@ -57,6 +58,7 @@ export function DashboardShell() {
   const router = useRouter();
   const { user, signOut, updateVault, updateBusinessName, walletNetworkWarning, disconnectWallet } = useAuth();
   const { unreadCount, toggleDrawer } = useNotifications();
+  const { theme, setTheme } = useDashboardTheme();
   const { currency, setCurrency, error: fiatError } = useFiatRates();
   const [activeTab, setActiveTab] = useState<DashboardTab>("overview");
 
@@ -154,7 +156,7 @@ export function DashboardShell() {
   ];
 
   return (
-    <div className="min-h-screen bg-[#fafafb] flex text-[#09090b]">
+    <div className="orbit-dashboard min-h-screen bg-[#fafafb] flex text-[#09090b]">
       {/* Mobile Backdrop */}
       {isMobileMenuOpen && (
         <div
@@ -357,6 +359,7 @@ export function DashboardShell() {
                 </span>
               )}
             </button>
+            <label className="inline-flex items-center gap-1"><span className="sr-only">Dashboard color theme</span><select aria-label="Dashboard color theme" value={theme} onChange={e => setTheme(e.target.value as ThemePreference)} className="rounded border border-black/20 bg-white px-2 py-1 text-xs text-black focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
             <label className="flex items-center gap-1 text-xs text-neutral-700 dark:text-neutral-200"><span className="sr-only">Display currency</span><select aria-label="Display currency" value={currency} onChange={(event) => setCurrency(event.target.value as FiatCurrency)} className="rounded-md border border-black/20 bg-white px-2 py-1 text-black focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">{["USD", "EUR", "GBP", "JPY"].map(code => <option key={code} value={code}>{code}</option>)}</select></label>
             <LocaleSwitcher className="hidden sm:inline-flex" />
             <Link
