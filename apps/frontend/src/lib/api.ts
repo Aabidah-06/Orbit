@@ -308,3 +308,33 @@ export async function sendTestWebhook(data: {
   });
   return handleResponse(res, "Failed to trigger test webhook");
 }
+
+/**
+ * Persists deployed custom contract ID to merchant's profile in Supabase (#143)
+ */
+export async function updateMerchantContract(
+  contractId: string
+): Promise<{ merchant: { id: string; name: string; contract_id: string } }> {
+  const url = new URL("/merchant/profile", ORBIT_API_URL);
+  const res = await fetch(url.toString(), {
+    method: "PATCH",
+    headers: merchantRequestHeaders(),
+    body: JSON.stringify({ contract_id: contractId }),
+  });
+  return handleResponse(res, "Failed to save contract to merchant profile");
+}
+
+/**
+ * Fetches merchant profile including custom contract configuration
+ */
+export async function fetchMerchantProfile(): Promise<{
+  merchant: { id: string; name: string; wallet_address: string; contract_id?: string };
+}> {
+  const url = new URL("/merchant/profile", ORBIT_API_URL);
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    headers: merchantRequestHeaders(),
+  });
+  return handleResponse(res, "Failed to fetch merchant profile");
+}
+

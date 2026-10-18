@@ -1,0 +1,22 @@
+{
+  "default_simulation": {
+    "key": "default_simulation",
+    "timestamp": "2026-10-18T00:00:00.000Z",
+    "request": "sim:AAAAAgAAAA...",
+    "response": {
+      "status": "SUCCESS",
+      "latestLedger": 1000,
+      "minResourceFee": "150",
+      "cost": {
+        "cpuInsns": "1200000",
+        "memBytes": "400000"
+      },
+      "results": [
+        {
+          "auth": [],
+          "xdr": "AAAAAwAAAA=="
+        }
+      ]
+    }
+  }
+}

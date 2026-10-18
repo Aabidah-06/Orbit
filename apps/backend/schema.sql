@@ -766,3 +766,33 @@ END;
 $$;
 REVOKE EXECUTE ON FUNCTION resolve_pending_pull(UUID, UUID, TEXT, BOOLEAN, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION resolve_pending_pull(UUID, UUID, TEXT, BOOLEAN, TIMESTAMPTZ) TO service_role;
+
+-- #143: Custom branded Soroban contract deployment per merchant
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS contract_id VARCHAR(255);
+
+-- #138: GDPR/CCPA Cryptographic Data Shredding & Privacy Compliance
+CREATE TABLE IF NOT EXISTS user_encryption_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    subject_hash VARCHAR(64) NOT NULL,
+    encrypted_dek TEXT,
+    iv VARCHAR(64),
+    auth_tag VARCHAR(64),
+    status VARCHAR(32) NOT NULL DEFAULT 'active', -- 'active', 'shredded'
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    shredded_at TIMESTAMP WITH TIME ZONE,
+    UNIQUE(merchant_id, subject_hash)
+);
+CREATE INDEX IF NOT EXISTS user_encryption_keys_merchant_subject_idx ON user_encryption_keys (merchant_id, subject_hash);
+ALTER TABLE user_encryption_keys ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS compliance_deletion_certificates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    subject_hash VARCHAR(64) NOT NULL,
+    certificate_data JSONB NOT NULL,
+    signature VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS compliance_deletion_certificates_merchant_subject_idx ON compliance_deletion_certificates (merchant_id, subject_hash);
+ALTER TABLE compliance_deletion_certificates ENABLE ROW LEVEL SECURITY;

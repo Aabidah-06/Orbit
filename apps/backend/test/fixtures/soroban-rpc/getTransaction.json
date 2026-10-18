@@ -1,0 +1,18 @@
+{
+  "default_get_tx": {
+    "key": "default_get_tx",
+    "timestamp": "2026-10-18T00:00:00.000Z",
+    "request": "tx:4a7f2e186c5141b99cf390d1bf379b329c3e1b527d4a4f8eb1a2c3d4e5f60718",
+    "response": {
+      "status": "SUCCESS",
+      "latestLedger": 1005,
+      "latestLedgerCloseTime": "1776510000",
+      "oldestLedger": 900,
+      "oldestLedgerCloseTime": "1776505000",
+      "ledger": 1001,
+      "createdAt": "1776509980",
+      "resultXdr": "AAAAAwAAAA==",
+      "resultMetaXdr": "AAAAAwAAAA=="
+    }
+  }
+}

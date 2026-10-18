@@ -5,6 +5,7 @@ import { setMerchantApiKey } from "@/lib/api";
 
 export interface LinkedVaults {
   stellar?: string;
+  contract_id?: string;
 }
 
 export interface MerchantUser {
@@ -12,6 +13,7 @@ export interface MerchantUser {
   email: string;
   businessName: string;
   walletAddress?: string;
+  customContractId?: string;
   linkedVaults?: LinkedVaults;
   createdAt: string;
 }
@@ -33,6 +35,7 @@ interface AuthContextType {
   signInWithWallet: (walletAddress: string) => Promise<{ success: boolean; error?: string }>;
   updateWallet: (walletAddress: string) => void;
   updateVault: (chain: "stellar", address: string) => void;
+  updateContractId: (contractId: string) => void;
   updateBusinessName: (businessName: string) => void;
   signOut: () => void;
 }
@@ -203,6 +206,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     saveUserSession(updated);
   };
 
+  const updateContractId = (contractId: string) => {
+    if (!user) return;
+    const trimmed = contractId.trim();
+    const updated = {
+      ...user,
+      customContractId: trimmed,
+      linkedVaults: {
+        ...user.linkedVaults,
+        contract_id: trimmed,
+      },
+    };
+    saveUserSession(updated);
+  };
+
   const updateBusinessName = (businessName: string) => {
     if (!user) return;
     const trimmed = businessName.trim();
@@ -233,6 +250,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         signInWithWallet,
         updateWallet,
         updateVault,
+        updateContractId,
         updateBusinessName,
         signOut,
       }}
