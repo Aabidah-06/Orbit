@@ -190,6 +190,8 @@ npm run typecheck
 cp apps/backend/.env.example apps/backend/.env   # fill in Supabase keys
 npm --prefix apps/backend install
 npm run dev:backend      # Merchant API on http://localhost:3001
+# Optional: share rate limits across API instances
+# docker run -p 6379:6379 redis   # then set REDIS_URL=redis://localhost:6379
 
 cd packages/checkout-widget && npm install && npm run dev   # widget on http://localhost:5173
 ```
@@ -391,6 +393,7 @@ The dashboard's Batch Payroll module parses a CSV on the client, checks each lin
 +-------------------------------------------------------------+
 |  apps/backend (Express + Supabase)                          |
 |  plans / subscriptions / subscribers / trigger-pull         |
+|  rate limiter + reputation  ---->  Redis (optional, shared) |
 +------------------------------+------------------------------+
                                |  @stellar/stellar-sdk (RPC)
                                v
@@ -425,9 +428,15 @@ Freighter is detected and connected through the official `@stellar/freighter-api
 | `GET` | `/subscribers?merchant_id=` | Subscriptions across a merchant's plans |
 | `POST` | `/trigger-pull` | Build, simulate (`prepareTransaction`), sign and submit `pull_funds` |
 
-Environment: see `apps/backend/.env.example` (`ORBIT_CONTRACT_ID`, `SOROBAN_RPC_URL`, `STELLAR_NETWORK_PASSPHRASE`, Supabase keys). See [apps/backend/README.md](apps/backend/README.md) for the full API reference, request/response examples, and error responses.
+Environment: see `apps/backend/.env.example` (`ORBIT_CONTRACT_ID`, `SOROBAN_RPC_URL`, `STELLAR_NETWORK_PASSPHRASE`, Supabase keys, optional `REDIS_URL` and `HORIZON_URL`). See [apps/backend/README.md](apps/backend/README.md) for the full API reference, request schemas, curl examples, and error codes.
 
-See [apps/backend/README.md](apps/backend/README.md) for full API reference documentation, request schemas, curl examples, and error codes.
+**Rate limiting.** Every route is limited per client IP, authenticated routes per API key, and `/relay/*` per merchant, using a sliding-window log (default 60 seconds). With `REDIS_URL` set, all API instances share one limit through Redis (a sorted set per client, updated atomically by a Lua script); if Redis is unreachable each instance falls back to in-memory limits and retries Redis later. Base limits are scaled by a reputation score:
+
+- New IPs get 0.5x; IPs that recently authenticated as a merchant get 4x.
+- Repeated `429`s shrink an IP's allowance until it stops for 15 minutes.
+- `live` API keys get 3x. With `HORIZON_URL` set, merchant wallets younger than 7 days get 0.5x and wallets older than 90 days get 1.5x.
+
+Responses carry `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` and `RateLimit-Policy` headers; over the limit the API returns `429` with `Retry-After`. Details: [apps/backend/README.md#rate-limiting](apps/backend/README.md#rate-limiting).
 
 ### 7.3 Checkout Widget SDK
 
@@ -518,6 +527,8 @@ test result: ok. 1 passed; 0 failed
 ```
 
 End-to-end coverage on the real testnet comes from `scripts/execute_flow.sh`.
+
+The Merchant API has a Vitest suite in `apps/backend/test` (`npm --prefix apps/backend test`). It runs the rate limiter against an in-memory Redis fake, covering cross-instance sync, window sliding, threshold enforcement, Redis fallback and reputation scoring. To also run the Lua scripts against a real Redis, set `REDIS_TEST_URL=redis://127.0.0.1:6379`.
 
 ---
 
