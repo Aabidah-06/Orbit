@@ -26,7 +26,7 @@ const {
 } = require('./dunning');
 const { registerComplianceRoutes } = require('./compliance');
 const { registerSigningSessionRoutes } = require('./signing-sessions');
-const { registerTransactionExportRoute } = require('./transaction-report');
+const { registerTransactionExportRoute, confirmedSettlementAmount } = require('./transaction-report');
 const { registerCustomerPortalRoutes } = require('./customer-portal');
 const { registerFailureRecoveryRoutes } = require('./failure-recovery');
 const { registerCouponRoutes, normalizeCode } = require('./coupons');
@@ -418,7 +418,7 @@ const loadPullContext = async (supabase, subscriptionId, merchant) => {
 };
 
 // Records the confirmed outcome of a pull transaction, whoever submitted it
-const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id, txHash, status, extraBody = {} }) => {
+const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id, txHash, status, confirmation, extraBody = {} }) => {
     if (status === "SUCCESS") {
         const pullTime = new Date();
         const nextBilling = new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
@@ -431,6 +431,7 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
                 retry_count: 0,
                 dunning_status: null,
                 next_dunning_retry_at: null,
+                last_failure: null,
             })
             .eq('id', subscription_id);
 
@@ -446,6 +447,52 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
         });
 
         if (sub.plans.merchant_id) {
+            // Fiat plans report the settled amount in raw USDC units
+            // converted at the current cached rate (#96)
+            let settledAmount = sub.plans.usdc_amount;
+            if (isFiatCurrency(sub.plans?.currency)) {
+                try {
+                    const quote = await quoteUsdcAmount({
+                        supabase,
+                        plan: sub.plans,
+                        subscription: sub,
+                        fetchImpl: app.locals.fetchImpl,
+                        allowNetwork: false,
+                        enforceSlippage: false,
+                    });
+                    settledAmount = quote.usdc_amount;
+                } catch {
+                    // Keep the stored plan amount when the cache cannot price it
+                }
+            }
+
+            // Only record amounts independently verified from the
+            // successful on-chain funds_pulled event. Plan and oracle
+            // quotes are not necessarily the vault's actual transfer.
+            const verifiedAmount = confirmedSettlementAmount(
+                confirmation,
+                { customerWallet: sub.customer_wallet_address,
+                  merchantWallet: merchant.wallet_address,
+                  contractId: process.env.ORBIT_CONTRACT_ID },
+            );
+            if (verifiedAmount === null) {
+                console.error('CRITICAL: confirmed transfer missing verified amount; reconcile transaction:', txHash);
+            } else {
+                const { error: paymentError } = await supabase.from('payment_transactions').insert([{
+                    merchant_id: sub.plans.merchant_id,
+                    subscription_id,
+                    plan_id: sub.plan_id,
+                    customer_wallet_address: sub.customer_wallet_address,
+                    amount_usdc_units: verifiedAmount,
+                    status: 'settled',
+                    tx_hash: txHash,
+                    settled_at: pullTime.toISOString(),
+                }]);
+                if (paymentError && paymentError.code !== '23505') {
+                    console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
+                }
+            }
+
             await dispatchWebhookEvent(supabase, {
                 merchantId: sub.plans.merchant_id,
                 eventType: 'payment.settled',
@@ -453,7 +500,7 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
                     event: 'payment.settled',
                     subscription_id,
                     customer_wallet_address: sub.customer_wallet_address,
-                    amount: sub.plans.usdc_amount,
+                    amount: settledAmount,
                     txHash,
                     settled_at: pullTime.toISOString(),
                 },
@@ -468,6 +515,7 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
     }
 
     if (status === "FAILED") {
+        await recordPullFailure(supabase, subscription_id, 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.', txHash);
         await markSubscriptionPastDue(supabase, subscription_id, {
             actorAddress: merchant.wallet_address,
             ipAddress: getClientIp(req),
@@ -482,6 +530,7 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
 
     // Still NOT_FOUND after the timeout: outcome unknown, let the caller poll later.
     // Keep the lease until it expires so no second pull races the one still in flight.
+    await recordPullFailure(supabase, subscription_id, 'RPC timeout: transaction submitted but not yet confirmed. Do not retry until its outcome is known.', txHash);
     return {
         status: 202,
         body: { message: "Transaction submitted but not yet confirmed; check back later", txHash, ...extraBody },
@@ -687,7 +736,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                     intervalMs: app.locals.txPollIntervalMs ?? TX_POLL_INTERVAL_MS,
                 });
 
-                return applyPullOutcome({ supabase, req, sub, merchant, subscription_id, txHash, status: confirmation.status });
+                return applyPullOutcome({ supabase, req, sub, merchant, subscription_id, txHash, status: confirmation.status, confirmation });
             });
         });
         sendResult(res, result);
@@ -710,113 +759,6 @@ const relayerErrorResult = (err) => ({
 });
 
 const RELAYER_NOT_CONFIGURED = { error: "Gas sponsorship relayer is not configured", code: "relayer_unavailable" };
-                if (confirmation.status === "SUCCESS") {
-                    const pullTime = new Date();
-                    const nextBilling = new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
-
-                    await supabase
-                        .from('subscriptions')
-                        .update({
-                            next_billing_date: nextBilling.toISOString(),
-                            status: 'active',
-                            retry_count: 0,
-                            dunning_status: null,
-                            next_dunning_retry_at: null,
-                            last_failure: null,
-                        })
-                        .eq('id', subscription_id);
-
-                    await writeAuditLog(supabase, {
-                        merchantId: sub.plans.merchant_id,
-                        actorAddress: getActorAddress(req, merchant.wallet_address),
-                        action: 'pull.execute',
-                        resourceType: 'subscription',
-                        resourceId: subscription_id,
-                        ipAddress: getClientIp(req),
-                        changesBefore: { next_billing_date: sub.next_billing_date, status: sub.status },
-                        changesAfter: { next_billing_date: nextBilling.toISOString(), status: 'active', txHash, amount: String(sub.plans.usdc_amount) },
-                    });
-
-                    if (sub.plans.merchant_id) {
-                        // Fiat plans report the settled amount in raw USDC units
-                        // converted at the current cached rate (#96)
-                        let settledAmount = sub.plans.usdc_amount;
-                        if (isFiatCurrency(sub.plans?.currency)) {
-                            try {
-                                const quote = await quoteUsdcAmount({
-                                    supabase,
-                                    plan: sub.plans,
-                                    subscription: sub,
-                                    fetchImpl: app.locals.fetchImpl,
-                                    allowNetwork: false,
-                                    enforceSlippage: false,
-                                });
-                                settledAmount = quote.usdc_amount;
-                            } catch {
-                                // Keep the stored plan amount when the cache cannot price it
-                            }
-                        }
-
-                        // Only record amounts independently verified from the
-                        // successful on-chain funds_pulled event. Plan and oracle
-                        // quotes are not necessarily the vault's actual transfer.
-                        const verifiedAmount = require('./transaction-report').confirmedSettlementAmount(
-                            confirmation,
-                            { customerWallet: sub.customer_wallet_address,
-                              merchantWallet: merchant.wallet_address,
-                              contractId: process.env.ORBIT_CONTRACT_ID },
-                        );
-                        if (verifiedAmount === null) {
-                            console.error('CRITICAL: confirmed transfer missing verified amount; reconcile transaction:', txHash);
-                        } else {
-                            const { error: paymentError } = await supabase.from('payment_transactions').insert([{
-                                merchant_id: sub.plans.merchant_id,
-                                subscription_id,
-                                plan_id: sub.plan_id,
-                                customer_wallet_address: sub.customer_wallet_address,
-                                amount_usdc_units: verifiedAmount,
-                                status: 'settled',
-                                tx_hash: txHash,
-                                settled_at: pullTime.toISOString(),
-                            }]);
-                            if (paymentError && paymentError.code !== '23505') {
-                                console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
-                            }
-                        }
-
-                        await dispatchWebhookEvent(supabase, {
-                            merchantId: sub.plans.merchant_id,
-                            eventType: 'payment.settled',
-                            payload: {
-                                event: 'payment.settled',
-                                subscription_id,
-                                customer_wallet_address: sub.customer_wallet_address,
-                                amount: settledAmount,
-                                txHash,
-                                settled_at: pullTime.toISOString(),
-                            },
-                            fetchImpl: app.locals.fetchImpl,
-                        });
-                    }
-
-                    return {
-                        status: 200,
-                        body: { message: "Successfully pulled funds on-chain!", txHash },
-                    };
-                }
-
-                if (confirmation.status === "FAILED") {
-                    let failureReason = 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.';
-                    try {
-                        const simulation = await server.simulateTransaction(signedTx);
-                        if (simulation.error) failureReason = simulation.error;
-                    } catch { /* keep the original failure when RPC diagnostics are unavailable */ }
-                    await recordPullFailure(supabase, subscription_id, failureReason, txHash);
-                    await markSubscriptionPastDue(supabase, subscription_id, {
-                        actorAddress: merchant.wallet_address,
-                        ipAddress: getClientIp(req),
-                        fetchImpl: app.locals.fetchImpl,
-                    });
 
 app.post('/relay/prepare-pull', authenticateMerchant, relayRateLimit, async (req, res) => {
     const parseResult = triggerPullSchema.safeParse(req.body);
@@ -922,14 +864,6 @@ app.post('/relay/submit-pull', authenticateMerchant, relayRateLimit, async (req,
                         attempts: outcome.attempts,
                     },
                 });
-                // Still NOT_FOUND after the timeout: outcome unknown, let the caller poll later.
-                // Keep the lease until it expires so no second pull races the one still in flight.
-                await recordPullFailure(supabase, subscription_id, 'RPC timeout: transaction submitted but not yet confirmed. Do not retry until its outcome is known.', txHash);
-                return {
-                    status: 202,
-                    body: { message: "Transaction submitted but not yet confirmed; check back later", txHash },
-                    holdLock: true,
-                };
             });
         });
         if (result.status >= 500 && !result.body?.txHash) await recordPullFailure(supabase, subscription_id, result.body?.error || 'Pull submission failed');
