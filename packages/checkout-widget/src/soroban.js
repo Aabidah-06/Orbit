@@ -33,7 +33,7 @@ export const pollTransaction = async (server, hash, { onProgress, timeoutMs = 60
   throw new PendingTransactionError(hash);
 };
 
-const signAndSubmit = async ({ server, transaction, wallet, address, networkPassphrase, stage, onSubmitted, onProgress }) => {
+export const signAndSubmit = async ({ server, transaction, wallet, address, networkPassphrase, stage, onSubmitted, onProgress }) => {
   const prepared = await server.prepareTransaction(transaction);
   const { signedTxXdr } = await wallet.signTransaction(prepared.toXDR(), {
     address,
