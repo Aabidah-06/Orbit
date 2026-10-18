@@ -21,7 +21,9 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: apps/frontend/package-lock.json
-      - run: npm ci
+      - name: Inspect npm working directory
+        run: pwd && ls -l package-lock.json package.json && npm config get package-lock
+      - run: npm ci --package-lock=true
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
