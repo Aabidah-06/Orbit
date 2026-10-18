@@ -61,12 +61,17 @@
       "plans": "Subscription Plans",
       "subscribers": "Subscribers",
       "payroll": "Batch Payroll",
+      "multisig": "Multi-Sig Room",
+      "passes": "Gift Passes",
+      "domains": "Custom Domains",
       "links": "Payment Links",
       "team": "Team & Permissions",
       "developers": "Developer Portal"
     },
     "badges": {
       "superpower": "Superpower",
+      "multisig": "M-of-N",
+      "oneTime": "One-Time",
       "api": "API"
     },
     "titles": {
@@ -74,6 +79,9 @@
       "plans": "Subscription Plans",
       "subscribers": "Subscribers",
       "payroll": "Batch Payroll Engine",
+      "multisig": "Multi-Sig Coordination Room",
+      "passes": "Gift Links & Pre-paid Passes",
+      "domains": "Custom Domains & SSL",
       "links": "Payment Links",
       "team": "Team & Permissions",
       "developers": "Developer Portal"

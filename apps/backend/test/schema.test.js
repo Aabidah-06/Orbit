@@ -93,6 +93,14 @@ describe('Database Schema & Row Level Security (RLS) Policies', () => {
     }
   });
 
+  it('keeps reconciliation_state private to the backend', () => {
+    const table = schemaSql.match(/CREATE\s+TABLE\s+reconciliation_state\s*\(([\s\S]*?)\n\);/i)?.[1];
+    expect(table).toBeDefined();
+    expect(table).toMatch(/event_cursor\s+TEXT/i);
+    expect(schemaSql).toMatch(/ALTER\s+TABLE\s+reconciliation_state\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
+    expect(schemaSql).not.toMatch(/CREATE\s+POLICY\s+.*ON\s+reconciliation_state\b/i);
+  });
+
   it('defines api_keys storing only a SHA-256 hash of each key', () => {
     const table = schemaSql.match(/CREATE\s+TABLE\s+api_keys\s*\(([\s\S]*?)\n\);/i)?.[1];
     expect(table).toBeDefined();
@@ -112,5 +120,22 @@ describe('Database Schema & Row Level Security (RLS) Policies', () => {
   it('keeps api_keys private to the backend', () => {
     expect(schemaSql).toMatch(/ALTER\s+TABLE\s+api_keys\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
     expect(schemaSql).not.toMatch(/CREATE\s+POLICY\s+.*ON\s+api_keys\b/i);
+  });
+
+  it('tracks relayer fee usage per merchant per day, private to the backend', () => {
+    const table = schemaSql.match(/CREATE\s+TABLE\s+relayer_fee_usage\s*\(([\s\S]*?)\n\);/i)?.[1];
+    expect(table).toBeDefined();
+    expect(table).toMatch(/merchant_id\s+UUID\s+NOT\s+NULL\s+REFERENCES\s+merchants\(id\)\s+ON\s+DELETE\s+CASCADE/i);
+    expect(table).toMatch(/fee_stroops\s+BIGINT\s+NOT\s+NULL/i);
+    expect(table).toMatch(/PRIMARY\s+KEY\s*\(\s*merchant_id\s*,\s*usage_date\s*\)/i);
+    expect(schemaSql).toMatch(/ALTER\s+TABLE\s+relayer_fee_usage\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY;/i);
+    expect(schemaSql).not.toMatch(/CREATE\s+POLICY\s+.*ON\s+relayer_fee_usage\b/i);
+    for (const fn of ['reserve_relayer_fee', 'adjust_relayer_fee']) {
+      expect(schemaSql).toMatch(new RegExp(`REVOKE\\s+EXECUTE\\s+ON\\s+FUNCTION\\s+${fn}\\(`, 'i'));
+    }
+  });
+
+  it('contains no leftover merge conflict markers', () => {
+    expect(schemaSql).not.toMatch(/^(<{7}|={7}|>{7})( |$)/m);
   });
 });

@@ -280,13 +280,9 @@ fn test_create_vault_overwrites_existing_terms_and_resets_last_pull_timestamp() 
     orbit_client.create_vault(&user, &merchant, &token_address, &40_0000000, &172800);
 
     // Check persistent storage to verify overwritten terms and reset last_pull_timestamp = 0
-    let key = VaultKey {
-        user: user.clone(),
-        merchant: merchant.clone(),
-    };
-    let vault_before_pull: VaultData = env.as_contract(&contract_id, || {
-        env.storage().persistent().get(&key).unwrap()
-    });
+    let key = vault_key(&user, &merchant);
+    let vault_before_pull: VaultData =
+        env.as_contract(&contract_id, || load_vault(&env, &key).unwrap());
     assert_eq!(vault_before_pull.amount_per_interval, 40_0000000);
     assert_eq!(vault_before_pull.interval_seconds, 172800);
     assert_eq!(vault_before_pull.last_pull_timestamp, 0);
@@ -700,10 +696,8 @@ fn test_contract_events_published_for_all_entrypoints() {
         merchant.clone().to_val(),
     ];
     let pull_data = (amount, 5000u64).into_val(&env);
-    let expected_pull = soroban_sdk::vec![
-        &env,
-        (orbit_client.address.clone(), pull_topics, pull_data),
-    ];
+    let expected_pull =
+        soroban_sdk::vec![&env, (orbit_client.address.clone(), pull_topics, pull_data),];
     assert_eq!(
         env.events().all().filter_by_contract(&orbit_client.address),
         expected_pull
@@ -897,6 +891,159 @@ fn test_cancel_vault_event_published() {
 }
 
 // ----------------------------------------------------------------------------
+// ISSUE #65: MULTI-SIG / THRESHOLD AUTHORIZATION FOR BATCH PAYROLL
+// ----------------------------------------------------------------------------
+
+struct PayrollSetup<'a> {
+    env: Env,
+    orbit_client: OrbitContractClient<'a>,
+    token_client: TokenClient<'a>,
+    token_address: Address,
+    sender: Address,
+    recipient_1: Address,
+    recipient_2: Address,
+    approvers: Vec<Address>,
+    splits: Vec<PaymentSplit>,
+}
+
+/// Sender with 100 USDC, a 60 USDC allowance to the contract, three approvers and
+/// two splits totalling 30 USDC. All auths are mocked.
+fn setup_payroll<'a>() -> PayrollSetup<'a> {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let sender = Address::generate(&env);
+    let recipient_1 = Address::generate(&env);
+    let recipient_2 = Address::generate(&env);
+#[test]
+fn test_failed_pull_enters_grace_and_settled_pull_restores_active() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&user, &100);
+    let contract_id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&user, &client.address, &100, &2000);
+    client.create_vault_with_grace_period(&user, &merchant, &token, &10, &100, &50);
+
+    env.ledger().set_timestamp(101);
+    client.record_failed_pull(&merchant, &user);
+    assert_eq!(client.get_vault(&user, &merchant).unwrap().payment_status, PAYMENT_GRACE_PERIOD);
+
+    client.pull_funds(&user, &merchant);
+    assert_eq!(client.get_vault(&user, &merchant).unwrap().payment_status, PAYMENT_ACTIVE);
+    assert_eq!(token_client.balance(&merchant), 10);
+}
+
+#[test]
+fn test_failed_pull_defaults_and_defaulted_pull_is_blocked() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let contract_id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &contract_id);
+    client.create_vault_with_grace_period(&user, &merchant, &token, &10, &100, &50);
+    env.ledger().set_timestamp(150);
+    client.record_failed_pull(&merchant, &user);
+    assert_eq!(client.get_vault(&user, &merchant).unwrap().payment_status, PAYMENT_DEFAULTED);
+    assert!(client.try_pull_funds(&user, &merchant).is_err());
+    client.merchant_cancel_vault(&merchant, &user);
+    assert_eq!(client.get_vault(&user, &merchant), None);
+}
+
+#[test]
+fn test_merchant_cancel_and_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&merchant, &100);
+    let contract_id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &contract_id);
+    client.create_vault(&user, &merchant, &token, &10, &100);
+    client.merchant_cancel_vault(&merchant, &user);
+    assert_eq!(client.get_vault(&user, &merchant), None);
+    token_client.approve(&merchant, &client.address, &25, &2000);
+    client.refund_subscriber(&merchant, &user, &token, &25);
+    assert_eq!(token_client.balance(&user), 25);
+}
+
+#[test]
+fn test_update_vault_terms_preserves_last_pull_and_uses_new_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&user, &100);
+    let contract_id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&user, &client.address, &100, &2000);
+    client.create_vault(&user, &merchant, &token, &10, &100);
+    env.ledger().set_timestamp(10);
+    client.pull_funds(&user, &merchant);
+    client.update_vault_terms(&user, &merchant, &25, &200);
+    let vault = client.get_vault(&user, &merchant).unwrap();
+    assert_eq!(vault.last_pull_timestamp, 10);
+    assert_eq!(vault.amount_per_interval, 25);
+    env.ledger().set_timestamp(210);
+    client.pull_funds(&user, &merchant);
+    assert_eq!(token_client.balance(&merchant), 35);
+}
+
+#[test]
+fn test_stream_withdraws_linearly_and_at_completion() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&sender, &100);
+    let contract_id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&sender, &client.address, &100, &2000);
+    let stream_id = client.create_stream(&sender, &recipient, &token, &100, &100, &200);
+    assert_eq!(token_client.balance(&sender), 0);
+    env.ledger().set_timestamp(150);
+    client.withdraw_from_stream(&stream_id, &25);
+    assert_eq!(token_client.balance(&recipient), 25);
+    env.ledger().set_timestamp(200);
+    client.withdraw_from_stream(&stream_id, &75);
+    assert_eq!(token_client.balance(&recipient), 100);
+}
+
+#[test]
+fn test_stream_early_cancel_splits_vested_and_unvested_amounts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&sender, &100);
+    let contract_id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&sender, &client.address, &100, &2000);
+    let stream_id = client.create_stream(&sender, &recipient, &token, &100, &100, &200);
+    env.ledger().set_timestamp(120);
+    client.cancel_stream(&stream_id);
+    assert_eq!(token_client.balance(&recipient), 20);
+    assert_eq!(token_client.balance(&sender), 80);
+// ----------------------------------------------------------------------------
 // ISSUE #93: SUBSCRIPTION PAUSE & RESUME
 // ----------------------------------------------------------------------------
 
@@ -913,6 +1060,236 @@ fn test_pause_blocks_pull_and_resume_restores_billing() {
         .register_stellar_asset_contract_v2(token_admin.clone())
         .address();
     let token_client = TokenClient::new(&env, &token_address);
+    StellarAssetClient::new(&env, &token_address).mint(&sender, &100_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&sender, &orbit_client.address, &60_0000000, &2000000);
+
+    let approvers = soroban_sdk::vec![
+        &env,
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let mut splits = Vec::new(&env);
+    splits.push_back(PaymentSplit {
+        recipient: recipient_1.clone(),
+        amount: 10_0000000,
+    });
+    splits.push_back(PaymentSplit {
+        recipient: recipient_2.clone(),
+        amount: 20_0000000,
+    });
+
+    PayrollSetup {
+        env,
+        orbit_client,
+        token_client,
+        token_address,
+        sender,
+        recipient_1,
+        recipient_2,
+        approvers,
+        splits,
+    }
+}
+
+impl PayrollSetup<'_> {
+    fn propose(&self, required_approvals: u32) -> u64 {
+        self.orbit_client.propose_batch_disburse(
+            &self.sender,
+            &self.token_address,
+            &self.splits,
+            &required_approvals,
+            &self.approvers,
+        )
+    }
+
+    fn approver(&self, index: u32) -> Address {
+        self.approvers.get(index).unwrap()
+    }
+
+    fn assert_nobody_paid(&self) {
+        assert_eq!(self.token_client.balance(&self.recipient_1), 0);
+        assert_eq!(self.token_client.balance(&self.recipient_2), 0);
+        assert_eq!(self.token_client.balance(&self.sender), 100_0000000);
+    }
+}
+
+#[test]
+fn test_propose_payroll_stores_pending_proposal_with_sequential_ids() {
+    let s = setup_payroll();
+
+    let first = s.propose(2);
+    let second = s.propose(3);
+    assert_eq!(first, 0);
+    assert_eq!(second, 1);
+
+    let proposal = s
+        .orbit_client
+        .get_payroll_proposal(&first)
+        .expect("proposal should exist");
+    assert_eq!(
+        proposal,
+        PayrollProposal {
+            id: 0,
+            sender: s.sender.clone(),
+            token: s.token_address.clone(),
+            splits: s.splits.clone(),
+            approvers: s.approvers.clone(),
+            approvals: Vec::new(&s.env),
+            required_approvals: 2,
+            executed: false,
+        }
+    );
+    assert_eq!(s.orbit_client.get_payroll_proposal(&2), None);
+
+    // Proposing moves no funds
+    s.assert_nobody_paid();
+}
+
+#[test]
+fn test_payroll_executes_after_threshold_of_distinct_approvals() {
+    let s = setup_payroll();
+    let id = s.propose(2);
+
+    s.orbit_client.approve_payroll_proposal(&s.approver(0), &id);
+    s.orbit_client.approve_payroll_proposal(&s.approver(2), &id);
+    s.orbit_client.execute_payroll_proposal(&id);
+
+    // events().all() only covers the most recent invocation, so check it before any other call
+    let executed_topics = soroban_sdk::vec![
+        &s.env,
+        Symbol::new(&s.env, "payroll_executed").to_val(),
+        s.sender.to_val(),
+        id.into_val(&s.env),
+    ];
+    let executed_data = (s.token_address.clone(), 2u32, 30_0000000i128).into_val(&s.env);
+    assert_eq!(
+        s.env
+            .events()
+            .all()
+            .filter_by_contract(&s.orbit_client.address),
+        soroban_sdk::vec![
+            &s.env,
+            (
+                s.orbit_client.address.clone(),
+                executed_topics,
+                executed_data
+            ),
+        ]
+    );
+
+    assert_eq!(s.token_client.balance(&s.recipient_1), 10_0000000);
+    assert_eq!(s.token_client.balance(&s.recipient_2), 20_0000000);
+    assert_eq!(s.token_client.balance(&s.sender), 70_0000000);
+
+    let proposal = s.orbit_client.get_payroll_proposal(&id).unwrap();
+    assert!(proposal.executed);
+    assert_eq!(
+        proposal.approvals,
+        soroban_sdk::vec![&s.env, s.approver(0), s.approver(2)]
+    );
+}
+
+#[test]
+fn test_payroll_execution_fails_below_threshold() {
+    let s = setup_payroll();
+    let id = s.propose(2);
+
+    assert!(s.orbit_client.try_execute_payroll_proposal(&id).is_err());
+
+    s.orbit_client.approve_payroll_proposal(&s.approver(1), &id);
+    assert!(s.orbit_client.try_execute_payroll_proposal(&id).is_err());
+
+    s.assert_nobody_paid();
+    assert!(!s.orbit_client.get_payroll_proposal(&id).unwrap().executed);
+}
+
+#[test]
+fn test_payroll_counts_each_approver_once() {
+    let s = setup_payroll();
+    let id = s.propose(2);
+
+    s.orbit_client.approve_payroll_proposal(&s.approver(0), &id);
+    let res = s
+        .orbit_client
+        .try_approve_payroll_proposal(&s.approver(0), &id);
+    assert!(res.is_err());
+
+    // One distinct approval is still short of a 2-of-3 threshold
+    assert_eq!(
+        s.orbit_client
+            .get_payroll_proposal(&id)
+            .unwrap()
+            .approvals
+            .len(),
+        1
+    );
+    assert!(s.orbit_client.try_execute_payroll_proposal(&id).is_err());
+    s.assert_nobody_paid();
+}
+
+#[test]
+fn test_payroll_rejects_approval_from_address_not_in_approver_list() {
+    let s = setup_payroll();
+    let id = s.propose(1);
+
+    let outsider = Address::generate(&s.env);
+    assert!(s
+        .orbit_client
+        .try_approve_payroll_proposal(&outsider, &id)
+        .is_err());
+
+    // The sender is not an approver unless listed
+    assert!(s
+        .orbit_client
+        .try_approve_payroll_proposal(&s.sender, &id)
+        .is_err());
+
+    assert!(s.orbit_client.try_execute_payroll_proposal(&id).is_err());
+    s.assert_nobody_paid();
+}
+
+#[test]
+fn test_payroll_approval_requires_the_approvers_own_signature() {
+    let s = setup_payroll();
+    let id = s.propose(1);
+    let approver = s.approver(0);
+    let other_approver = s.approver(1);
+
+    // Another listed approver signing cannot approve on `approver`'s behalf
+    let res = s
+        .orbit_client
+        .mock_auths(&[MockAuth {
+            address: &other_approver,
+            invoke: &MockAuthInvoke {
+                contract: &s.orbit_client.address,
+                fn_name: "approve_payroll_proposal",
+                args: (&approver, id).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_approve_payroll_proposal(&approver, &id);
+    assert!(res.is_err());
+
+    let res = s
+        .orbit_client
+        .mock_auths(&[MockAuth {
+            address: &approver,
+            invoke: &MockAuthInvoke {
+                contract: &s.orbit_client.address,
+                fn_name: "approve_payroll_proposal",
+                args: (&approver, id).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_approve_payroll_proposal(&approver, &id);
+    assert!(res.is_ok());
+    assert_eq!(
+        s.orbit_client.get_payroll_proposal(&id).unwrap().approvals,
+        soroban_sdk::vec![&s.env, approver]
     let token_admin_client = StellarAssetClient::new(&env, &token_address);
     token_admin_client.mint(&user, &100_0000000);
 
@@ -1447,7 +1824,12 @@ fn test_register_plan_rejects_plan_id_owned_by_another_merchant() {
 
     // The owner can refresh the terms, which also reactivates the plan
     orbit_client.deactivate_plan(&merchant_a, &plan_id);
-    assert!(!orbit_client.get_plan(&plan_id).expect("plan exists").is_active);
+    assert!(
+        !orbit_client
+            .get_plan(&plan_id)
+            .expect("plan exists")
+            .is_active
+    );
 
     orbit_client.register_plan(&merchant_a, &plan_id, &token, &40_0000000, &172800, &name);
     let plan = orbit_client.get_plan(&plan_id).expect("plan should exist");
@@ -1484,10 +1866,237 @@ fn test_deactivate_plan_requires_owning_merchant() {
         }])
         .try_deactivate_plan(&other, &plan_id);
     assert!(res.is_err());
-    assert!(orbit_client.get_plan(&plan_id).expect("plan exists").is_active);
+    assert!(
+        orbit_client
+            .get_plan(&plan_id)
+            .expect("plan exists")
+            .is_active
+    );
 }
 
 #[test]
+fn test_propose_payroll_requires_sender_signature() {
+    let s = setup_payroll();
+    let impostor = Address::generate(&s.env);
+    let required_approvals: u32 = 1;
+
+    let res = s
+        .orbit_client
+        .mock_auths(&[MockAuth {
+            address: &impostor,
+            invoke: &MockAuthInvoke {
+                contract: &s.orbit_client.address,
+                fn_name: "propose_batch_disburse",
+                args: (
+                    &s.sender,
+                    &s.token_address,
+                    &s.splits,
+                    required_approvals,
+                    &s.approvers,
+                )
+                    .into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_propose_batch_disburse(
+            &s.sender,
+            &s.token_address,
+            &s.splits,
+            &required_approvals,
+            &s.approvers,
+        );
+    assert!(res.is_err());
+    assert_eq!(s.orbit_client.get_payroll_proposal(&0), None);
+}
+
+#[test]
+fn test_payroll_cannot_be_executed_twice() {
+    let s = setup_payroll();
+    let id = s.propose(1);
+
+    s.orbit_client.approve_payroll_proposal(&s.approver(0), &id);
+    s.orbit_client.execute_payroll_proposal(&id);
+    assert_eq!(s.token_client.balance(&s.sender), 70_0000000);
+
+    // Replay: the remaining 30 USDC allowance would cover a second run, but it must not happen
+    assert!(s.orbit_client.try_execute_payroll_proposal(&id).is_err());
+    assert_eq!(s.token_client.balance(&s.recipient_1), 10_0000000);
+    assert_eq!(s.token_client.balance(&s.recipient_2), 20_0000000);
+    assert_eq!(s.token_client.balance(&s.sender), 70_0000000);
+
+    // Nor can it collect further approvals
+    assert!(s
+        .orbit_client
+        .try_approve_payroll_proposal(&s.approver(1), &id)
+        .is_err());
+}
+
+#[test]
+fn test_payroll_execution_reverts_atomically_and_can_be_retried() {
+    let s = setup_payroll();
+    let id = s.propose(1);
+    s.orbit_client.approve_payroll_proposal(&s.approver(0), &id);
+
+    // Allowance too small for the 30 USDC payroll
+    s.token_client
+        .approve(&s.sender, &s.orbit_client.address, &15_0000000, &2000000);
+    assert!(s.orbit_client.try_execute_payroll_proposal(&id).is_err());
+
+    // Nothing moved and the executed flag was rolled back with the failed transfers
+    s.assert_nobody_paid();
+    assert!(!s.orbit_client.get_payroll_proposal(&id).unwrap().executed);
+
+    s.token_client
+        .approve(&s.sender, &s.orbit_client.address, &30_0000000, &2000000);
+    s.orbit_client.execute_payroll_proposal(&id);
+    assert_eq!(s.token_client.balance(&s.recipient_2), 20_0000000);
+    assert!(s.orbit_client.get_payroll_proposal(&id).unwrap().executed);
+}
+
+#[test]
+fn test_propose_payroll_rejects_invalid_threshold() {
+    let s = setup_payroll();
+
+    // Zero approvals required
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(&s.sender, &s.token_address, &s.splits, &0, &s.approvers)
+        .is_err());
+    // More approvals required than there are approvers
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(&s.sender, &s.token_address, &s.splits, &4, &s.approvers)
+        .is_err());
+    // A threshold equal to the approver count is allowed
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(&s.sender, &s.token_address, &s.splits, &3, &s.approvers)
+        .is_ok());
+}
+
+#[test]
+fn test_propose_payroll_rejects_invalid_approver_lists() {
+    let s = setup_payroll();
+    let approver = s.approver(0);
+
+    // Empty list
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(
+            &s.sender,
+            &s.token_address,
+            &s.splits,
+            &1,
+            &Vec::new(&s.env)
+        )
+        .is_err());
+
+    // A duplicated approver could otherwise satisfy a 2-of-2 threshold alone
+    let duplicated = soroban_sdk::vec![&s.env, approver.clone(), approver];
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(&s.sender, &s.token_address, &s.splits, &2, &duplicated)
+        .is_err());
+
+    // Over the approver cap
+    let mut too_many = Vec::new(&s.env);
+    for _ in 0..(MAX_PAYROLL_APPROVERS + 1) {
+        too_many.push_back(Address::generate(&s.env));
+    }
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(&s.sender, &s.token_address, &s.splits, &1, &too_many)
+        .is_err());
+}
+
+#[test]
+fn test_propose_payroll_rejects_invalid_splits() {
+    let s = setup_payroll();
+
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(
+            &s.sender,
+            &s.token_address,
+            &Vec::new(&s.env),
+            &1,
+            &s.approvers
+        )
+        .is_err());
+
+    let mut zero_split = s.splits.clone();
+    zero_split.push_back(PaymentSplit {
+        recipient: Address::generate(&s.env),
+        amount: 0,
+    });
+    assert!(s
+        .orbit_client
+        .try_propose_batch_disburse(&s.sender, &s.token_address, &zero_split, &1, &s.approvers)
+        .is_err());
+}
+
+#[test]
+fn test_payroll_actions_fail_for_unknown_proposal() {
+    let s = setup_payroll();
+
+    assert!(s
+        .orbit_client
+        .try_approve_payroll_proposal(&s.approver(0), &42)
+        .is_err());
+    assert!(s.orbit_client.try_execute_payroll_proposal(&42).is_err());
+}
+
+#[test]
+fn test_payroll_proposal_and_approval_events_published() {
+    let s = setup_payroll();
+    let id = s.propose(2);
+
+    let proposed_topics = soroban_sdk::vec![
+        &s.env,
+        Symbol::new(&s.env, "payroll_proposed").to_val(),
+        s.sender.to_val(),
+        id.into_val(&s.env),
+    ];
+    let proposed_data = (s.token_address.clone(), 2u32, 3u32, 30_0000000i128).into_val(&s.env);
+    assert_eq!(
+        s.env
+            .events()
+            .all()
+            .filter_by_contract(&s.orbit_client.address),
+        soroban_sdk::vec![
+            &s.env,
+            (
+                s.orbit_client.address.clone(),
+                proposed_topics,
+                proposed_data
+            ),
+        ]
+    );
+
+    s.orbit_client.approve_payroll_proposal(&s.approver(1), &id);
+
+    let approved_topics = soroban_sdk::vec![
+        &s.env,
+        Symbol::new(&s.env, "payroll_approved").to_val(),
+        s.approver(1).to_val(),
+        id.into_val(&s.env),
+    ];
+    let approved_data = (1u32, 2u32).into_val(&s.env);
+    assert_eq!(
+        s.env
+            .events()
+            .all()
+            .filter_by_contract(&s.orbit_client.address),
+        soroban_sdk::vec![
+            &s.env,
+            (
+                s.orbit_client.address.clone(),
+                approved_topics,
+                approved_data
+            ),
+        ]
+    );
+}
 fn test_deactivate_plan_blocks_new_vaults_but_existing_vaults_keep_billing() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1538,7 +2147,12 @@ fn test_deactivate_plan_blocks_new_vaults_but_existing_vaults_keep_billing() {
 
     // Merchant deactivates the plan: no NEW subscriptions, existing ones live
     orbit_client.deactivate_plan(&merchant, &plan_id);
-    assert!(!orbit_client.get_plan(&plan_id).expect("plan exists").is_active);
+    assert!(
+        !orbit_client
+            .get_plan(&plan_id)
+            .expect("plan exists")
+            .is_active
+    );
 
     let res = orbit_client.try_create_vault_from_plan(&new_user, &plan_id);
     assert!(res.is_err());
@@ -1949,4 +2563,221 @@ fn test_metered_events_published_for_creation_and_pulls() {
         env.events().all().filter_by_contract(&orbit_client.address),
         soroban_sdk::vec![&env, (orbit_client.address.clone(), pull_topics, pull_data)]
     );
+}
+
+// ----------------------------------------------------------------------------
+// #123–126: Soulbound credentials, bitmap registry, swap and escrow settlement
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_badge_issuance_renewal_expiration_and_revocation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token = TokenClient::new(&env, &token_id);
+    StellarAssetClient::new(&env, &token_id).mint(&user, &1_000);
+    let id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &id);
+    token.approve(&user, &id, &1_000, &2_000_000);
+
+    client.create_vault(&user, &merchant, &token_id, &100, &100);
+    let original = client.get_subscriber_badge(&user, &merchant).unwrap();
+    assert!(original.active);
+    assert_eq!(original.tier, 1);
+    assert_eq!(original.subscriber_id, 0);
+    assert_eq!(original.expiration_timestamp, 100);
+    assert!(client.is_subscriber_active(&user, &merchant));
+    assert_eq!(
+        client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0],
+        1
+    );
+
+    client.set_subscriber_tier(&user, &merchant, &3);
+    env.ledger().set_timestamp(20);
+    client.pull_funds(&user, &merchant);
+    let renewed = client.get_subscriber_badge(&user, &merchant).unwrap();
+    assert_eq!(renewed.tier, 3);
+    assert_eq!(renewed.expiration_timestamp, 120);
+    env.ledger().set_timestamp(121);
+    assert!(!client.is_subscriber_active(&user, &merchant));
+    assert!(client.mark_subscription_default(&user, &merchant));
+    assert!(
+        !client
+            .get_subscriber_badge(&user, &merchant)
+            .unwrap()
+            .active
+    );
+    assert_eq!(
+        client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0],
+        0
+    );
+
+    client.cancel_vault(&user, &merchant);
+    client.create_vault(&user, &merchant, &token_id, &100, &100);
+    assert_eq!(
+        client
+            .get_subscriber_badge(&user, &merchant)
+            .unwrap()
+            .subscriber_id,
+        0
+    );
+    assert_eq!(
+        client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0],
+        1
+    );
+    client.cancel_vault(&user, &merchant);
+    assert!(!client.is_subscriber_active(&user, &merchant));
+    assert_eq!(
+        client.get_subscriber_bitmap_chunk(&merchant, &0).to_array()[0],
+        0
+    );
+}
+
+#[test]
+fn test_bitmap_chunk_boundary_and_neighbor_integrity() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &id);
+    let mut users = Vec::<Address>::new(&env);
+    for _ in 0..258 {
+        let user = Address::generate(&env);
+        client.create_vault(&user, &merchant, &token, &10, &86400);
+        users.push_back(user);
+    }
+    let first = client.get_subscriber_bitmap_chunk(&merchant, &0).to_array();
+    let second = client.get_subscriber_bitmap_chunk(&merchant, &1).to_array();
+    assert_eq!(first, [255u8; 32]);
+    assert_eq!(second[0], 3);
+    assert_eq!(second[1], 0);
+
+    client.cancel_vault(&users.get(255).unwrap(), &merchant);
+    client.cancel_vault(&users.get(256).unwrap(), &merchant);
+    let first = client.get_subscriber_bitmap_chunk(&merchant, &0).to_array();
+    let second = client.get_subscriber_bitmap_chunk(&merchant, &1).to_array();
+    assert_eq!(first[31], 127);
+    assert_eq!(first[30], 255);
+    assert_eq!(second[0], 2);
+    assert!(client.is_subscriber_active(&users.get(257).unwrap(), &merchant));
+}
+
+#[test]
+fn test_escrow_claim_dispute_and_partial_arbitration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token = TokenClient::new(&env, &token_id);
+    StellarAssetClient::new(&env, &token_id).mint(&user, &1_000);
+    let id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &id);
+    token.approve(&user, &id, &1_000, &2_000_000);
+    client.create_vault(&user, &merchant, &token_id, &100, &100);
+    client.configure_escrow(&user, &merchant, &arbitrator, &30);
+
+    env.ledger().set_timestamp(10);
+    client.pull_funds(&user, &merchant);
+    assert_eq!(token.balance(&merchant), 0);
+    assert_eq!(token.balance(&id), 100);
+    assert_eq!(client.get_escrow(&0).unwrap().release_at, 40);
+    assert!(client.try_claim_escrow_funds(&merchant, &0).is_err());
+    client.raise_dispute(&user, &merchant, &0);
+    env.ledger().set_timestamp(41);
+    assert!(client.try_claim_escrow_funds(&merchant, &0).is_err());
+    assert!(client.try_resolve_dispute(&user, &0, &50).is_err());
+    assert!(client.try_resolve_dispute(&arbitrator, &0, &101).is_err());
+    client.resolve_dispute(&arbitrator, &0, &25);
+    assert_eq!(token.balance(&user), 925);
+    assert_eq!(token.balance(&merchant), 75);
+    assert!(client.get_escrow(&0).is_none());
+
+    env.ledger().set_timestamp(110);
+    client.pull_funds(&user, &merchant);
+    assert_eq!(token.balance(&merchant), 75);
+    assert!(client.try_claim_escrow_funds(&merchant, &1).is_err());
+    env.ledger().set_timestamp(141);
+    client.claim_escrow_funds(&merchant, &1);
+    assert_eq!(token.balance(&merchant), 175);
+    assert!(client.get_escrow(&1).is_none());
+}
+
+#[soroban_sdk::contract]
+pub struct TestExactOutputRouter;
+
+#[soroban_sdk::contractimpl]
+impl TestExactOutputRouter {
+    pub fn swap_exact_output(
+        env: Env,
+        payment_token: Address,
+        settlement_token: Address,
+        amount_out: i128,
+        max_amount_in: i128,
+        recipient: Address,
+    ) -> i128 {
+        let spent = amount_out.checked_mul(2).unwrap();
+        assert!(
+            spent <= max_amount_in,
+            "Insufficient max input for router quote"
+        );
+        let router = env.current_contract_address();
+        token::Client::new(&env, &settlement_token).transfer(&router, &recipient, &amount_out);
+        if max_amount_in > spent {
+            token::Client::new(&env, &payment_token).transfer(
+                &router,
+                &recipient,
+                &(max_amount_in - spent),
+            );
+        }
+        spent
+    }
+}
+
+#[test]
+fn test_cross_asset_swap_exact_output_refund_and_slippage_rejection() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let payment = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let settlement = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let payment_token = TokenClient::new(&env, &payment);
+    let settlement_token = TokenClient::new(&env, &settlement);
+    StellarAssetClient::new(&env, &payment).mint(&user, &1_000);
+    let router = env.register(TestExactOutputRouter, ());
+    StellarAssetClient::new(&env, &settlement).mint(&router, &1_000);
+    let id = env.register(OrbitContract, ());
+    let client = OrbitContractClient::new(&env, &id);
+    payment_token.approve(&user, &id, &1_000, &2_000_000);
+    client.create_vault(&user, &merchant, &settlement, &100, &100);
+    client.configure_swap(&user, &merchant, &payment, &router, &250);
+    env.ledger().set_timestamp(20);
+    client.pull_funds(&user, &merchant);
+    assert_eq!(payment_token.balance(&user), 800);
+    assert_eq!(payment_token.balance(&router), 200);
+    assert_eq!(settlement_token.balance(&merchant), 100);
+    assert_eq!(settlement_token.balance(&id), 0);
+
+    // Change the authorized quote cap to below the router's input requirement.
+    client.configure_swap(&user, &merchant, &payment, &router, &150);
+    env.ledger().set_timestamp(121);
+    assert!(client.try_pull_funds(&user, &merchant).is_err());
+    assert_eq!(payment_token.balance(&user), 800);
+    assert_eq!(settlement_token.balance(&merchant), 100);
 }

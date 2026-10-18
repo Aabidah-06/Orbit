@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useMemo, useEffect, useDeferredValue } from "react";
 import {
   SendHorizontal,
   Upload,
@@ -17,12 +17,17 @@ import {
   FileSpreadsheet,
   ShieldCheck,
   X,
+  FlaskConical,
 } from "lucide-react";
 import { useTranslations } from "next-intl";
 import Papa from "papaparse";
 import { StrKey } from "@stellar/stellar-sdk";
-import { PayrollRecipient } from "../dashboard-types";
+import { PayrollRecipient, PayrollSimulationResult } from "../dashboard-types";
 import { useTeam } from "@/lib/team-context";
+import { useAuth } from "@/lib/auth-context";
+import { Contractor, duplicateWallets, mergeDuplicateRecipients, filterAndSortRecipients, parsePayrollAmount } from "@/lib/payroll";
+import { simulatePayrollRun } from "@/lib/payroll-simulation";
+import { PayrollSimulationModal } from "../modals/payroll-simulation-modal";
 
 const SAMPLE_RECIPIENTS: PayrollRecipient[] = [
   {
@@ -72,12 +77,58 @@ export function PayrollView() {
   const t = useTranslations("Tables");
   const { can } = useTeam();
   const canRunPayroll = can("runPayroll");
+  const { user } = useAuth();
+  const addressBookKey = user?.id ? `orbit_contractors:${user.id}` : null;
+  const [contractors, setContractors] = useState<Contractor[]>([]);
+  const [bookError, setBookError] = useState("");
+  const [showAddressBook, setShowAddressBook] = useState(false);
+  const [search, setSearch] = useState("");
+  const deferredSearch = useDeferredValue(search);
+  const [sortColumn, setSortColumn] = useState<"name" | "amount">("name");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
   const [recipients, setRecipients] = useState<PayrollRecipient[]>(SAMPLE_RECIPIENTS);
   const [isExecuting, setIsExecuting] = useState(false);
   const [disbursedSuccess, setDisbursedSuccess] = useState<string | null>(null);
+  const [isSimulating, setIsSimulating] = useState(false);
+  const [isSimulationOpen, setIsSimulationOpen] = useState(false);
+  const [simulationResult, setSimulationResult] = useState<PayrollSimulationResult | null>(null);
   const [uploadErrors, setUploadErrors] = useState<RowValidationError[]>([]);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const duplicates = useMemo(() => duplicateWallets(recipients), [recipients]);
+  const visibleRecipients = useMemo(() => filterAndSortRecipients(recipients, deferredSearch, sortColumn, sortDirection),
+    [recipients, deferredSearch, sortColumn, sortDirection]);
+
+  useEffect(() => {
+    setContractors([]); setBookError("");
+    if (!addressBookKey) return;
+    try {
+      const stored = JSON.parse(localStorage.getItem(addressBookKey) || "[]");
+      if (!Array.isArray(stored)) throw new Error("Invalid address book");
+      const verified = new Map<string, Contractor>();
+      for (const row of stored) if (typeof row.name === "string" && typeof row.role === "string" &&
+        typeof row.walletAddress === "string" && StrKey.isValidEd25519PublicKey(row.walletAddress) &&
+        typeof row.amount === "number" && Number.isFinite(row.amount) && parsePayrollAmount(row.amount.toFixed(7)) !== null) {
+        verified.set(row.walletAddress, row);
+      }
+      setContractors([...verified.values()]);
+    } catch { setBookError("The saved address book could not be read."); }
+  }, [addressBookKey]);
+
+  const saveContractor = (recipient: PayrollRecipient) => {
+    if (!addressBookKey || !StrKey.isValidEd25519PublicKey(recipient.walletAddress)) {
+      setBookError("Sign in and use a valid Stellar address before saving a contractor."); return;
+    }
+    const entry: Contractor = { name: recipient.name, role: recipient.role, walletAddress: recipient.walletAddress, amount: recipient.amount };
+    const next = [...contractors.filter((row) => row.walletAddress !== entry.walletAddress), entry];
+    try { localStorage.setItem(addressBookKey, JSON.stringify(next)); setContractors(next); setBookError(""); }
+    catch { setBookError("Saving failed. Check that browser storage is available."); }
+  };
+
+  const sortBy = (column: "name" | "amount") => {
+    if (sortColumn === column) setSortDirection((previous) => previous === "asc" ? "desc" : "asc");
+    else { setSortColumn(column); setSortDirection("asc"); }
+  };
 
   // Manual Add Modal / Row state
   const [isAddingManual, setIsAddingManual] = useState(false);
@@ -187,11 +238,8 @@ export function PayrollView() {
           if (!rawAmount || rawAmount === "") {
             rowReasons.push("Missing amount");
           } else {
-            const parsedAmount = parseFloat(rawAmount);
-            if (isNaN(parsedAmount) || !isFinite(parsedAmount)) {
-              rowReasons.push(`Unparseable amount "${rawAmount}"`);
-            } else if (parsedAmount <= 0) {
-              rowReasons.push(`Amount must be greater than zero (got ${rawAmount})`);
+            if (parsePayrollAmount(rawAmount) === null) {
+              rowReasons.push(`Amount must be positive, with at most 7 decimal places and within the supported range (got "${rawAmount}")`);
             }
           }
 
@@ -206,7 +254,7 @@ export function PayrollView() {
               name,
               role,
               walletAddress: wallet,
-              amount: parseFloat(rawAmount),
+              amount: parsePayrollAmount(rawAmount)!,
               network: "stellar-testnet",
               status: "ready",
             });
@@ -215,10 +263,8 @@ export function PayrollView() {
 
         setUploadErrors(errors);
 
-        if (validRecipients.length > 0) {
-          setRecipients(validRecipients);
-          setDisbursedSuccess(null);
-        }
+        setRecipients(validRecipients);
+        setDisbursedSuccess(null);
       },
       error: (error) => {
         setUploadErrors([{ row: 0, reason: `Failed to parse CSV: ${error.message}` }]);
@@ -242,8 +288,8 @@ export function PayrollView() {
       return;
     }
 
-    const parsedAmount = parseFloat(newAmount);
-    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+    const parsedAmount = parsePayrollAmount(newAmount);
+    if (parsedAmount === null) {
       setUploadErrors([
         {
           row: 0,
@@ -278,7 +324,7 @@ export function PayrollView() {
 
   // Run Batch Payroll Trigger (simulates on-chain Soroban batch_disburse execution)
   const handleRunBatchPayroll = () => {
-    if (readyCount === 0 || !canRunPayroll) return;
+    if (readyCount === 0 || !canRunPayroll || duplicates.size > 0) return;
     setIsExecuting(true);
     setDisbursedSuccess(null);
 
@@ -297,6 +343,22 @@ export function PayrollView() {
         })} USDC atomically distributed to ${readyCount} contractor wallets in a single ledger block (1.3s finality).`
       );
     }, 1300);
+  };
+
+  // #147 — Read-only pre-flight: build the batch_disburse envelope, simulate it
+  // on Soroban RPC and surface fees, instruction limits and per-recipient checks
+  // without ever prompting for a wallet signature.
+  const handleSimulatePayroll = async () => {
+    if (readyCount === 0) return;
+    setIsSimulationOpen(true);
+    setIsSimulating(true);
+    setSimulationResult(null);
+    const result = await simulatePayrollRun({
+      recipients,
+      sender: user?.walletAddress || user?.linkedVaults?.stellar,
+    });
+    setSimulationResult(result);
+    setIsSimulating(false);
   };
 
   return (
@@ -348,6 +410,15 @@ export function PayrollView() {
             <span>Add Row</span>
           </button>
           <button
+            onClick={handleSimulatePayroll}
+            disabled={isSimulating || isExecuting || readyCount === 0}
+            title="Simulate the batch against Soroban RPC without signing"
+            className="button button-secondary text-xs h-9 px-3 flex items-center gap-1.5 disabled:opacity-50"
+          >
+            {isSimulating ? <RotateCw size={13} className="animate-spin" /> : <FlaskConical size={13} />}
+            <span>Simulate Payroll Run</span>
+          </button>
+          <button
             onClick={handleLoadSampleCSV}
             className="button button-secondary text-xs h-9 px-3 text-neutral-600 hover:text-black"
           >
@@ -368,6 +439,12 @@ export function PayrollView() {
       )}
 
       {/* CSV Validation Error Banner */}
+      {duplicates.size > 0 && <div role="alert" className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm">
+        <p>{duplicates.size} duplicate recipient {duplicates.size === 1 ? "wallet" : "wallets"} found. Merge amounts or remove duplicate rows before running payroll.</p>
+        <button className="button button-secondary mt-3 px-3 py-2" onClick={() => {
+          try { setRecipients(mergeDuplicateRecipients(recipients)); }
+          catch (reason) { setUploadErrors([{ row: 0, reason: reason instanceof Error ? reason.message : "Unable to merge payouts" }]); }
+        }}>Merge duplicate amounts</button></div>}
       {uploadErrors.length > 0 && (
         <div className="p-4 rounded-xl bg-red-50 border border-red-200 text-xs text-red-950 space-y-2 animate-in fade-in duration-200 shadow-xs">
           <div className="flex items-center justify-between">
@@ -449,7 +526,7 @@ export function PayrollView() {
 
           <button
             onClick={handleRunBatchPayroll}
-            disabled={isExecuting || readyCount === 0 || !canRunPayroll}
+            disabled={isExecuting || readyCount === 0 || !canRunPayroll || duplicates.size > 0}
             title={canRunPayroll ? undefined : t("payroll.noPermission")}
             className="w-full mt-3 button bg-white text-black hover:bg-neutral-100 font-bold text-xs h-10 px-4 flex items-center justify-center gap-2 disabled:opacity-50 transition-all cursor-pointer shadow-xs"
           >
@@ -515,7 +592,8 @@ export function PayrollView() {
               <input
                 type="number"
                 required
-                min="1"
+                min="0.0000001"
+                step="0.0000001"
                 placeholder="USDC Amount"
                 value={newAmount}
                 onChange={(e) => setNewAmount(e.target.value)}
@@ -533,7 +611,29 @@ export function PayrollView() {
       )}
 
       {/* 3. Recipients Table */}
+      <div className="rounded-xl border bg-white p-4 text-xs">
+        <button className="button button-secondary px-3 py-2" onClick={() => setShowAddressBook((previous) => !previous)}>Saved contractors ({contractors.length})</button>
+        {bookError && <p role="alert" className="mt-2 text-red-700">{bookError}</p>}
+        {showAddressBook && <div className="mt-3 max-h-64 overflow-auto space-y-2">
+          <p className="text-neutral-500">Addresses are validated as Stellar public keys. Confirm ownership with the contractor before payment.</p>
+          {contractors.length === 0 && <p>No saved contractors yet. Use “Save contractor” on a payout row.</p>}
+          {contractors.map((contractor) => <div key={contractor.walletAddress} className="flex flex-wrap items-center gap-3 rounded-lg border p-3">
+            <div className="min-w-0 flex-1"><strong>{contractor.name}</strong><p className="break-all font-mono">{contractor.walletAddress}</p><p>{contractor.amount} USDC</p></div>
+            <button className="button button-secondary px-3 py-2" disabled={isExecuting} onClick={() => {
+              setRecipients((previous) => [...previous, { ...contractor, id: crypto.randomUUID(), network: "stellar-testnet", status: "ready" }]); setDisbursedSuccess(null);
+            }}>Quick add</button>
+            <button aria-label={`Remove ${contractor.name} from address book`} onClick={() => {
+              const next = contractors.filter((row) => row.walletAddress !== contractor.walletAddress);
+              try { if (addressBookKey) localStorage.setItem(addressBookKey, JSON.stringify(next)); setContractors(next); }
+              catch { setBookError("The contractor could not be removed from storage."); }
+            }}>Remove</button>
+          </div>)}
+        </div>}
+      </div>
       <div className="rounded-xl border border-black/10 bg-white overflow-hidden shadow-xs">
+        <div className="flex flex-wrap items-center gap-3 border-b p-4 text-xs"><label htmlFor="payroll-search">Search payouts</label>
+          <input id="payroll-search" type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Name or wallet address"
+            className="min-w-0 flex-1 rounded-lg border px-3 py-2" /><span role="status">{visibleRecipients.length} of {recipients.length} recipients</span></div>
         <div className="p-4 px-5 border-b border-black/10 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <FileSpreadsheet size={16} className="text-black" />
@@ -555,19 +655,20 @@ export function PayrollView() {
             <table className="w-full text-left text-xs">
               <thead className="bg-neutral-50/80 border-b border-black/10 text-neutral-500 uppercase tracking-wider font-semibold text-[10px]">
                 <tr>
-                  <th className="py-3.5 px-5">{t("payroll.contractor")}</th>
+                  <th className="py-3.5 px-5" aria-sort={sortColumn === "name" ? sortDirection === "asc" ? "ascending" : "descending" : "none"}><button onClick={() => sortBy("name")}>{t("payroll.contractor")} {sortColumn === "name" ? sortDirection === "asc" ? "↑" : "↓" : "↕"}</button></th>
                   <th className="py-3.5 px-4">{t("payroll.role")}</th>
                   <th className="py-3.5 px-4">{t("payroll.address")}</th>
-                  <th className="py-3.5 px-4">{t("payroll.amount")}</th>
+                  <th className="py-3.5 px-4" aria-sort={sortColumn === "amount" ? sortDirection === "asc" ? "ascending" : "descending" : "none"}><button onClick={() => sortBy("amount")}>{t("payroll.amount")} {sortColumn === "amount" ? sortDirection === "asc" ? "↑" : "↓" : "↕"}</button></th>
                   <th className="py-3.5 px-4">{t("payroll.status")}</th>
                   <th className="py-3.5 px-5 text-right">{t("payroll.action")}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-black/5 text-neutral-700">
-                {recipients.map((rec) => (
-                  <tr key={rec.id} className="hover:bg-neutral-50/50 transition-colors">
+                {visibleRecipients.map((rec) => (
+                  <tr key={rec.id} className={duplicates.has(rec.walletAddress) && rec.status === "ready" ? "bg-amber-50" : "hover:bg-neutral-50/50 transition-colors"}>
                     <td className="py-4 px-5 font-semibold text-black">
                       {rec.name}
+                      {duplicates.has(rec.walletAddress) && rec.status === "ready" && <span className="ml-2 text-amber-800">Duplicate wallet</span>}
                     </td>
 
                     <td className="py-4 px-4 text-neutral-600">
@@ -620,6 +721,7 @@ export function PayrollView() {
                     </td>
 
                     <td className="py-4 px-5 text-right">
+                      <button className="mr-2 text-xs underline" onClick={() => saveContractor(rec)}>Save contractor</button>
                       <button
                         onClick={() => handleRemove(rec.id)}
                         className="p-1.5 rounded text-neutral-400 hover:text-red-600 hover:bg-red-50 transition-colors"
@@ -632,6 +734,7 @@ export function PayrollView() {
                 ))}
               </tbody>
             </table>
+            {visibleRecipients.length === 0 && <p className="p-6 text-center text-xs">No payouts match your search.</p>}
           </div>
         ) : (
           <div className="py-16 text-center">
@@ -660,6 +763,14 @@ export function PayrollView() {
           {" "}Unlike traditional chains where payouts happen as N individual transactions that can partially fail, Orbit&apos;s Soroban smart contract (<code className="font-mono text-[11px] text-black">batch_disburse</code>) executes all transfers atomically. Either every single contractor gets paid, or the transaction safely rolls back.
         </div>
       </div>
+
+      {/* Dry-run simulation inspector (#147) */}
+      <PayrollSimulationModal
+        isOpen={isSimulationOpen}
+        isLoading={isSimulating}
+        result={simulationResult}
+        onClose={() => setIsSimulationOpen(false)}
+      />
     </div>
   );
 }

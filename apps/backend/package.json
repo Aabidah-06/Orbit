@@ -5,20 +5,31 @@
   "main": "index.js",
   "scripts": {
     "test": "vitest run",
-    "create-api-key": "node scripts/create-api-key.js"
+    "create-api-key": "node scripts/create-api-key.js",
+    "inspect-contract": "node scripts/inspect-contract.js",
+    "generate:contract-sdk": "node scripts/generate-contract-sdk.js",
+    "reconcile": "node reconciliation.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@apollo/server": "^5.5.1",
+    "@apollo/subgraph": "^2.15.1",
+    "@as-integrations/express5": "^1.1.2",
     "@stellar/stellar-sdk": "^17.0.1",
     "@supabase/supabase-js": "^2.116.0",
     "cors": "^2.8.6",
+    "dataloader": "^2.2.3",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "pg": "^8.23.1",
+    "pg-cursor": "^2.22.1",
+    "graphql": "^16.14.2",
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.10",
     "supertest": "^7.3.0",
     "vitest": "^5.0.2"
   },
