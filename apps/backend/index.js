@@ -29,6 +29,7 @@ const { registerSigningSessionRoutes } = require('./signing-sessions');
 const { registerTransactionExportRoute } = require('./transaction-report');
 const { registerCustomerPortalRoutes } = require('./customer-portal');
 const { registerFailureRecoveryRoutes } = require('./failure-recovery');
+const { registerAnalyticsRoutes } = require('./analytics');
 const { registerCouponRoutes, normalizeCode } = require('./coupons');
 const { registerGraphql } = require('./graphql');
 const { configuredIndexer, registerIndexerRoutes } = require('./ledger-indexer');
@@ -90,6 +91,7 @@ const getSupabase = () => app.locals.supabase || defaultSupabase;
 
 // Merchant routes: authenticate the API key, then apply its rate limit
 const authenticateMerchant = [requireApiKey(getSupabase), apiKeyRateLimit];
+registerAnalyticsRoutes(app, getSupabase);
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
 const getSorobanServer = (rpcUrl) => app.locals.sorobanServer || new rpc.Server(rpcUrl);
