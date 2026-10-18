@@ -796,3 +796,104 @@ CREATE TABLE IF NOT EXISTS compliance_deletion_certificates (
 );
 CREATE INDEX IF NOT EXISTS compliance_deletion_certificates_merchant_subject_idx ON compliance_deletion_certificates (merchant_id, subject_hash);
 ALTER TABLE compliance_deletion_certificates ENABLE ROW LEVEL SECURITY;
+-- 160-payout-splits.sql
+-- Automated merchant payout split engine (#160). Each settlement is split
+-- between partner treasury wallets; payout_distributions links the primary pull
+-- transaction hash to every secondary forward transfer hash.
+CREATE TABLE IF NOT EXISTS merchant_payout_splits (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    recipient_wallet VARCHAR(255) NOT NULL,
+    percentage_basis_points INTEGER NOT NULL
+        CHECK (percentage_basis_points > 0 AND percentage_basis_points <= 10000),
+    label VARCHAR(255),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    UNIQUE (merchant_id, recipient_wallet)
+);
+CREATE INDEX IF NOT EXISTS merchant_payout_splits_merchant_active_idx
+    ON merchant_payout_splits (merchant_id, is_active);
+
+CREATE TABLE IF NOT EXISTS payout_distributions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    subscription_id UUID REFERENCES subscriptions(id) ON DELETE SET NULL,
+    primary_tx_hash VARCHAR(128) NOT NULL,
+    recipient_wallet VARCHAR(255) NOT NULL,
+    split_id UUID REFERENCES merchant_payout_splits(id) ON DELETE SET NULL,
+    label VARCHAR(255),
+    percentage_basis_points INTEGER NOT NULL
+        CHECK (percentage_basis_points > 0 AND percentage_basis_points <= 10000),
+    amount_usdc_units NUMERIC NOT NULL CHECK (amount_usdc_units >= 0),
+    status VARCHAR(32) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'submitted', 'settled', 'failed')),
+    split_tx_hash VARCHAR(128),
+    error TEXT,
+    settled_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    UNIQUE (primary_tx_hash, recipient_wallet)
+);
+CREATE INDEX IF NOT EXISTS payout_distributions_merchant_created_idx
+    ON payout_distributions (merchant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS payout_distributions_status_idx
+    ON payout_distributions (status);
+CREATE INDEX IF NOT EXISTS payout_distributions_primary_tx_idx
+    ON payout_distributions (primary_tx_hash);
+
+ALTER TABLE merchant_payout_splits ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payout_distributions ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE merchant_payout_splits FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON TABLE payout_distributions FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON merchant_payout_splits TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON payout_distributions TO service_role;
+
+-- 164-plan-price-indexation.sql
+-- Scheduled plan price indexation (#164): upcoming price changes, advance
+-- notices, and one-click subscriber re-authorization tokens.
+CREATE TABLE IF NOT EXISTS plan_price_schedules (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan_id UUID NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    effective_date TIMESTAMP WITH TIME ZONE NOT NULL,
+    new_usdc_amount NUMERIC NOT NULL CHECK (new_usdc_amount > 0),
+    new_price_amount NUMERIC CHECK (new_price_amount IS NULL OR new_price_amount > 0),
+    status VARCHAR(32) NOT NULL DEFAULT 'scheduled'
+        CHECK (status IN ('scheduled', 'notified', 'applied', 'cancelled')),
+    advance_notice_days INTEGER NOT NULL DEFAULT 30
+        CHECK (advance_notice_days >= 0 AND advance_notice_days <= 365),
+    notified_at TIMESTAMP WITH TIME ZONE,
+    applied_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    UNIQUE (plan_id, effective_date)
+);
+CREATE INDEX IF NOT EXISTS plan_price_schedules_status_date_idx
+    ON plan_price_schedules (status, effective_date);
+CREATE INDEX IF NOT EXISTS plan_price_schedules_plan_idx
+    ON plan_price_schedules (plan_id, effective_date DESC);
+
+CREATE TABLE IF NOT EXISTS plan_price_reauthorizations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    schedule_id UUID NOT NULL REFERENCES plan_price_schedules(id) ON DELETE CASCADE,
+    subscription_id UUID NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    token VARCHAR(128) NOT NULL UNIQUE,
+    status VARCHAR(32) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'authorized', 'expired')),
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    authorized_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    UNIQUE (schedule_id, subscription_id)
+);
+CREATE INDEX IF NOT EXISTS plan_price_reauthorizations_token_idx
+    ON plan_price_reauthorizations (token);
+CREATE INDEX IF NOT EXISTS plan_price_reauthorizations_schedule_idx
+    ON plan_price_reauthorizations (schedule_id, status);
+
+ALTER TABLE plan_price_schedules ENABLE ROW LEVEL SECURITY;
+ALTER TABLE plan_price_reauthorizations ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE plan_price_schedules FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON TABLE plan_price_reauthorizations FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON plan_price_schedules TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON plan_price_reauthorizations TO service_role;

@@ -97,6 +97,40 @@ const getRelayer = () => {
     return defaultRelayer;
 };
 
+// Forward transfers for merchant payout splits (#160). The merchant treasury (or a
+// dedicated split relayer) signs and pays; when no key is configured, splits are
+// still recorded as pending so an operator can reconcile them later.
+let defaultSplitForwarder;
+const getSplitForwarder = () => {
+    if (app.locals.splitForwarder !== undefined) return app.locals.splitForwarder;
+    if (defaultSplitForwarder === undefined) {
+        const secret = process.env.SPLIT_RELAYER_SECRET_KEY || process.env.RELAYER_SECRET_KEY;
+        const tokenContractId = process.env.SPLIT_TOKEN_CONTRACT_ID || process.env.USDC_CONTRACT_ID;
+        if (!secret || !tokenContractId) {
+            defaultSplitForwarder = null;
+        } else {
+            defaultSplitForwarder = createStellarSplitForwarder({
+                server: getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
+                sourceKeypair: Keypair.fromSecret(secret),
+                tokenContractId,
+                networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+            });
+        }
+    }
+    return defaultSplitForwarder;
+};
+
+const getPayoutSplitDispatcher = () => createPayoutSplitDispatcher({
+    supabase: getSupabase(),
+    forwarder: getSplitForwarder(),
+    getTreasuryWallet: async (merchantId) => {
+        const supabase = getSupabase();
+        if (!supabase) return null;
+        const { data } = await supabase.from('merchants').select('wallet_address').eq('id', merchantId).maybeSingle();
+        return data?.wallet_address ?? null;
+    },
+});
+
 // Per-merchant throttle on relay requests, on top of the general API key limit
 const relayRateLimit = createRateLimiter({
     windowMs: Number(process.env.RELAYER_RATE_LIMIT_WINDOW_MS) || 60 * 1000,
@@ -460,6 +494,23 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
                 },
                 fetchImpl: app.locals.fetchImpl,
             });
+
+            // Automated revenue sharing (#160): forward each configured split
+            // share from the merchant treasury, recording the primary pull hash
+            // next to every secondary split transfer hash. Failures here never
+            // fail the settlement itself.
+            try {
+                await getPayoutSplitDispatcher().handlePaymentSettled({
+                    merchantId: sub.plans.merchant_id,
+                    subscriptionId: subscription_id,
+                    primaryTxHash: txHash,
+                    amountUnits: sub.plans.usdc_amount,
+                    settledAt: pullTime.toISOString(),
+                    fetchImpl: app.locals.fetchImpl,
+                });
+            } catch (splitErr) {
+                console.error("Payout split dispatch failed:", splitErr);
+            }
         }
 
         return {
@@ -1790,6 +1841,10 @@ registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
 registerCouponRoutes(app, getSupabase, authenticateMerchant);
 registerBillingResolutionRoutes(app, getSupabase, authenticateMerchant, loadPullContext, getSorobanServer);
+registerPayoutSplitRoutes(app, getSupabase, authenticateMerchant, {
+    resolveDispatcher: () => getPayoutSplitDispatcher(),
+});
+registerPriceIndexationRoutes(app, getSupabase, authenticateMerchant);
 registerIndexerRoutes(app);
 app.locals.graphqlServer = registerGraphql(app, getSupabase, authenticateMerchant);
 
@@ -1864,6 +1919,17 @@ if (require.main === module) {
             supabase: oracleSupabase,
             fetchImpl: app.locals.fetchImpl,
         });
+
+        // Price indexation worker (#164): notifies subscribers inside the advance
+        // notice window and applies scheduled plan price changes on their
+        // effective date.
+        app.locals.priceIndexationWorker = createPriceIndexationWorker({
+            supabase: oracleSupabase,
+            fetchImpl: app.locals.fetchImpl,
+        });
+        app.locals.priceIndexationWorker.start(
+            Number(process.env.PRICE_INDEXATION_INTERVAL_MS) || undefined,
+        );
     } else {
         console.warn("Oracle worker not started: Supabase client not initialized");
     }
