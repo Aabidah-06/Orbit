@@ -2,6 +2,7 @@
 
 import React, { createContext, useContext, useEffect, useState } from "react";
 import { setMerchantApiKey } from "@/lib/api";
+import { getAddress, getNetwork, isConnected } from "@stellar/freighter-api";
 
 export interface LinkedVaults {
   stellar?: string;
@@ -13,6 +14,7 @@ export interface MerchantUser {
   email: string;
   businessName: string;
   walletAddress?: string;
+  walletProvider?: "freighter";
   customContractId?: string;
   linkedVaults?: LinkedVaults;
   createdAt: string;
@@ -21,6 +23,8 @@ export interface MerchantUser {
 interface AuthContextType {
   user: MerchantUser | null;
   isLoading: boolean;
+  walletNetworkWarning: string | null;
+  disconnectWallet: () => void;
   signUp: (data: {
     email: string;
     password?: string;
@@ -47,6 +51,7 @@ const STORAGE_KEY = "orbit_merchant_session";
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<MerchantUser | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [walletNetworkWarning, setWalletNetworkWarning] = useState<string | null>(null);
   useEffect(() => { setMerchantApiKey(""); }, [user?.id]);
 
   // Restore session on mount
@@ -62,6 +67,53 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setIsLoading(false);
     }
   }, []);
+
+  // Passive checks never request wallet permissions or trigger a Freighter popup.
+  useEffect(() => {
+    if (!user?.walletAddress || user.walletProvider !== "freighter") {
+      setWalletNetworkWarning(null);
+      return;
+    }
+    let active = true;
+    const verify = async () => {
+      try {
+        const connected = await isConnected();
+        if (!active) return;
+        if (!connected.isConnected || connected.error) return; // extension temporarily unavailable
+        const address = await getAddress();
+        if (!active) return;
+        if (!address.address) {
+          if (!address.error) return;
+          // An inaccessible/locked wallet is not an authenticated session.
+          setUser(current => {
+            if (!current || current.walletProvider !== "freighter") return current;
+            const next = { ...current, walletAddress: undefined, walletProvider: undefined };
+            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
+            return next;
+          });
+          return;
+        }
+        setUser(current => {
+          if (!current || current.walletProvider !== "freighter" || current.walletAddress === address.address) return current;
+          const next = { ...current, walletAddress: address.address, linkedVaults: { ...current.linkedVaults, stellar: address.address } };
+          try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
+          return next;
+        });
+        const network = await getNetwork();
+        if (!active) return;
+        const expected = process.env.NEXT_PUBLIC_STELLAR_NETWORK || "TESTNET";
+        const actual = network.network || "";
+        setWalletNetworkWarning(actual && actual.toUpperCase() !== expected.toUpperCase()
+          ? `Freighter is connected to ${actual}, but Orbit expects ${expected}. Switch networks before making payments.`
+          : null);
+      } catch { /* Transient extension errors must not erase the merchant. */ }
+    };
+    void verify();
+    const interval = setInterval(() => { void verify(); }, 3000);
+    const visibility = () => { if (document.visibilityState === "visible") void verify(); };
+    document.addEventListener("visibilitychange", visibility);
+    return () => { active = false; clearInterval(interval); document.removeEventListener("visibilitychange", visibility); };
+  }, [user?.id, user?.walletAddress, user?.walletProvider]);
 
   const saveUserSession = (userData: MerchantUser) => {
     setUser(userData);
@@ -184,6 +236,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const updated = {
       ...user,
       walletAddress: trimmed,
+      walletProvider: "freighter" as const,
       linkedVaults: {
         ...user.linkedVaults,
         stellar: trimmed,
@@ -231,6 +284,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     saveUserSession(updated);
   };
 
+  const disconnectWallet = () => {
+    if (!user) return;
+    saveUserSession({ ...user, walletAddress: undefined, walletProvider: undefined, linkedVaults: { ...user.linkedVaults, stellar: undefined } });
+    setWalletNetworkWarning(null);
+  };
+
   const signOut = () => {
     setUser(null);
     try {
@@ -245,6 +304,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       value={{
         user,
         isLoading,
+        walletNetworkWarning,
+        disconnectWallet,
         signUp,
         signIn,
         signInWithWallet,
