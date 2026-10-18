@@ -8,6 +8,8 @@ import { xBullModule, XBULL_ID } from '@creit.tech/stellar-wallets-kit/modules/x
 import { Networks, rpc } from '@stellar/stellar-sdk';
 import { getNetworkDetails, requestAccess } from '@stellar/freighter-api';
 import { authorizePlan, authorizePlanAtomic, PendingTransactionError, pollTransaction, preflightPlan } from './soroban';
+import { authorizePlan, PendingTransactionError, pollTransaction, preflightPlan } from './soroban';
+import { assetContractId, assetKey, authorizeSwapPlan, fetchPayWithBalances, fetchSwapQuote, fromStroops, horizonUrlFor, payWithAssetsFor } from './swap';
 import { isPasskeySupported, authenticateOrRegisterPasskey, PasskeyWalletAdapter } from './passkey';
 import {
   isSessionKeySupported,
@@ -30,6 +32,9 @@ const WALLET_MODULES = [
 ];
 const DEFAULT_WALLETS = WALLET_MODULES.map(([id]) => id);
 const DEMO_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+const PLAN_CURRENCY_CODE = 'USDC';
+const SLIPPAGE_OPTIONS = [0.5, 1, 3];
+const HIGH_PRICE_IMPACT_PCT = 5;
 const RADIUS = { none: '0', sm: '4px', md: '10px', lg: '18px', full: '999px' };
 
 export default function OrbitCheckout({
@@ -63,6 +68,14 @@ export default function OrbitCheckout({
   const [pending, setPending] = useState(null);
   const [confirmingSeconds, setConfirmingSeconds] = useState(60);
   const [confirming, setConfirming] = useState(false);
+
+  // Multi-asset payment (#191): balances, selected pay-with asset, and live swap quote
+  const [payWithBalances, setPayWithBalances] = useState([]);
+  const [payWithKey, setPayWithKey] = useState('');
+  const [slippagePct, setSlippagePct] = useState(1);
+  const [swapQuote, setSwapQuote] = useState(null);
+  const [swapQuoteError, setSwapQuoteError] = useState('');
+  const [swapQuoteLoading, setSwapQuoteLoading] = useState(false);
 
   // Custom Form Fields & Validation
   const [formData, setFormData] = useState({});
@@ -337,6 +350,66 @@ export default function OrbitCheckout({
     dispatch('orbit:close');
   };
 
+  const payWithAssets = useMemo(() => payWithAssetsFor(networkPassphrase), [networkPassphrase]);
+  const horizonUrl = useMemo(() => horizonUrlFor(networkPassphrase), [networkPassphrase]);
+  const planCurrency = useMemo(() => payWithAssets.find((asset) => asset.code === PLAN_CURRENCY_CODE), [payWithAssets]);
+  const selectedPayWith = payWithBalances.find((asset) => assetKey(asset) === payWithKey)
+    || payWithBalances.find((asset) => asset.code === PLAN_CURRENCY_CODE)
+    || payWithBalances[0]
+    || null;
+  const isSwap = Boolean(selectedPayWith) && selectedPayWith.code !== PLAN_CURRENCY_CODE;
+
+  // Load the wallet's spendable balances once it connects
+  useEffect(() => {
+    if (!address || isDemo) {
+      setPayWithBalances([]);
+      return undefined;
+    }
+    let cancelled = false;
+    fetchPayWithBalances({ horizonUrl, address, assets: payWithAssets })
+      .then((balances) => { if (!cancelled) setPayWithBalances(balances); })
+      .catch(() => { if (!cancelled) setPayWithBalances([]); });
+    return () => { cancelled = true; };
+  }, [address, horizonUrl, payWithAssets, isDemo]);
+
+  // Re-quote when the pay-with asset, slippage, or plan changes (debounced)
+  useEffect(() => {
+    if (!isSwap || !plan || !planCurrency) {
+      setSwapQuote(null);
+      setSwapQuoteError('');
+      setSwapQuoteLoading(false);
+      return undefined;
+    }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setSwapQuoteLoading(true);
+      setSwapQuoteError('');
+      try {
+        const quote = await fetchSwapQuote({
+          horizonUrl,
+          sourceAsset: selectedPayWith,
+          destAsset: planCurrency,
+          destAmount: fromStroops(plan.usdc_amount),
+          slippagePct,
+        });
+        if (cancelled) return;
+        setSwapQuote(quote);
+        if (!quote) setSwapQuoteError(`No swap path is available from ${selectedPayWith.code} right now.`);
+      } catch (reason) {
+        if (!cancelled) {
+          setSwapQuote(null);
+          setSwapQuoteError(reason.message || 'Could not load a swap quote.');
+        }
+      } finally {
+        if (!cancelled) setSwapQuoteLoading(false);
+      }
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [isSwap, selectedPayWith, slippagePct, plan, planCurrency, horizonUrl]);
+
   const subscribe = async () => {
     if (!validateForm()) return;
     if (isWrongNetwork) {
@@ -352,6 +425,13 @@ export default function OrbitCheckout({
         return;
       }
 
+      if (isSwap && (!swapQuote || swapQuoteLoading)) {
+        throw new Error('Waiting for a live swap quote. Try again in a moment.');
+      }
+      if (isSwap && !plan.swap_router_address) {
+        throw new Error(`${plan.merchants?.name || 'This merchant'} does not accept ${selectedPayWith.code} yet. Choose ${PLAN_CURRENCY_CODE} to continue.`);
+      }
+
       const activeWallet = passkeyAdapter || StellarWalletsKit;
       setConfirming(true);
       setConfirmingSeconds(60);
@@ -361,6 +441,25 @@ export default function OrbitCheckout({
       // Smart wallet session delegation or passkey: execute single-confirmation atomic handshake with relayer sponsorship (#169)
       if (isSessionKey || passkeyAdapter) {
         hashes = await authorizePlanAtomic({
+      // The USDC preflight only applies to same-asset billing. A swap is checked
+      // by the contract when it runs.
+      const preflight = isSwap ? null : await preflightPlan({
+        address,
+        merchantAddress: plan.merchants.wallet_address,
+        amount: plan.usdc_amount,
+        intervalSeconds: plan.interval_seconds,
+        orbitContractId,
+        tokenContractId,
+        rpcUrl,
+        networkPassphrase,
+      });
+
+      if (preflight) setFeeEstimate(preflight);
+      setConfirming(true);
+      setConfirmingSeconds(60);
+
+      const hashes = isSwap
+        ? { approvalHash: null, vaultHash: await authorizeSwapPlan({
           wallet: activeWallet,
           address,
           merchantAddress: plan.merchants.wallet_address,
@@ -406,6 +505,12 @@ export default function OrbitCheckout({
           rpcUrl,
           networkPassphrase,
           preflight,
+          settlementTokenContractId: tokenContractId,
+          paymentTokenContractId: assetContractId(selectedPayWith, networkPassphrase),
+          routerAddress: plan.swap_router_address,
+          maxInputStroops: swapQuote.maxInputStroops,
+          rpcUrl,
+          networkPassphrase,
           onSubmitted: ({ stage, hash }) => {
             localStorage.setItem(PENDING_KEY, JSON.stringify({ stage, hash, planId: plan.id || planId }));
             setPending({ stage, hash });
@@ -413,6 +518,24 @@ export default function OrbitCheckout({
           onProgress: ({ remainingMs }) => setConfirmingSeconds(Math.ceil(remainingMs / 1000)),
         });
       }
+        }) }
+        : await authorizePlan({
+        wallet: activeWallet,
+        address,
+        merchantAddress: plan.merchants.wallet_address,
+        amount: plan.usdc_amount,
+        intervalSeconds: plan.interval_seconds,
+        orbitContractId,
+        tokenContractId,
+        rpcUrl,
+        networkPassphrase,
+        preflight,
+        onSubmitted: ({ stage, hash }) => {
+          localStorage.setItem(PENDING_KEY, JSON.stringify({ stage, hash, planId: plan.id || planId }));
+          setPending({ stage, hash });
+        },
+        onProgress: ({ remainingMs }) => setConfirmingSeconds(Math.ceil(remainingMs / 1000)),
+      });
 
       const response = await fetch(`${apiUrl}/subscriptions`, {
         method: 'POST',
@@ -503,6 +626,49 @@ export default function OrbitCheckout({
 
       <p style={styles.price}>${(Number(plan.usdc_amount) / 10000000).toFixed(2)} USDC</p>
       <p>Billed every {Math.max(1, Math.round(Number(plan.interval_seconds) / 86400))} days</p>
+
+      {/* Pay With selector and live swap quote (#191) */}
+      {address && !receipt && payWithBalances.length > 1 && (
+        <div className="orbit-pay-with" style={{ marginTop: 12, marginBottom: 12, textAlign: 'left' }}>
+          <label htmlFor="orbit-pay-with" style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 4 }}>Pay with</label>
+          <select
+            id="orbit-pay-with"
+            value={selectedPayWith ? assetKey(selectedPayWith) : ''}
+            onChange={(e) => setPayWithKey(e.target.value)}
+            disabled={processing || confirming}
+            style={{ width: '100%', padding: '10px 12px', borderRadius: 'var(--orbit-radius)', border: '1px solid var(--orbit-border)', background: 'var(--orbit-surface)', color: 'var(--orbit-text)', fontSize: 14 }}
+          >
+            {payWithBalances.map((asset) => (
+              <option key={assetKey(asset)} value={assetKey(asset)}>
+                {asset.code} (balance {Number(asset.balance).toFixed(2)})
+              </option>
+            ))}
+          </select>
+
+          {isSwap && (
+            <div role="status" style={{ marginTop: 8, fontSize: 13, color: 'var(--orbit-muted)' }}>
+              {swapQuoteLoading && <div>Fetching live swap quote...</div>}
+              {swapQuoteError && <div className="orbit-field-error" role="alert">{swapQuoteError}</div>}
+              {swapQuote && (
+                <>
+                  <div>Rate: 1 {PLAN_CURRENCY_CODE} = {swapQuote.rate.toFixed(4)} {selectedPayWith.code}</div>
+                  <div>
+                    Price impact: {swapQuote.priceImpactPct.toFixed(2)}%
+                    {swapQuote.priceImpactPct > HIGH_PRICE_IMPACT_PCT && <strong style={{ color: 'var(--orbit-error)' }}> (high)</strong>}
+                  </div>
+                  <div>You pay about {swapQuote.sourceAmount} {selectedPayWith.code}, at most {swapQuote.maxInputAmount} after slippage.</div>
+                </>
+              )}
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
+                Slippage tolerance
+                <select value={slippagePct} onChange={(e) => setSlippagePct(Number(e.target.value))} disabled={processing || confirming}>
+                  {SLIPPAGE_OPTIONS.map((option) => <option key={option} value={option}>{option}%</option>)}
+                </select>
+              </label>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Customizable Form Fields */}
       {customFields && customFields.length > 0 && !receipt && (
@@ -615,7 +781,7 @@ export default function OrbitCheckout({
             <button
               className={customClasses.button}
               style={{ ...styles.button, opacity: isWrongNetwork ? 0.6 : 1 }}
-              disabled={processing || isWrongNetwork}
+              disabled={processing || isWrongNetwork || (isSwap && (!swapQuote || swapQuoteLoading))}
               onClick={subscribe}
             >
               {processing

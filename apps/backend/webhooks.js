@@ -33,6 +33,22 @@ const verifyWebhookSignature = (signature, payloadString, secrets) => {
     });
 };
 
+// Optional hook called after every delivery attempt (dispatch and resend). The
+// alerting bridge uses it for failure telemetry. It runs off the request path, so
+// a slow or failing alert destination never delays or fails a delivery.
+let deliveryObserver = null;
+
+const setDeliveryObserver = (observer) => {
+    deliveryObserver = typeof observer === 'function' ? observer : null;
+};
+
+const notifyDeliveryObserver = (event) => {
+    if (!deliveryObserver) return;
+    Promise.resolve()
+        .then(() => deliveryObserver(event))
+        .catch((err) => console.error('Webhook delivery observer failed:', err));
+};
+
 /**
  * Dispatches an event to all active webhooks subscribed to this merchant and event type
  */
@@ -126,6 +142,8 @@ const dispatchWebhookEvent = async (supabase, {
                 .select()
                 .single();
 
+            notifyDeliveryObserver({ merchantId, webhook: wh, eventType, responseStatus, deliveryId });
+
             if (!deliveryErr && deliveryRecord) {
                 deliveries.push(deliveryRecord);
             }
@@ -213,6 +231,8 @@ const resendWebhookDelivery = async (supabase, deliveryId, fetchImpl = globalThi
         .eq('id', deliveryId)
         .select()
         .single();
+
+    notifyDeliveryObserver({ merchantId: delivery.merchant_id, webhook: wh || { id: delivery.webhook_id, url: destinationUrl }, eventType: delivery.event_type, responseStatus, deliveryId });
 
     if (updateErr) throw updateErr;
     return updated;
@@ -431,6 +451,7 @@ module.exports = {
     dispatchWebhookEvent,
     resendWebhookDelivery,
     replayWebhookEvents,
+    setDeliveryObserver,
 };
 
 

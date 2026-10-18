@@ -6,7 +6,8 @@ const { z } = require('zod');
 const { StrKey, Keypair, rpc, Networks, TransactionBuilder, Contract, Address } = require('@stellar/stellar-sdk');
 const { executeIdempotently, withBillingLock, sendResult } = require('./idempotency');
 const { API_KEY_ENVIRONMENTS, issueApiKey, requireApiKey } = require('./apiKeys');
-const { createRateLimiter } = require('./rateLimit');
+const { createRateLimiter, createStoreFromEnv } = require('./rateLimit');
+const { createReputationScorer, createHorizonWalletLookup } = require('./reputation');
 const { isRelayerError, createRelayerFromEnv } = require('./relayer');
 const { getAuditLogsQuerySchema, getClientIp, getActorAddress, writeAuditLog } = require('./audit');
 const {
@@ -17,7 +18,9 @@ const {
     dispatchWebhookEvent,
     resendWebhookDelivery,
     replayWebhookEvents,
+    setDeliveryObserver,
 } = require('./webhooks');
+const { createDeliveryAlertObserver, registerWebhookAlertRoutes } = require('./webhook-alerts');
 const {
     DUNNING_INTERVAL_DAYS,
     MAX_DUNNING_RETRIES,
@@ -27,8 +30,9 @@ const {
     processDunningRetries,
 } = require('./dunning');
 const { registerComplianceRoutes } = require('./compliance');
+const { registerDunningWorkflowRoutes, loadDunningWorkflow } = require('./dunning-workflow');
 const { registerSigningSessionRoutes } = require('./signing-sessions');
-const { registerTransactionExportRoute } = require('./transaction-report');
+const { registerTransactionExportRoute, confirmedSettlementAmount } = require('./transaction-report');
 const { registerCustomerPortalRoutes } = require('./customer-portal');
 const { registerFailureRecoveryRoutes } = require('./failure-recovery');
 const { registerAnalyticsRoutes } = require('./analytics');
@@ -58,21 +62,43 @@ if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY);
 app.use(cors());
 
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000;
-// Coarse per-IP limit on every route, public or not, so unauthenticated traffic
-// (including floods of invalid API keys) cannot exhaust the database
-const ipRateLimit = createRateLimiter({
-    windowMs: RATE_LIMIT_WINDOW_MS,
-    limit: Number(process.env.IP_RATE_LIMIT_MAX) || 300,
-    keyGenerator: (req) => req.ip,
+// Shared by every limiter and the reputation scorer: Redis (with an in-memory
+// fallback) when REDIS_URL is set, so limits hold across all API instances
+const rateLimitStore = createStoreFromEnv();
+// Wallet age is scored only when Horizon is configured; tests inject app.locals.walletLookup
+const horizonWalletLookup = process.env.HORIZON_URL
+    ? createHorizonWalletLookup({ horizonUrl: process.env.HORIZON_URL })
+    : null;
+const reputation = createReputationScorer({
+    store: rateLimitStore,
+    walletLookup: async (address) => {
+        const lookup = app.locals.walletLookup || horizonWalletLookup;
+        return lookup ? lookup(address) : null;
+    },
+    ipTrustAfterMs: Number(process.env.REPUTATION_IP_TRUST_AFTER_MS) || undefined,
 });
-// Per-API-key limit on authenticated merchant routes
-const apiKeyRateLimit = createRateLimiter({
+// Coarse per-IP limit on every route, public or not, so unauthenticated traffic
+// (including floods of invalid API keys) cannot exhaust the database. Scaled by the
+// IP's reputation: new IPs and repeat offenders get less, merchant IPs more.
+const ipRateLimit = createRateLimiter({
+    name: 'ip',
+    store: rateLimitStore,
     windowMs: RATE_LIMIT_WINDOW_MS,
-    limit: Number(process.env.API_KEY_RATE_LIMIT_MAX) || 100,
+    limit: reputation.ipLimit(Number(process.env.IP_RATE_LIMIT_MAX) || 300),
+    keyGenerator: (req) => req.ip,
+    onLimitReached: (req) => reputation.recordViolation(req.ip),
+});
+// Per-API-key limit on authenticated merchant routes, scaled by key tier and wallet age
+const apiKeyRateLimit = createRateLimiter({
+    name: 'key',
+    store: rateLimitStore,
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: reputation.apiKeyLimit(Number(process.env.API_KEY_RATE_LIMIT_MAX) || 100),
     keyGenerator: (req) => req.apiKey?.id,
     message: "API key rate limit exceeded, please retry later",
 });
 app.locals.rateLimiters = { ip: ipRateLimit, apiKey: apiKeyRateLimit };
+app.locals.reputation = reputation;
 
 app.use(ipRateLimit);
 app.use(express.json());
@@ -140,6 +166,8 @@ const getPayoutSplitDispatcher = () => createPayoutSplitDispatcher({
 
 // Per-merchant throttle on relay requests, on top of the general API key limit
 const relayRateLimit = createRateLimiter({
+    name: 'relay',
+    store: rateLimitStore,
     windowMs: Number(process.env.RELAYER_RATE_LIMIT_WINDOW_MS) || 60 * 1000,
     limit: Number(process.env.RELAYER_RATE_LIMIT_MAX) || 10,
     keyGenerator: (req) => req.merchant?.id,
@@ -460,7 +488,7 @@ const loadPullContext = async (supabase, subscriptionId, merchant) => {
 };
 
 // Records the confirmed outcome of a pull transaction, whoever submitted it
-const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id, txHash, status, extraBody = {} }) => {
+const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id, txHash, status, confirmation, extraBody = {} }) => {
     if (status === "SUCCESS") {
         const pullTime = new Date();
         const nextBilling = new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
@@ -473,6 +501,7 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
                 retry_count: 0,
                 dunning_status: null,
                 next_dunning_retry_at: null,
+                last_failure: null,
             })
             .eq('id', subscription_id);
 
@@ -488,6 +517,8 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
         });
 
         if (sub.plans.merchant_id) {
+            // Fiat plans report the settled amount in raw USDC units
+            // converted at the current cached rate (#96)
             let settledAmount = sub.plans.usdc_amount;
             if (isFiatCurrency(sub.plans?.currency)) {
                 try {
@@ -502,6 +533,33 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
                     settledAmount = quote.usdc_amount;
                 } catch {
                     // Keep the stored plan amount when the cache cannot price it
+                }
+            }
+
+            // Only record amounts independently verified from the
+            // successful on-chain funds_pulled event. Plan and oracle
+            // quotes are not necessarily the vault's actual transfer.
+            const verifiedAmount = confirmedSettlementAmount(
+                confirmation,
+                { customerWallet: sub.customer_wallet_address,
+                  merchantWallet: merchant.wallet_address,
+                  contractId: process.env.ORBIT_CONTRACT_ID },
+            );
+            if (verifiedAmount === null) {
+                console.error('CRITICAL: confirmed transfer missing verified amount; reconcile transaction:', txHash);
+            } else {
+                const { error: paymentError } = await supabase.from('payment_transactions').insert([{
+                    merchant_id: sub.plans.merchant_id,
+                    subscription_id,
+                    plan_id: sub.plan_id,
+                    customer_wallet_address: sub.customer_wallet_address,
+                    amount_usdc_units: verifiedAmount,
+                    status: 'settled',
+                    tx_hash: txHash,
+                    settled_at: pullTime.toISOString(),
+                }]);
+                if (paymentError && paymentError.code !== '23505') {
+                    console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
                 }
             }
 
@@ -544,6 +602,7 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
     }
 
     if (status === "FAILED") {
+        await recordPullFailure(supabase, subscription_id, 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.', txHash);
         await markSubscriptionPastDue(supabase, subscription_id, {
             actorAddress: merchant.wallet_address,
             ipAddress: getClientIp(req),
@@ -764,7 +823,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                     intervalMs: app.locals.txPollIntervalMs ?? TX_POLL_INTERVAL_MS,
                 });
 
-                return applyPullOutcome({ supabase, req, sub, merchant, subscription_id, txHash, status: confirmation.status });
+                return applyPullOutcome({ supabase, req, sub, merchant, subscription_id, txHash, status: confirmation.status, confirmation });
             });
         });
         sendResult(res, result);
@@ -892,14 +951,6 @@ app.post('/relay/submit-pull', authenticateMerchant, relayRateLimit, async (req,
                         attempts: outcome.attempts,
                     },
                 });
-                // Still NOT_FOUND after the timeout: outcome unknown, let the caller poll later.
-                // Keep the lease until it expires so no second pull races the one still in flight.
-                await recordPullFailure(supabase, subscription_id, 'RPC timeout: transaction submitted but not yet confirmed. Do not retry until its outcome is known.', txHash);
-                return {
-                    status: 202,
-                    body: { message: "Transaction submitted but not yet confirmed; check back later", txHash },
-                    holdLock: true,
-                };
             });
         });
         if (result.status >= 500 && !result.body?.txHash) await recordPullFailure(supabase, subscription_id, result.body?.error || 'Pull submission failed');
@@ -1246,9 +1297,12 @@ app.post('/dunning/process', async (req, res) => {
         const supabase = getSupabase();
         if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
         const merchant_id = req.body?.merchant_id;
+        // Use the merchant's saved dunning workflow when one exists (#190)
+        const workflow = await loadDunningWorkflow(supabase, merchant_id);
         const result = await processDunningRetries(supabase, {
             merchantId: merchant_id,
             fetchImpl: app.locals.fetchImpl,
+            workflowSteps: workflow?.steps || null,
         });
         res.status(200).json(result);
     } catch (err) {
@@ -1813,6 +1867,13 @@ registerComplianceRoutes(app, getSupabase, authenticateMerchant);
 registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
+
+// Webhook incident alerting: Slack / PagerDuty / email channels and failure telemetry (#189)
+registerWebhookAlertRoutes(app, getSupabase, authenticateMerchant);
+
+// Dunning workflow builder: saved retry cadence, email templates and recovery funnel (#190)
+registerDunningWorkflowRoutes(app, getSupabase, authenticateMerchant);
+setDeliveryObserver(createDeliveryAlertObserver(getSupabase));
 registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
 registerCouponRoutes(app, getSupabase, authenticateMerchant);
