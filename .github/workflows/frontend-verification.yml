@@ -21,7 +21,7 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: apps/frontend/package-lock.json
-      - run: npm ci
+      - run: npm install --no-package-lock --no-audit --no-fund
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
@@ -42,5 +42,5 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: apps/backend/package-lock.json
-      - run: npm ci
+      - run: npm install --no-package-lock --no-audit --no-fund
       - run: npm test
