@@ -7,8 +7,16 @@ import { HanaModule, HANA_ID } from '@creit.tech/stellar-wallets-kit/modules/han
 import { xBullModule, XBULL_ID } from '@creit.tech/stellar-wallets-kit/modules/xbull';
 import { Networks, rpc } from '@stellar/stellar-sdk';
 import { getNetworkDetails, requestAccess } from '@stellar/freighter-api';
-import { authorizePlan, PendingTransactionError, pollTransaction, preflightPlan } from './soroban';
+import { authorizePlan, authorizePlanAtomic, PendingTransactionError, pollTransaction, preflightPlan } from './soroban';
 import { isPasskeySupported, authenticateOrRegisterPasskey, PasskeyWalletAdapter } from './passkey';
+import {
+  isSessionKeySupported,
+  createDelegatedSessionKey,
+  getActiveSessionKey,
+  revokeSessionKey,
+  SessionWalletAdapter,
+  SMART_WALLET_ID,
+} from './sessionKey';
 
 const STORAGE_KEY = 'orbit:selected-wallet';
 const PENDING_KEY = 'orbit:pending-transaction';
@@ -68,6 +76,25 @@ export default function OrbitCheckout({
   // Passkey Smart Wallet
   const [passkeyAdapter, setPasskeyAdapter] = useState(null);
   const hasPasskey = useMemo(() => isPasskeySupported(), []);
+
+  // Smart Wallet & Session Key Delegation (#169)
+  const [isSessionKey, setIsSessionKey] = useState(false);
+  const [sessionData, setSessionData] = useState(null);
+  const hasSessionKey = useMemo(() => isSessionKeySupported(), []);
+
+  useEffect(() => {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved === SMART_WALLET_ID) {
+      const activeSession = getActiveSessionKey();
+      if (activeSession) {
+        const adapter = new SessionWalletAdapter(activeSession);
+        setPasskeyAdapter(adapter);
+        setSessionData(activeSession);
+        setIsSessionKey(true);
+        setAddress(activeSession.address);
+      }
+    }
+  }, []);
 
   const actualTheme = theme === 'auto' && typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : theme;
   const rootStyle = {
@@ -257,6 +284,7 @@ export default function OrbitCheckout({
       });
       const adapter = new PasskeyWalletAdapter(keypair);
       setPasskeyAdapter(adapter);
+      setIsSessionKey(false);
       setAddress(passkeyAddress);
       setIsDemo(false);
       setReceipt(null);
@@ -271,11 +299,38 @@ export default function OrbitCheckout({
     }
   };
 
+  const connectSessionKey = async () => {
+    try {
+      setError('');
+      const session = createDelegatedSessionKey({
+        delegatedBy: formData.email || formData.name || 'Orbit Customer',
+      });
+      const adapter = new SessionWalletAdapter(session);
+      setPasskeyAdapter(adapter);
+      setSessionData(session);
+      setIsSessionKey(true);
+      setAddress(session.address);
+      setIsDemo(false);
+      setReceipt(null);
+      setShowWallets(false);
+      setIsWrongNetwork(false);
+      localStorage.setItem(STORAGE_KEY, SMART_WALLET_ID);
+      dispatch('orbit:wallet_connected', { address: session.address, type: 'smart-wallet-session', isSessionKey: true });
+    } catch (reason) {
+      const message = reason?.message || 'Failed to initialize smart wallet session.';
+      setError(message);
+      dispatch('orbit:error', { message });
+    }
+  };
+
   const disconnect = async () => {
     if (!isDemo && !passkeyAdapter) await StellarWalletsKit.disconnect().catch(() => {});
+    if (isSessionKey) revokeSessionKey();
     localStorage.removeItem(STORAGE_KEY);
     setAddress('');
     setPasskeyAdapter(null);
+    setSessionData(null);
+    setIsSessionKey(false);
     setIsDemo(false);
     setReceipt(null);
     setIsWrongNetwork(false);
@@ -298,38 +353,66 @@ export default function OrbitCheckout({
       }
 
       const activeWallet = passkeyAdapter || StellarWalletsKit;
-      const preflight = await preflightPlan({
-        address,
-        merchantAddress: plan.merchants.wallet_address,
-        amount: plan.usdc_amount,
-        intervalSeconds: plan.interval_seconds,
-        orbitContractId,
-        tokenContractId,
-        rpcUrl,
-        networkPassphrase,
-      });
-
-      setFeeEstimate(preflight);
       setConfirming(true);
       setConfirmingSeconds(60);
 
-      const hashes = await authorizePlan({
-        wallet: activeWallet,
-        address,
-        merchantAddress: plan.merchants.wallet_address,
-        amount: plan.usdc_amount,
-        intervalSeconds: plan.interval_seconds,
-        orbitContractId,
-        tokenContractId,
-        rpcUrl,
-        networkPassphrase,
-        preflight,
-        onSubmitted: ({ stage, hash }) => {
-          localStorage.setItem(PENDING_KEY, JSON.stringify({ stage, hash, planId: plan.id || planId }));
-          setPending({ stage, hash });
-        },
-        onProgress: ({ remainingMs }) => setConfirmingSeconds(Math.ceil(remainingMs / 1000)),
-      });
+      let hashes;
+
+      // Smart wallet session delegation or passkey: execute single-confirmation atomic handshake with relayer sponsorship (#169)
+      if (isSessionKey || passkeyAdapter) {
+        hashes = await authorizePlanAtomic({
+          wallet: activeWallet,
+          address,
+          merchantAddress: plan.merchants.wallet_address,
+          amount: plan.usdc_amount,
+          intervalSeconds: plan.interval_seconds,
+          orbitContractId,
+          tokenContractId,
+          rpcUrl,
+          networkPassphrase,
+          billingCycles: 12,
+          apiUrl,
+          sponsorFees: true,
+          includeTrustline: true,
+          assetCode: 'USDC',
+          onSubmitted: ({ stage, hash, sponsored }) => {
+            localStorage.setItem(PENDING_KEY, JSON.stringify({ stage, hash, planId: plan.id || planId, sponsored }));
+            setPending({ stage, hash, sponsored });
+          },
+          onProgress: ({ remainingMs }) => setConfirmingSeconds(Math.ceil(remainingMs / 1000)),
+        });
+      } else {
+        const preflight = await preflightPlan({
+          address,
+          merchantAddress: plan.merchants.wallet_address,
+          amount: plan.usdc_amount,
+          intervalSeconds: plan.interval_seconds,
+          orbitContractId,
+          tokenContractId,
+          rpcUrl,
+          networkPassphrase,
+        });
+
+        setFeeEstimate(preflight);
+
+        hashes = await authorizePlan({
+          wallet: activeWallet,
+          address,
+          merchantAddress: plan.merchants.wallet_address,
+          amount: plan.usdc_amount,
+          intervalSeconds: plan.interval_seconds,
+          orbitContractId,
+          tokenContractId,
+          rpcUrl,
+          networkPassphrase,
+          preflight,
+          onSubmitted: ({ stage, hash }) => {
+            localStorage.setItem(PENDING_KEY, JSON.stringify({ stage, hash, planId: plan.id || planId }));
+            setPending({ stage, hash });
+          },
+          onProgress: ({ remainingMs }) => setConfirmingSeconds(Math.ceil(remainingMs / 1000)),
+        });
+      }
 
       const response = await fetch(`${apiUrl}/subscriptions`, {
         method: 'POST',
@@ -520,8 +603,14 @@ export default function OrbitCheckout({
         (address ? (
           <>
             <p>
-              <strong>{isDemo ? 'Demo address' : passkeyAdapter ? 'Passkey account' : 'Wallet'}:</strong> {address.slice(0, 8)}...{address.slice(-5)}
+              <strong>{isDemo ? 'Demo address' : isSessionKey ? '⚡ Smart Wallet Session' : passkeyAdapter ? 'Passkey account' : 'Wallet'}:</strong> {address.slice(0, 8)}...{address.slice(-5)}
             </p>
+            {isSessionKey && (
+              <div style={{ marginBottom: 12, padding: '6px 10px', background: 'rgba(16, 185, 129, 0.1)', border: '1px solid rgba(16, 185, 129, 0.3)', borderRadius: 'var(--orbit-radius)', fontSize: 12, color: '#059669', display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span>⚡</span>
+                <span><strong>Delegated Session Active:</strong> Zero network gas fees (relayer sponsored) & 1-click single confirmation.</span>
+              </div>
+            )}
             {isDemo && <p role="note">Demo mode never signs transactions or creates a subscription.</p>}
             <button
               className={customClasses.button}
@@ -535,6 +624,8 @@ export default function OrbitCheckout({
                 ? `Switch to ${targetNetworkName} to continue`
                 : isDemo
                 ? 'Preview success state'
+                : isSessionKey
+                ? '1-Click Subscribe (Zero Gas)'
                 : 'Subscribe & Approve'}
             </button>
             <button style={styles.cancel} onClick={handleOpenWallets}>Switch wallet</button>
@@ -553,6 +644,26 @@ export default function OrbitCheckout({
       {showWallets && (
         <div role="dialog" aria-modal="true" aria-labelledby="wallet-title" style={styles.dialog}>
           <h3 id="wallet-title">Choose Payment Method</h3>
+
+          {/* Smart Wallet Session Key Option (#169) */}
+          {hasSessionKey && (
+            <button
+              style={{
+                ...styles.wallet,
+                borderColor: '#10b981',
+                background: 'rgba(16, 185, 129, 0.08)',
+                marginBottom: 12,
+              }}
+              onClick={connectSessionKey}
+            >
+              <div style={{ fontWeight: 700, display: 'flex', alignItems: 'center', gap: 6, color: '#059669' }}>
+                <span>⚡ 1-Click Smart Wallet (Zero Gas)</span>
+              </div>
+              <small style={{ color: 'var(--orbit-muted)' }}>
+                Instant onboarding with delegated session key · Zero XLM needed · Gas sponsored by Orbit Relayer
+              </small>
+            </button>
+          )}
 
           {/* Biometric Passkey Option */}
           {hasPasskey && (

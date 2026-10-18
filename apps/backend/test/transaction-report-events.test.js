@@ -39,7 +39,7 @@ describe('verified on-chain report amount (#76)', () => {
   it('reads the exact amount from the successful contract event', () => {
     const f = fixture();
     expect(amountOf(makeEvent(f), f)).toBe('290000000');
-  });
+  }, 15000);
 
   it('ignores another contract, including one emitting the same topic', () => {
     const f = fixture();

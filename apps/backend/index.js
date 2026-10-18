@@ -12,9 +12,11 @@ const { getAuditLogsQuerySchema, getClientIp, getActorAddress, writeAuditLog } =
 const {
     createWebhookSchema,
     updateWebhookSchema,
+    backfillWebhookSchema,
     generateSigningSecret,
     dispatchWebhookEvent,
     resendWebhookDelivery,
+    replayWebhookEvents,
 } = require('./webhooks');
 const {
     DUNNING_INTERVAL_DAYS,
@@ -46,6 +48,9 @@ const {
 } = require('./oracle');
 const { getDatabaseManager } = require('./db');
 const { registerPrivacyRoutes } = require('./privacy');
+const { createPayoutSplitDispatcher, registerPayoutSplitRoutes } = require('./payout-splits');
+const { createPriceIndexationWorker, registerPriceIndexationRoutes } = require('./price-indexation');
+const { registerProofRoutes } = require('./proofs');
 
 const app = express();
 // Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
@@ -483,6 +488,23 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
         });
 
         if (sub.plans.merchant_id) {
+            let settledAmount = sub.plans.usdc_amount;
+            if (isFiatCurrency(sub.plans?.currency)) {
+                try {
+                    const quote = await quoteUsdcAmount({
+                        supabase,
+                        plan: sub.plans,
+                        subscription: sub,
+                        fetchImpl: app.locals.fetchImpl,
+                        allowNetwork: false,
+                        enforceSlippage: false,
+                    });
+                    settledAmount = quote.usdc_amount;
+                } catch {
+                    // Keep the stored plan amount when the cache cannot price it
+                }
+            }
+
             await dispatchWebhookEvent(supabase, {
                 merchantId: sub.plans.merchant_id,
                 eventType: 'payment.settled',
@@ -490,7 +512,7 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
                     event: 'payment.settled',
                     subscription_id,
                     customer_wallet_address: sub.customer_wallet_address,
-                    amount: sub.plans.usdc_amount,
+                    amount: settledAmount,
                     txHash,
                     settled_at: pullTime.toISOString(),
                 },
@@ -506,7 +528,7 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
                     merchantId: sub.plans.merchant_id,
                     subscriptionId: subscription_id,
                     primaryTxHash: txHash,
-                    amountUnits: sub.plans.usdc_amount,
+                    amountUnits: settledAmount,
                     settledAt: pullTime.toISOString(),
                     fetchImpl: app.locals.fetchImpl,
                 });
@@ -536,6 +558,7 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
 
     // Still NOT_FOUND after the timeout: outcome unknown, let the caller poll later.
     // Keep the lease until it expires so no second pull races the one still in flight.
+    await recordPullFailure(supabase, subscription_id, 'RPC timeout: transaction submitted but not yet confirmed. Do not retry until its outcome is known.', txHash);
     return {
         status: 202,
         body: { message: "Transaction submitted but not yet confirmed; check back later", txHash, ...extraBody },
@@ -764,113 +787,6 @@ const relayerErrorResult = (err) => ({
 });
 
 const RELAYER_NOT_CONFIGURED = { error: "Gas sponsorship relayer is not configured", code: "relayer_unavailable" };
-                if (confirmation.status === "SUCCESS") {
-                    const pullTime = new Date();
-                    const nextBilling = new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
-
-                    await supabase
-                        .from('subscriptions')
-                        .update({
-                            next_billing_date: nextBilling.toISOString(),
-                            status: 'active',
-                            retry_count: 0,
-                            dunning_status: null,
-                            next_dunning_retry_at: null,
-                            last_failure: null,
-                        })
-                        .eq('id', subscription_id);
-
-                    await writeAuditLog(supabase, {
-                        merchantId: sub.plans.merchant_id,
-                        actorAddress: getActorAddress(req, merchant.wallet_address),
-                        action: 'pull.execute',
-                        resourceType: 'subscription',
-                        resourceId: subscription_id,
-                        ipAddress: getClientIp(req),
-                        changesBefore: { next_billing_date: sub.next_billing_date, status: sub.status },
-                        changesAfter: { next_billing_date: nextBilling.toISOString(), status: 'active', txHash, amount: String(sub.plans.usdc_amount) },
-                    });
-
-                    if (sub.plans.merchant_id) {
-                        // Fiat plans report the settled amount in raw USDC units
-                        // converted at the current cached rate (#96)
-                        let settledAmount = sub.plans.usdc_amount;
-                        if (isFiatCurrency(sub.plans?.currency)) {
-                            try {
-                                const quote = await quoteUsdcAmount({
-                                    supabase,
-                                    plan: sub.plans,
-                                    subscription: sub,
-                                    fetchImpl: app.locals.fetchImpl,
-                                    allowNetwork: false,
-                                    enforceSlippage: false,
-                                });
-                                settledAmount = quote.usdc_amount;
-                            } catch {
-                                // Keep the stored plan amount when the cache cannot price it
-                            }
-                        }
-
-                        // Only record amounts independently verified from the
-                        // successful on-chain funds_pulled event. Plan and oracle
-                        // quotes are not necessarily the vault's actual transfer.
-                        const verifiedAmount = require('./transaction-report').confirmedSettlementAmount(
-                            confirmation,
-                            { customerWallet: sub.customer_wallet_address,
-                              merchantWallet: merchant.wallet_address,
-                              contractId: process.env.ORBIT_CONTRACT_ID },
-                        );
-                        if (verifiedAmount === null) {
-                            console.error('CRITICAL: confirmed transfer missing verified amount; reconcile transaction:', txHash);
-                        } else {
-                            const { error: paymentError } = await supabase.from('payment_transactions').insert([{
-                                merchant_id: sub.plans.merchant_id,
-                                subscription_id,
-                                plan_id: sub.plan_id,
-                                customer_wallet_address: sub.customer_wallet_address,
-                                amount_usdc_units: verifiedAmount,
-                                status: 'settled',
-                                tx_hash: txHash,
-                                settled_at: pullTime.toISOString(),
-                            }]);
-                            if (paymentError && paymentError.code !== '23505') {
-                                console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
-                            }
-                        }
-
-                        await dispatchWebhookEvent(supabase, {
-                            merchantId: sub.plans.merchant_id,
-                            eventType: 'payment.settled',
-                            payload: {
-                                event: 'payment.settled',
-                                subscription_id,
-                                customer_wallet_address: sub.customer_wallet_address,
-                                amount: settledAmount,
-                                txHash,
-                                settled_at: pullTime.toISOString(),
-                            },
-                            fetchImpl: app.locals.fetchImpl,
-                        });
-                    }
-
-                    return {
-                        status: 200,
-                        body: { message: "Successfully pulled funds on-chain!", txHash },
-                    };
-                }
-
-                if (confirmation.status === "FAILED") {
-                    let failureReason = 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.';
-                    try {
-                        const simulation = await server.simulateTransaction(signedTx);
-                        if (simulation.error) failureReason = simulation.error;
-                    } catch { /* keep the original failure when RPC diagnostics are unavailable */ }
-                    await recordPullFailure(supabase, subscription_id, failureReason, txHash);
-                    await markSubscriptionPastDue(supabase, subscription_id, {
-                        actorAddress: merchant.wallet_address,
-                        ipAddress: getClientIp(req),
-                        fetchImpl: app.locals.fetchImpl,
-                    });
 
 app.post('/relay/prepare-pull', authenticateMerchant, relayRateLimit, async (req, res) => {
     const parseResult = triggerPullSchema.safeParse(req.body);
@@ -1006,6 +922,28 @@ app.get('/relay/budget', authenticateMerchant, async (req, res) => {
         console.error("Error submitting pull:", err);
         if (ownedSubscriptionId) await recordPullFailure(getSupabase(), ownedSubscriptionId, err.message).catch(console.error);
         res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * POST /relay/sponsor-transaction (#169)
+ * Allows the checkout widget to submit atomic batch transactions sponsored by the relayer.
+ */
+app.post('/relay/sponsor-transaction', relayRateLimit, async (req, res) => {
+    try {
+        const { tx_xdr, network_passphrase } = req.body || {};
+        if (!tx_xdr) return res.status(400).json({ error: 'tx_xdr is required' });
+        const relayer = getRelayer();
+        if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+        const result = await relayer.sponsorTransaction({
+            txXdr: tx_xdr,
+            passphrase: network_passphrase || process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+        });
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('Error sponsoring transaction:', err);
+        return res.status(500).json({ error: err.message || 'Fee sponsorship failed' });
     }
 });
 
@@ -1836,8 +1774,44 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
     res.json({ webhook: data, signing_secret: secret });
 });
 
+app.post('/webhooks/:id/backfill', async (req, res) => {
+    const parseResult = backfillWebhookSchema.safeParse(req.body || {});
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    try {
+        const { id } = req.params;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { event_types, start_date, end_date } = parseResult.data;
+        const result = await replayWebhookEvents(supabase, {
+            webhookId: id,
+            eventTypes: event_types,
+            startDate: start_date,
+            endDate: end_date,
+            fetchImpl: app.locals.fetchImpl,
+        });
+
+        res.status(200).json({
+            message: "Webhook backfill completed successfully",
+            total_events: result.total_events,
+            replayed_count: result.replayed_count,
+            deliveries: result.deliveries,
+        });
+    } catch (err) {
+        if (err.status === 404 || err.message === 'Webhook not found') {
+            return res.status(404).json({ error: "Webhook not found" });
+        }
+        console.error("Error executing webhook backfill:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
 registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
+registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
 registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);

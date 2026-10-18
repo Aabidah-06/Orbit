@@ -353,14 +353,29 @@ const createRelayer = ({
         };
     };
 
+    const sponsorTransaction = async ({ txXdr, passphrase = networkPassphrase }) => {
+        const innerTx = TransactionBuilder.fromXDR(txXdr, passphrase);
+        const feeBump = TransactionBuilder.buildFeeBumpTransaction(sponsor, String(opts.baseFee * 2), innerTx, passphrase);
+        feeBump.sign(sponsor);
+        const submission = await server.sendTransaction(feeBump);
+        return {
+            txHash: submission.hash,
+            status: submission.status,
+            sponsored: true,
+            sponsorAddress: sponsor.publicKey(),
+        };
+    };
+
     return {
         sponsorAddress: sponsor.publicKey(),
+        sponsorKeypair: sponsor,
         pool,
         sequences,
         preparePullAuthorization,
         verifyPullAuthorization,
         relayPull,
         budgetStatus,
+        sponsorTransaction,
     };
 };
 
