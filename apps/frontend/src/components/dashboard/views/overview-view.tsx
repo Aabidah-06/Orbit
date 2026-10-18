@@ -1,5 +1,6 @@
 "use client";
 
+import { PriceDisplay } from "@/components/ui/price-display";
 import { useEffect, useMemo, useState } from "react";
 import {
   Wallet,
@@ -393,7 +394,7 @@ const session = await verifyAnalyticsSignature(
           ) : analytics.points.slice(-4).reverse().map(point => (
             <div key={point.date} className="py-3 flex justify-between items-center gap-3">
               <span className="text-sm text-neutral-600">{point.date} (UTC)</span>
-              <strong className="text-sm font-mono text-black">{formatRawUsdc(point.amount_usdc_units)} USDC</strong>
+              <strong className="text-sm font-mono text-black"><PriceDisplay amount={Number(point.amount_usdc_units) / 10000000} /></strong>
             </div>
           ))}
         </div>
