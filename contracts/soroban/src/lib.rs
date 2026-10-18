@@ -169,6 +169,8 @@ pub enum DataKey {
     /// Id the next payroll escrow deposit will receive
     NextPayrollEscrowId,
     PayrollEscrow(u64),
+    /// Router a merchant has pre-approved for cross-asset subscriptions (#191)
+    TrustedSwapRouter(Address, Address),
 }
 
 /// Storage key for a metered (usage-based) vault (#46). An enum on purpose:
@@ -791,6 +793,104 @@ impl OrbitContract {
         env.storage()
             .persistent()
             .remove(&SubscriptionKey::Swap(user, merchant));
+    }
+
+    /// Merchant pre-approves a Soroban AMM router that subscribers may use to pay
+    /// in another asset (#191). Routers that are not approved here can never back
+    /// a swap subscription, so the subscriber can't pick an arbitrary router.
+    pub fn approve_swap_router(env: Env, merchant: Address, router: Address) {
+        merchant.require_auth();
+        let key = DataKey::TrustedSwapRouter(merchant, router);
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+    }
+
+    /// Withdraws a merchant's approval of a swap router. Existing swap vaults that
+    /// use the router stop settling through it on their next pull.
+    pub fn revoke_swap_router(env: Env, merchant: Address, router: Address) {
+        merchant.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TrustedSwapRouter(merchant, router));
+    }
+
+    /// Subscribe and set up a cross-asset payment in a single invocation (#191).
+    /// The subscriber pays `payment_token`, the merchant settles in
+    /// `settlement_token`, and `router` converts between them on each pull.
+    ///
+    /// Vault creation, the swap config, and the payment-token allowance all happen
+    /// here, so one subscriber signature covers them and any failure reverts the
+    /// whole call. Soroban allows one contract invocation per transaction, so
+    /// this is how the subscribe-and-swap step stays atomic.
+    pub fn create_vault_with_swap(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        payment_token: Address,
+        settlement_token: Address,
+        router: Address,
+        amount_per_interval: i128,
+        interval_seconds: u64,
+        max_input_amount: i128,
+        payment_allowance: i128,
+        allowance_live_until_ledger: u32,
+    ) {
+        user.require_auth();
+        assert!(max_input_amount > 0, "Maximum input must be positive");
+        assert!(
+            payment_token != settlement_token,
+            "Use regular billing for same-token settlement"
+        );
+        assert!(
+            payment_allowance >= max_input_amount,
+            "Allowance must cover the maximum input"
+        );
+        assert!(
+            env.storage()
+                .persistent()
+                .get(&DataKey::TrustedSwapRouter(merchant.clone(), router.clone()))
+                .unwrap_or(false),
+            "Router is not approved by this merchant"
+        );
+
+        Self::create_vault(
+            env.clone(),
+            user.clone(),
+            merchant.clone(),
+            settlement_token.clone(),
+            amount_per_interval,
+            interval_seconds,
+        );
+
+        token::Client::new(&env, &payment_token).approve(
+            &user,
+            &env.current_contract_address(),
+            &payment_allowance,
+            &allowance_live_until_ledger,
+        );
+
+        let key = SubscriptionKey::Swap(user.clone(), merchant.clone());
+        env.storage().persistent().set(
+            &key,
+            &SwapConfig {
+                payment_token: payment_token.clone(),
+                settlement_token: settlement_token.clone(),
+                router,
+                max_input_amount,
+            },
+        );
+        extend_key(&env, &key, interval_seconds);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "vault_swap_configured"),
+                user,
+                merchant,
+            ),
+            (payment_token, settlement_token, max_input_amount),
+        );
     }
 
     /// Opt into dispute-protected settlement with a pre-agreed arbitrator.

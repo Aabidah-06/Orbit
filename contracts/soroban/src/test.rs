@@ -2905,3 +2905,89 @@ fn test_payroll_create_rejects_past_expiration_and_zero_amount() {
         .try_create_payroll_escrow(&sender, &recipient, &token, &0, &2_000)
         .is_err());
 }
+
+// ----------------------------------------------------------------------------
+// #191: SWAP-AND-SUBSCRIBE WITH MERCHANT-APPROVED ROUTERS
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_create_vault_with_swap_creates_vault_and_payment_allowance_in_one_call() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let router = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let payment_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let settlement_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    StellarAssetClient::new(&env, &payment_token).mint(&user, &50_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    orbit.approve_swap_router(&merchant, &router);
+
+    orbit.create_vault_with_swap(
+        &user,
+        &merchant,
+        &payment_token,
+        &settlement_token,
+        &router,
+        &10_0000000,
+        &(30 * 24 * 60 * 60),
+        &12_0000000,
+        &12_0000000,
+        &2_000_000,
+    );
+
+    let vault = orbit.get_vault(&user, &merchant).unwrap();
+    assert_eq!(vault.token, settlement_token);
+    assert_eq!(vault.amount_per_interval, 10_0000000);
+    assert_eq!(
+        TokenClient::new(&env, &payment_token).allowance(&user, &contract_id),
+        12_0000000
+    );
+}
+
+#[test]
+fn test_create_vault_with_swap_rejects_router_the_merchant_has_not_approved() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let approved_router = Address::generate(&env);
+    let rogue_router = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let payment_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let settlement_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    orbit.approve_swap_router(&merchant, &approved_router);
+
+    assert!(orbit
+        .try_create_vault_with_swap(
+            &user,
+            &merchant,
+            &payment_token,
+            &settlement_token,
+            &rogue_router,
+            &10_0000000,
+            &(30 * 24 * 60 * 60),
+            &12_0000000,
+            &12_0000000,
+            &2_000_000,
+        )
+        .is_err());
+    assert!(orbit.get_vault(&user, &merchant).is_none());
+}
