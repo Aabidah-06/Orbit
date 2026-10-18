@@ -74,7 +74,7 @@ fn fuzz_invariant_solvency_escrow_and_streams() {
     let contract_id = env.register(OrbitContract, ());
     let client = OrbitContractClient::new(&env, &contract_id);
 
-    token_client.approve(&user, &contract_id, &initial_supply, &9_999_999);
+    token_client.approve(&user, &contract_id, &initial_supply, &6_000_000);
 
     let mut rng = SplitMix64::new(0x0181_5017_E4C0_FFEE);
     let mut now: u64 = 10_000;
@@ -179,7 +179,7 @@ fn fuzz_invariant_single_pull_per_billing_interval() {
 
     let contract_id = env.register(OrbitContract, ());
     let client = OrbitContractClient::new(&env, &contract_id);
-    token_client.approve(&user, &contract_id, &initial_supply, &9_999_999);
+    token_client.approve(&user, &contract_id, &initial_supply, &6_000_000);
 
     let start_ts: u64 = 1_000_000;
     let interval: u64 = 3_600;
@@ -250,7 +250,7 @@ fn fuzz_invariant_distribution_and_metered_cap_integrity() {
 
     let contract_id = env.register(OrbitContract, ());
     let client = OrbitContractClient::new(&env, &contract_id);
-    token_client.approve(&user, &contract_id, &total_deposited, &9_999_999);
+    token_client.approve(&user, &contract_id, &total_deposited, &6_000_000);
 
     let mut now: u64 = 50_000;
     let interval: u64 = 10_000;
@@ -274,19 +274,22 @@ fn fuzz_invariant_distribution_and_metered_cap_integrity() {
         now = now.saturating_add(advance);
         env.ledger().set_timestamp(now);
 
-        if now >= epoch_start + interval {
-            epoch_start = now;
-            tracked_epoch_spent = 0;
-        }
+        // The contract rolls the epoch over inside the pull, so a rejected pull
+        // reverts the rollover too: only commit it alongside a successful pull.
+        let (next_epoch_start, spent) = if now >= epoch_start + interval {
+            (now, 0)
+        } else {
+            (epoch_start, tracked_epoch_spent)
+        };
 
         let attempt = rng.range_i128(1, 30_000_000);
+        let balance_before = token_client.balance(&user);
         let res = client.try_pull_metered_funds(&user, &merchant, &attempt);
 
-        if tracked_epoch_spent + attempt <= max_per_interval
-            && token_client.balance(&user) >= attempt
-        {
+        if spent + attempt <= max_per_interval && balance_before >= attempt {
             assert!(res.is_ok());
-            tracked_epoch_spent += attempt;
+            epoch_start = next_epoch_start;
+            tracked_epoch_spent = spent + attempt;
         } else {
             assert!(res.is_err());
         }
@@ -349,7 +352,7 @@ fn fuzz_edge_cases_zero_amounts_and_timestamp_boundaries() {
 
     let contract_id = env.register(OrbitContract, ());
     let client = OrbitContractClient::new(&env, &contract_id);
-    token_client.approve(&user, &contract_id, &1_000_000_000, &9_999_999);
+    token_client.approve(&user, &contract_id, &1_000_000_000, &6_000_000);
 
     // Edge case 1: Zero and negative amounts or intervals must always be rejected
     let r1 = client.try_create_vault(&user, &merchant, &token_address, &0, &86_400);

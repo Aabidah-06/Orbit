@@ -1824,3 +1824,18 @@
   }
 }
 
+
+/* Accessible dashboard theme (#81): focus and contrast adjustments are scoped to the app. */
+.orbit-dashboard :is(button, a, input, select, textarea):focus-visible { outline: 2px solid #2563eb; outline-offset: 3px; }
+.orbit-dashboard :is(button, a):disabled { cursor: not-allowed; opacity: .6; }
+html.dark .orbit-dashboard { background: #0b1220 !important; color: #f8fafc !important; }
+html.dark .orbit-dashboard :is(aside, header, [class~="bg-white"], [class*="bg-[#fafafb]"]) { background-color: #172338 !important; color: #f8fafc !important; }
+html.dark .orbit-dashboard [class*="bg-neutral-50"], html.dark .orbit-dashboard [class*="bg-neutral-100"] { background-color: #24334c !important; }
+html.dark .orbit-dashboard [class*="text-black"], html.dark .orbit-dashboard [class*="text-[#09090b]"], html.dark .orbit-dashboard [class*="text-neutral-800"], html.dark .orbit-dashboard [class*="text-neutral-700"] { color: #f8fafc !important; }
+html.dark .orbit-dashboard [class*="text-neutral-400"], html.dark .orbit-dashboard [class*="text-neutral-500"], html.dark .orbit-dashboard [class*="text-neutral-600"] { color: #cbd5e1 !important; }
+html.dark .orbit-dashboard [class*="border-black"] { border-color: #52627a !important; }
+html.dark .orbit-dashboard :is(input, textarea, select) { background: #111c30 !important; border-color: #64748b !important; color: #fff !important; }
+html.dark .orbit-dashboard [class*="bg-black"] { background-color: #0f172a !important; color: #fff !important; }
+html.dark .orbit-dashboard [class*="bg-emerald-50"] { background-color: #064e3b !important; }
+html.dark .orbit-dashboard [class*="text-emerald-700"], html.dark .orbit-dashboard [class*="text-emerald-600"] { color: #6ee7b7 !important; }
+@media (prefers-reduced-motion: reduce) { .orbit-dashboard *, .orbit-dashboard *::before, .orbit-dashboard *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; } }

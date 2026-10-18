@@ -1,6 +1,20 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
+import { spawnSync } from 'child_process';
+import { PGlite } from '@electric-sql/pglite';
+import {
+  MIGRATIONS_DIR,
+  MigrationError,
+  SchemaDriftError,
+  assertSchemaCurrent,
+  checkSchemaOnStartup,
+  loadMigrations,
+  migrateDown,
+  migrateUp,
+  migrationStatus,
+} from '../migrate.js';
 
 describe('Database Schema & Row Level Security (RLS) Policies', () => {
   const schemaPath = path.resolve(__dirname, '../schema.sql');
@@ -138,4 +152,162 @@ describe('Database Schema & Row Level Security (RLS) Policies', () => {
   it('contains no leftover merge conflict markers', () => {
     expect(schemaSql).not.toMatch(/^(<{7}|={7}|>{7})( |$)/m);
   });
+});
+
+describe('Migration runner and schema versioning guard (#157)', () => {
+  let db;
+  let dir;
+  const write = (file, content) => fs.writeFileSync(path.join(dir, file), content);
+  const tables = async () => (await db.query(
+    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name",
+  )).rows.map((r) => r.table_name);
+  const sql = (up, down) => `-- migrate:up\n${up}\n-- migrate:down\n${down}\n`;
+
+  // Booting PGlite is slow, so one instance is shared and the schema reset per test
+  beforeAll(async () => {
+    db = new PGlite();
+    await db.exec('CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role;');
+  }, 60000);
+  afterAll(async () => { await db?.close(); });
+
+  beforeEach(async () => {
+    await db.exec('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-migrations-'));
+    write('20260101000000_create_widgets.sql', sql('CREATE TABLE widgets (id INT PRIMARY KEY);', 'DROP TABLE widgets;'));
+    write('20260102000000_add_widget_name.sql', sql('ALTER TABLE widgets ADD COLUMN name TEXT;', 'ALTER TABLE widgets DROP COLUMN name;'));
+    write('20260103000000_seed_widgets.js', `
+      exports.up = async (db) => { await db.query("INSERT INTO widgets (id, name) VALUES (1, 'one')"); };
+      exports.down = async (db) => { await db.query('DELETE FROM widgets WHERE id = 1'); };
+    `);
+    // Pre-runner migrations use NNN-name.sql and are ignored
+    write('101-legacy.sql', 'CREATE TABLE should_not_exist (id INT);');
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('applies migrations sequentially and records checksums and duration', async () => {
+    const applied = await migrateUp(db, { dir });
+    expect(applied).toEqual(['20260101000000', '20260102000000', '20260103000000']);
+    expect(await tables()).toEqual(['schema_migrations', 'widgets']);
+    expect((await db.query('SELECT id, name FROM widgets')).rows).toEqual([{ id: 1, name: 'one' }]);
+
+    const { rows } = await db.query('SELECT version, name, checksum, execution_ms FROM schema_migrations ORDER BY version');
+    const files = loadMigrations(dir);
+    expect(rows.map((r) => r.version)).toEqual(files.map((m) => m.version));
+    rows.forEach((row, i) => {
+      expect(row.name).toBe(files[i].name);
+      expect(row.checksum).toMatch(/^[0-9a-f]{64}$/);
+      expect(row.checksum).toBe(files[i].checksum);
+      expect(row.execution_ms).toBeGreaterThanOrEqual(0);
+    });
+
+    // Re-running is a no-op
+    expect(await migrateUp(db, { dir })).toEqual([]);
+  });
+
+  it('applies a limited number of steps', async () => {
+    expect(await migrateUp(db, { dir, steps: 1 })).toEqual(['20260101000000']);
+    expect((await migrationStatus(db, { dir })).pending.map((m) => m.version)).toEqual(['20260102000000', '20260103000000']);
+  });
+
+  it('rolls back every statement of a failing migration and stops there', async () => {
+    write('20260102120000_broken.sql', sql(
+      "CREATE TABLE gadgets (id INT PRIMARY KEY);\nINSERT INTO widgets (id) VALUES (7);\nINSERT INTO no_such_table VALUES (1);",
+      'DROP TABLE gadgets;',
+    ));
+
+    const error = await migrateUp(db, { dir }).catch((err) => err);
+    expect(error).toBeInstanceOf(MigrationError);
+    expect(error.version).toBe('20260102120000');
+    expect(error.message).toMatch(/rolled back/);
+
+    // Earlier migrations stay applied; the failed one left nothing behind; later ones never ran
+    expect(await tables()).toEqual(['schema_migrations', 'widgets']);
+    expect((await db.query('SELECT count(*)::int AS n FROM widgets')).rows[0].n).toBe(0);
+    expect((await db.query('SELECT version FROM schema_migrations ORDER BY version')).rows.map((r) => r.version))
+      .toEqual(['20260101000000', '20260102000000']);
+
+    // Once fixed, the run resumes from the failed migration
+    write('20260102120000_broken.sql', sql('CREATE TABLE gadgets (id INT PRIMARY KEY);', 'DROP TABLE gadgets;'));
+    expect(await migrateUp(db, { dir })).toEqual(['20260102120000', '20260103000000']);
+  });
+
+  it('rolls back single steps with migrate:down', async () => {
+    await migrateUp(db, { dir });
+    expect(await migrateDown(db, { dir })).toEqual(['20260103000000']);
+    expect((await db.query('SELECT count(*)::int AS n FROM widgets')).rows[0].n).toBe(0);
+    expect(await migrateDown(db, { dir, steps: 2 })).toEqual(['20260102000000', '20260101000000']);
+    expect(await tables()).toEqual(['schema_migrations']);
+    expect((await db.query('SELECT count(*)::int AS n FROM schema_migrations')).rows[0].n).toBe(0);
+    expect(await migrateDown(db, { dir })).toEqual([]);
+  });
+
+  it('keeps the migration recorded when its down step fails', async () => {
+    write('20260104000000_bad_down.sql', sql('CREATE TABLE bad_down (id INT);', 'DROP TABLE bad_down;\nDROP TABLE missing_table;'));
+    await migrateUp(db, { dir });
+    await expect(migrateDown(db, { dir })).rejects.toThrow(/rolled back/);
+    expect(await tables()).toContain('bad_down');
+    expect((await migrationStatus(db, { dir })).pending).toHaveLength(0);
+  });
+
+  it('detects checksum drift and refuses to migrate or start', async () => {
+    await migrateUp(db, { dir });
+    write('20260102000000_add_widget_name.sql', sql('ALTER TABLE widgets ADD COLUMN name VARCHAR(10);', 'ALTER TABLE widgets DROP COLUMN name;'));
+
+    const status = await migrationStatus(db, { dir });
+    expect(status.mismatched.map((m) => m.version)).toEqual(['20260102000000']);
+    await expect(assertSchemaCurrent(db, { dir })).rejects.toBeInstanceOf(SchemaDriftError);
+    await expect(assertSchemaCurrent(db, { dir })).rejects.toThrow(/checksum mismatch in 20260102000000/);
+    await expect(migrateUp(db, { dir })).rejects.toBeInstanceOf(SchemaDriftError);
+    await expect(migrateDown(db, { dir, steps: 2 })).rejects.toThrow(/changed since it was applied/);
+  });
+
+  it('guards against pending migrations and migrations unknown to this build', async () => {
+    await expect(assertSchemaCurrent(db, { dir })).rejects.toThrow(/3 pending/);
+    await migrateUp(db, { dir });
+    await expect(assertSchemaCurrent(db, { dir })).resolves.toMatchObject({ pending: [], mismatched: [], missing: [] });
+
+    fs.rmSync(path.join(dir, '20260103000000_seed_widgets.js'));
+    await expect(assertSchemaCurrent(db, { dir })).rejects.toThrow(/applied but missing locally: 20260103000000/);
+  });
+
+  it('rejects duplicate versions and migrations without an up section', () => {
+    write('20260101000000_duplicate.sql', sql('SELECT 1;', ''));
+    expect(() => loadMigrations(dir)).toThrow(/Duplicate migration version 20260101000000/);
+    fs.rmSync(path.join(dir, '20260101000000_duplicate.sql'));
+    write('20260105000000_empty.sql', '-- migrate:down\nSELECT 1;');
+    expect(() => loadMigrations(dir)).toThrow(/no "-- migrate:up" section/);
+  });
+
+  it('applies and reverts the shipped migrations on top of schema.sql', async () => {
+    await db.exec(fs.readFileSync(path.resolve(__dirname, '../schema.sql'), 'utf8'));
+    const shipped = loadMigrations(MIGRATIONS_DIR);
+    expect(shipped.length).toBeGreaterThan(0);
+    for (const m of shipped) expect(m.file).toMatch(/^\d{14}_[a-z0-9_-]+\.(sql|js)$/);
+
+    expect(await migrateUp(db)).toEqual(shipped.map((m) => m.version));
+    await assertSchemaCurrent(db);
+    await migrateDown(db, { steps: shipped.length });
+    expect(await tables()).not.toContain('fiat_subscriptions');
+    expect(await migrateUp(db)).toHaveLength(shipped.length);
+  });
+
+  it('skips the startup guard when no database URL is configured', async () => {
+    const warnings = [];
+    await expect(checkSchemaOnStartup({ databaseUrl: '', logger: { warn: (m) => warnings.push(m) } })).resolves.toBeNull();
+    expect(warnings[0]).toMatch(/skipped/);
+  });
+
+  it('halts application startup when the schema cannot be verified', () => {
+    const result = spawnSync(process.execPath, [path.resolve(__dirname, '../index.js')], {
+      env: { ...process.env, DATABASE_URL: 'postgres://orbit:orbit@127.0.0.1:1/orbit', PORT: '0' },
+      encoding: 'utf8',
+      timeout: 20000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/Startup aborted/);
+    expect(result.stdout).not.toMatch(/running on/);
+  }, 30000);
 });
