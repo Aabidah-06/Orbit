@@ -25,7 +25,9 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
-      - run: npm run build
+      - name: Build production frontend even if baseline tests fail
+        if: ${{ success() || failure() }}
+        run: npm run build
         env:
           NEXT_TELEMETRY_DISABLED: '1'
   backend:
