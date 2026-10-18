@@ -219,6 +219,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         email: `merchant_${shortAddr.toLowerCase()}@orbit.network`,
         businessName: `Merchant (${shortAddr})`,
         walletAddress: walletAddress.trim(),
+        walletProvider: "freighter",
         createdAt: new Date().toISOString(),
       };
 
