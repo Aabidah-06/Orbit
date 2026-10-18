@@ -1,5 +1,6 @@
 "use client";
 
+import { PriceDisplay } from "@/components/ui/price-display";
 import { useTranslations } from "next-intl";
 import { useEffect, useState, useCallback } from "react";
 import {
@@ -599,7 +600,7 @@ export function SubscribersView() {
                       {/* Allowance Rate */}
                       <td className="py-4 px-4">
                         <div className="font-mono font-bold text-black">
-                          {sub.amount.toFixed(2)} USDC
+                          <PriceDisplay amount={sub.amount} />
                         </div>
                         <div className="text-[10px] text-neutral-400">
                           Per Cycle
@@ -609,7 +610,7 @@ export function SubscribersView() {
                       {/* Total Settled */}
                       <td className="py-4 px-4">
                         <div className="font-mono font-semibold text-black">
-                          {sub.totalSettled.toFixed(2)} USDC
+                          <PriceDisplay amount={sub.totalSettled} />
                         </div>
                         <div className="text-[10px] text-neutral-400">
                           {Math.round(sub.totalSettled / (sub.amount || 1))} pulls settled

@@ -66,8 +66,11 @@ const {
 const { getDatabaseManager } = require('./db');
 const { registerPrivacyRoutes } = require('./privacy');
 const { registerProofRoutes } = require('./proofs');
+const { registerRpcProxyRoute } = require('./rpc-proxy');
+const { registerHealthMetrics } = require('./health-metrics');
 const { captureStripeRawBody, registerStripeBillingRoutes } = require('./stripe-billing');
 const { registerCredentialRoutes } = require('./credentials');
+const { registerPaymentLinkRoutes } = require('./payment-links');
 const { checkSchemaOnStartup } = require('./migrate');
 const { createInvoiceService, registerInvoiceRoutes } = require('./invoices');
 
@@ -128,6 +131,7 @@ const getSupabase = () => getPrimarySupabase(app);
 // Merchant routes: authenticate the API key, then apply its rate limit
 const authenticateMerchant = [requireApiKey(getSupabase), reputation.markAuthenticated, apiKeyRateLimit];
 registerAnalyticsRoutes(app, getSupabase);
+registerPaymentLinkRoutes(app, getSupabase, authenticateMerchant);
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
 const getSorobanServer = (rpcUrl) => app.locals.sorobanServer || new rpc.Server(rpcUrl);
@@ -1949,6 +1953,7 @@ app.post('/webhooks/:id/backfill', async (req, res) => {
 
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
 registerInvoiceRoutes(app, getSupabase, authenticateMerchant);
+registerRpcProxyRoute(app);
 registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
@@ -1968,6 +1973,7 @@ registerPayoutSplitRoutes(app, getSupabase, authenticateMerchant, {
 });
 registerPriceIndexationRoutes(app, getSupabase, authenticateMerchant);
 registerSnapshotRoutes(app, getSupabase, authenticateMerchant, getSorobanServer);
+registerHealthMetrics(app, { getSupabase, getSorobanServer, rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org' });
 registerIndexerRoutes(app);
 registerStripeBillingRoutes(app, getSupabase, authenticateMerchant);
 const credentialService = registerCredentialRoutes(app, getSupabase, authenticateMerchant);
