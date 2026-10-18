@@ -767,6 +767,35 @@ $$;
 REVOKE EXECUTE ON FUNCTION resolve_pending_pull(UUID, UUID, TEXT, BOOLEAN, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION resolve_pending_pull(UUID, UUID, TEXT, BOOLEAN, TIMESTAMPTZ) TO service_role;
 
+-- #143: Custom branded Soroban contract deployment per merchant
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS contract_id VARCHAR(255);
+
+-- #138: GDPR/CCPA Cryptographic Data Shredding & Privacy Compliance
+CREATE TABLE IF NOT EXISTS user_encryption_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    subject_hash VARCHAR(64) NOT NULL,
+    encrypted_dek TEXT,
+    iv VARCHAR(64),
+    auth_tag VARCHAR(64),
+    status VARCHAR(32) NOT NULL DEFAULT 'active', -- 'active', 'shredded'
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    shredded_at TIMESTAMP WITH TIME ZONE,
+    UNIQUE(merchant_id, subject_hash)
+);
+CREATE INDEX IF NOT EXISTS user_encryption_keys_merchant_subject_idx ON user_encryption_keys (merchant_id, subject_hash);
+ALTER TABLE user_encryption_keys ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS compliance_deletion_certificates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    subject_hash VARCHAR(64) NOT NULL,
+    certificate_data JSONB NOT NULL,
+    signature VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS compliance_deletion_certificates_merchant_subject_idx ON compliance_deletion_certificates (merchant_id, subject_hash);
+ALTER TABLE compliance_deletion_certificates ENABLE ROW LEVEL SECURITY;
 -- 160-payout-splits.sql
 -- Automated merchant payout split engine (#160). Each settlement is split
 -- between partner treasury wallets; payout_distributions links the primary pull
@@ -897,3 +926,29 @@ ALTER TABLE contract_state_snapshots ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON TABLE contract_state_snapshots FROM PUBLIC, anon, authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON contract_state_snapshots TO service_role;
 
+-- 11. Webhook Incident Alert Channels (#189)
+-- Per-merchant destinations for endpoint incident and recovery alerts.
+-- config holds { webhook_url } for slack, { routing_key } for pagerduty, { email } for email.
+CREATE TABLE IF NOT EXISTS webhook_alert_channels (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('slack', 'pagerduty', 'email')),
+    config JSONB NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS webhook_alert_channels_merchant_id_idx ON webhook_alert_channels (merchant_id);
+
+-- Cross-asset checkout (#191): router a merchant has approved on-chain for swap subscriptions.
+-- The checkout widget reads this to route swap subscriptions through an approved router.
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS swap_router_address VARCHAR(56);
+
+-- 12. Dunning Workflows (#190)
+-- A merchant's retry cadence and per-step email templates. Without a row the
+-- default Day 1 / 3 / 5 / 7 schedule applies.
+CREATE TABLE IF NOT EXISTS dunning_workflows (
+    merchant_id UUID PRIMARY KEY REFERENCES merchants(id) ON DELETE CASCADE,
+    steps JSONB NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);

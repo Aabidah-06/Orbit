@@ -1,39 +1,41 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Wallet,
   ArrowUpRight,
-  CheckCircle2,
   AlertCircle,
   Copy,
   Check,
-  TrendingUp,
-  Clock,
   Layers,
   Send,
-  Users,
   ExternalLink,
+  FileSpreadsheet,
 } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { MerchantUser, useAuth } from "@/lib/auth-context";
 import { connectFreighter } from "@/lib/freighter";
+import { signMessage } from "@stellar/freighter-api";
+import { AnalyticsRange, MerchantAnalytics, getAnalyticsChallenge, verifyAnalyticsSignature,
+  fetchMerchantAnalytics, formatRawUsdc, plotVerifiedRevenue } from "@/lib/merchant-analytics";
 import { DashboardTab, NetworkId, NETWORKS } from "../dashboard-types";
 
 interface OverviewViewProps {
   user: MerchantUser;
   activeNetwork: NetworkId;
   onNavigateTab: (tab: DashboardTab) => void;
+  onOpenReportsWizard?: () => void;
 }
 
 export function OverviewView({
   user,
   activeNetwork,
   onNavigateTab,
+  onOpenReportsWizard,
 }: OverviewViewProps) {
   const t = useTranslations("Overview");
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
-  const [timeframe, setTimeframe] = useState<"7D" | "30D" | "ALL">("30D");
+  const [timeframe, setTimeframe] = useState<AnalyticsRange>("30D");
 
   const copyToClipboard = (text: string, key: string) => {
     navigator.clipboard.writeText(text);
@@ -63,18 +65,68 @@ export function OverviewView({
     setIsConnecting(false);
   };
 
-  // Mock settled revenue curve data points
-  const revenuePoints = [
-    { day: 1, amount: 450, x: 20, y: 130 },
-    { day: 5, amount: 920, x: 80, y: 110 },
-    { day: 10, amount: 1480, x: 140, y: 95 },
-    { day: 15, amount: 2150, x: 200, y: 80 },
-    { day: 20, amount: 3200, x: 260, y: 55 },
-    { day: 25, amount: 4100, x: 320, y: 38 },
-    { day: 30, amount: 4820, x: 380, y: 20 },
-  ];
+  const [analyticsToken, setAnalyticsToken] = useState<string | null>(null);
+  const [analytics, setAnalytics] = useState<MerchantAnalytics | null>(null);
+  const [analyticsError, setAnalyticsError] = useState("");
+  const [analyticsLoading, setAnalyticsLoading] = useState(false);
+  const [hoveredDate, setHoveredDate] = useState<string | null>(null);
 
-  const [hoveredPoint, setHoveredPoint] = useState<(typeof revenuePoints)[0] | null>(null);
+  async function connectAnalytics() {
+    setAnalyticsError("");
+    setAnalyticsLoading(true);
+    setAnalyticsToken(null);
+    setAnalytics(null);
+    try {
+      const wallet = await connectFreighter();
+      if (!wallet.ok) throw new Error(wallet.error);
+      if (user.walletAddress && wallet.address !== user.walletAddress)
+        throw new Error("Connect the wallet linked to your merchant account.");
+      const challenge = await getAnalyticsChallenge(wallet.address);
+      const signed = await signMessage(challenge.message, { address: wallet.address });
+      if (signed.error || !signed.signedMessage || signed.signerAddress !== wallet.address)
+        throw new Error(signed.error?.message || "Wallet signature was not confirmed.");
+      const signature =
+  typeof signed.signedMessage === "string"
+    ? signed.signedMessage
+    : btoa(
+        Array.from(signed.signedMessage, (byte) =>
+          String.fromCharCode(byte)
+        ).join("")
+      );
+
+const session = await verifyAnalyticsSignature(
+  challenge.challenge_id,
+  signature
+);
+      setAnalyticsToken(session.token); // read-only, short-lived; never persisted.
+    } catch (error) {
+      setAnalyticsError(error instanceof Error ? error.message : "Unable to load merchant analytics");
+    } finally {
+      setAnalyticsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!analyticsToken) return;
+    const controller = new AbortController();
+    setAnalyticsLoading(true);
+    setAnalytics(null); // do not display previous range as current.
+    setAnalyticsError("");
+    setHoveredDate(null);
+    fetchMerchantAnalytics(analyticsToken, timeframe, controller.signal)
+      .then(setAnalytics)
+      .catch(error => {
+        if (!controller.signal.aborted) setAnalyticsError(error instanceof Error ? error.message : "Unable to load analytics");
+      })
+      .finally(() => { if (!controller.signal.aborted) setAnalyticsLoading(false); });
+    return () => controller.abort();
+  }, [analyticsToken, timeframe]);
+
+  const chartPoints = useMemo(() => analytics
+    ? plotVerifiedRevenue(analytics.points, analytics.period_start, analytics.period_end)
+    : [], [analytics]);
+  const chartPath = chartPoints.map((pt, i) => `${i === 0 ? "M" : "L"} ${pt.x.toFixed(2)} ${pt.y.toFixed(2)}`).join(" ");
+  const hoveredDay = chartPoints.find(point => point.date === hoveredDate);
 
   return (
     <div className="space-y-8">
@@ -141,179 +193,112 @@ export function OverviewView({
         )}
       </div>
 
-      {/* 2. Core KPI Metrics Cards */}
+      {/* Authenticated live analytics — no API keys in browser storage. */}
+      <div className="rounded-xl border border-black/10 bg-white p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div>
+          <div className="text-sm font-semibold text-black">Verified merchant analytics</div>
+          <p className="text-xs text-neutral-500">Connect the registered merchant wallet and sign a read-only login message to view confirmed data.</p>
+        </div>
+        <button type="button" onClick={connectAnalytics} disabled={analyticsLoading}
+          className="rounded-lg bg-black text-white px-4 py-2 text-sm font-medium disabled:opacity-50">
+          {analyticsLoading ? "Loading…" : analyticsToken ? "Reconnect wallet" : "Connect analytics"}
+        </button>
+      </div>
+      {analyticsError && <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">{analyticsError}</div>}
+      {analyticsLoading && !analytics && <div role="status" className="grid grid-cols-2 lg:grid-cols-4 gap-4" aria-label="Loading live metrics">
+        {[0, 1, 2, 3].map((i) => <div key={i} className="h-24 rounded-xl animate-pulse bg-neutral-100" />)}
+      </div>}
+      {/* Core KPI metrics from verified, merchant-scoped records only. */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {/* Monthly Recurring Revenue */}
         <div className="p-5 rounded-xl bg-white border border-black/10 shadow-xs">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">
-              {t("mrr")}
-            </span>
-            <span className="text-[11px] font-mono text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200 flex items-center gap-1">
-              <TrendingUp size={11} /> +14.2%
-            </span>
+          <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">{t("mrr")}</div>
+          <div className="text-2xl font-bold text-black mt-3">
+            {!analytics || analytics.mrr_incomplete ? "—" : formatRawUsdc(analytics.mrr_usdc_units)}
+            <span className="text-sm text-neutral-500 ml-1">USDC</span>
           </div>
-          <div className="text-3xl font-bold text-black mt-2 tracking-tight">
-            4,820.00 <span className="text-sm font-semibold text-neutral-500 font-mono">USDC</span>
-          </div>
-          <div className="text-xs text-neutral-500 mt-1">
-            {t("mrrNote")}
-          </div>
+          <div className="text-xs text-neutral-500 mt-2">{analytics?.mrr_incomplete ? "Some plans lack verified USDC pricing" : t("mrrNote")}</div>
         </div>
-
-        {/* Active Subscribers */}
         <div className="p-5 rounded-xl bg-white border border-black/10 shadow-xs">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">
-              {t("activeSubscribers")}
-            </span>
-            <span className="text-[11px] font-mono text-neutral-500">
-              {t("onChain")}
-            </span>
-          </div>
-          <div className="text-3xl font-bold text-black mt-2 tracking-tight">
-            148
-          </div>
-          <div className="text-xs text-neutral-500 mt-1">
-            {t("subscribersNote")}
-          </div>
+          <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">{t("activeSubscribers")}</div>
+          <div className="text-2xl font-bold text-black mt-3">{analytics?.active_subscribers.toLocaleString("en-US") ?? "—"}</div>
+          <div className="text-xs text-neutral-500 mt-2">Current active subscriptions</div>
         </div>
-
-        {/* Batch Payroll Disbursed */}
         <div className="p-5 rounded-xl bg-white border border-black/10 shadow-xs">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">
-              {t("payrollVolume")}
-            </span>
-            <span className="text-[11px] font-mono text-neutral-500">
-              {t("oneClick")}
-            </span>
-          </div>
-          <div className="text-3xl font-bold text-black mt-2 tracking-tight">
-            18,450.00 <span className="text-sm font-semibold text-neutral-500 font-mono">USDC</span>
-          </div>
-          <div className="text-xs text-neutral-500 mt-1">
-            {t("payrollNote")}
-          </div>
+          <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">Verified settled volume</div>
+          <div className="text-2xl font-bold text-black mt-3">{formatRawUsdc(analytics?.settled_volume_usdc_units)} <span className="text-sm text-neutral-500">USDC</span></div>
+          <div className="text-xs text-neutral-500 mt-2">Confirmed payments recorded on-chain</div>
         </div>
-
-        {/* Protocol Settlement */}
         <div className="p-5 rounded-xl bg-white border border-black/10 shadow-xs">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">
-              {t("protocolSettlement")}
-            </span>
-            <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
-          </div>
-          <div className="text-3xl font-bold text-emerald-600 mt-2 tracking-tight">
-            &lt; 1.5s
-          </div>
-          <div className="text-xs text-neutral-500 mt-1">
-            {t("settlementNote")}
-          </div>
+          <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">New subscribers ({timeframe})</div>
+          <div className="text-2xl font-bold text-black mt-3">{analytics?.new_subscribers.toLocaleString("en-US") ?? "—"}</div>
+          <div className="text-xs text-neutral-500 mt-2">{analytics && analytics.previous_new_subscribers > 0
+            ? `${((analytics.new_subscribers - analytics.previous_new_subscribers) / analytics.previous_new_subscribers * 100).toFixed(1)}% vs previous period`
+            : "No previous-period comparison"}</div>
         </div>
       </div>
 
-      {/* 3. Settled Revenue Volume Chart & Quick Actions */}
+      {/* Verified revenue chart and existing quick actions */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Settled Revenue Chart (2 cols) */}
         <div className="lg:col-span-2 p-6 rounded-xl bg-white border border-black/10 shadow-xs">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-5 border-b border-black/5">
             <div>
-              <h3 className="text-base font-semibold text-black tracking-tight">
-                {t("revenueTitle")}
-              </h3>
-              <p className="text-xs text-neutral-500 mt-0.5">
-                {t("revenueDescription")}
-              </p>
+              <h3 className="text-base font-semibold text-black tracking-tight">{t("revenueTitle")}</h3>
+              <p className="text-xs text-neutral-500 mt-0.5">Confirmed USDC settlements, grouped by UTC day</p>
             </div>
-            <div className="flex items-center gap-1 bg-neutral-100 p-0.5 rounded-lg">
-              {(["7D", "30D", "ALL"] as const).map((range) => (
+            <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1 bg-neutral-100 p-0.5 rounded-lg">
+                {(["7D", "30D", "90D", "1Y"] as const).map(range => (
+                  <button type="button" key={range} aria-pressed={timeframe === range}
+                    onClick={() => setTimeframe(range)}
+                    className={`text-xs font-mono px-2.5 py-1 rounded-md transition-colors ${timeframe === range ? "bg-white text-black font-bold shadow-2xs" : "text-neutral-500 hover:text-black"}`}>{range}</button>
+                ))}
+              </div>
+              {onOpenReportsWizard && (
                 <button
-                  key={range}
-                  onClick={() => setTimeframe(range)}
-                  className={`text-xs font-mono px-2.5 py-1 rounded-md transition-colors ${
-                    timeframe === range
-                      ? "bg-white text-black font-bold shadow-2xs"
-                      : "text-neutral-500 hover:text-black"
-                  }`}
+                  type="button"
+                  onClick={onOpenReportsWizard}
+                  className="px-2.5 py-1 rounded-lg border border-black/10 bg-white text-xs font-medium text-black hover:bg-neutral-50 flex items-center gap-1.5 transition-colors shadow-2xs"
+                  title="Open Reports & Tax Reporting Wizard (#168)"
                 >
-                  {range}
+                  <FileSpreadsheet size={13} />
+                  <span>Tax Wizard</span>
                 </button>
-              ))}
+              )}
             </div>
           </div>
-
-          {/* Interactive SVG Chart */}
-          <div className="relative pt-6">
-            <div className="h-44 w-full flex items-end">
-              <svg
-                viewBox="0 0 400 150"
-                className="w-full h-full overflow-visible"
-                preserveAspectRatio="none"
-              >
-                <defs>
-                  <linearGradient id="orbitRevGradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#09090b" stopOpacity="0.12" />
-                    <stop offset="100%" stopColor="#09090b" stopOpacity="0.0" />
-                  </linearGradient>
-                </defs>
-
-                {/* Horizontal Grid lines */}
-                <line x1="0" y1="30" x2="400" y2="30" stroke="#f0f0f2" strokeDasharray="3 3" />
-                <line x1="0" y1="80" x2="400" y2="80" stroke="#f0f0f2" strokeDasharray="3 3" />
-                <line x1="0" y1="130" x2="400" y2="130" stroke="#f0f0f2" />
-
-                {/* Shaded Area */}
-                <path
-                  d="M 20 130 L 80 110 L 140 95 L 200 80 L 260 55 L 320 38 L 380 20 L 380 145 L 20 145 Z"
-                  fill="url(#orbitRevGradient)"
-                />
-
-                {/* Line Path */}
-                <path
-                  d="M 20 130 L 80 110 L 140 95 L 200 80 L 260 55 L 320 38 L 380 20"
-                  fill="none"
-                  stroke="#09090b"
-                  strokeWidth="2.5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-
-                {/* Interactive Points */}
-                {revenuePoints.map((pt, idx) => (
-                  <circle
-                    key={idx}
-                    cx={pt.x}
-                    cy={pt.y}
-                    r={hoveredPoint === pt ? 5 : 3.5}
-                    fill="#ffffff"
-                    stroke="#09090b"
-                    strokeWidth={hoveredPoint === pt ? "2.5" : "2"}
-                    className="cursor-pointer transition-all"
-                    onMouseEnter={() => setHoveredPoint(pt)}
-                    onMouseLeave={() => setHoveredPoint(null)}
-                  />
+          {!analytics ? (
+            <div className="h-56 flex items-center justify-center text-sm text-neutral-500">
+              {analyticsLoading ? "Loading verified settlements…" : "Sign with your merchant wallet to load revenue"}
+            </div>
+          ) : chartPoints.every(p => p.amount === 0) ? (
+            <div className="h-56 flex items-center justify-center text-sm text-neutral-500">No confirmed settlements in this timeframe</div>
+          ) : (
+            <div className="relative pt-6">
+              <svg viewBox="0 0 400 150" preserveAspectRatio="none" className="w-full h-44 overflow-visible" role="img" aria-label={`Verified settlement revenue for ${timeframe}`}>
+                <defs><linearGradient id="orbitLiveRevenue" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#09090b" stopOpacity="0.12" />
+                  <stop offset="100%" stopColor="#09090b" stopOpacity="0" />
+                </linearGradient></defs>
+                {[30, 80, 130].map(y => <line key={y} x1="0" y1={y} x2="400" y2={y} stroke="#f0f0f2" strokeDasharray="3 3" />)}
+                <path d={`${chartPath} L 380 145 L 20 145 Z`} fill="url(#orbitLiveRevenue)" />
+                <path d={chartPath} fill="none" stroke="#09090b" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                {chartPoints.map(pt => (
+                  <circle key={pt.date} cx={pt.x} cy={pt.y} r={hoveredDate === pt.date ? 5 : 3}
+                    fill="white" stroke="#09090b" strokeWidth="2" className="cursor-pointer"
+                    onMouseEnter={() => setHoveredDate(pt.date)} onMouseLeave={() => setHoveredDate(null)}>
+                    <title>{`${pt.date}: ${formatRawUsdc(pt.units)} USDC`}</title>
+                  </circle>
                 ))}
               </svg>
-            </div>
-
-            {/* Hover Tooltip */}
-            {hoveredPoint && (
-              <div
-                className="absolute top-2 left-1/2 -translate-x-1/2 bg-black text-white text-xs px-3 py-1.5 rounded-lg shadow-md font-mono"
-              >
-                {t("day", { day: hoveredPoint.day })}: <span className="font-bold text-emerald-400">{hoveredPoint.amount} USDC</span>
+              {hoveredDay && <div className="absolute top-0 right-0 bg-black text-white text-xs px-3 py-1.5 rounded-lg shadow-md font-mono">
+                {hoveredDay.date}: {formatRawUsdc(hoveredDay.units)} USDC
+              </div>}
+              <div className="flex justify-between text-[11px] font-mono text-neutral-400 pt-3 border-t border-black/5">
+                <span>{chartPoints[0]?.date}</span><span>{chartPoints[chartPoints.length - 1]?.date}</span>
               </div>
-            )}
-
-            {/* Bottom X-Axis labels */}
-            <div className="flex justify-between text-[11px] font-mono text-neutral-400 pt-3 border-t border-black/5">
-              {[1, 10, 20, 30].map((day) => (
-                <span key={day}>{t("day", { day })}</span>
-              ))}
             </div>
-          </div>
+          )}
+          <div className="text-xs text-neutral-500 mt-3">Settled in this period: {formatRawUsdc(analytics?.period_settled_usdc_units)} USDC</div>
         </div>
 
         {/* Quick Launch & Actions (1 col) */}
@@ -398,82 +383,19 @@ export function OverviewView({
         </div>
       </div>
 
-      {/* 4. Recent Protocol Activity Feed */}
+      {/* Recent verified settlement dates, never synthetic transaction activity. */}
       <div className="rounded-xl border border-black/10 bg-white p-6 shadow-xs">
-        <div className="flex items-center justify-between pb-4 border-b border-black/5">
-          <div>
-            <h3 className="text-base font-semibold text-black tracking-tight">
-              {t("activityTitle")}
-            </h3>
-            <p className="text-xs text-neutral-500 mt-0.5">
-              {t("activityDescription")}
-            </p>
-          </div>
-          <span className="text-xs font-mono text-neutral-500">
-            {t("realtimeFeed")}
-          </span>
-        </div>
-
-        <div className="divide-y divide-black/5">
-          <div className="py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-            <div className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
-                <CheckCircle2 size={16} />
-              </div>
-              <div>
-                <div className="text-xs font-medium text-black">
-                  {t("activityPull")} · <span className="font-mono text-neutral-600">sub_9482</span>
-                </div>
-                <div className="text-[11px] font-mono text-neutral-500 mt-0.5">
-                  {t("activityPullMeta")}
-                </div>
-              </div>
+        <h3 className="text-base font-semibold text-black tracking-tight">Recent verified settlement days</h3>
+        <p className="text-xs text-neutral-500 mt-1">Aggregated confirmed on-chain settlement records, not individual transaction receipts</p>
+        <div className="divide-y divide-black/5 mt-4">
+          {!analytics || analytics.points.length === 0 ? (
+            <p className="py-4 text-sm text-neutral-500">{analytics ? "No confirmed payments for this timeframe" : "Connect analytics to view settlement history"}</p>
+          ) : analytics.points.slice(-4).reverse().map(point => (
+            <div key={point.date} className="py-3 flex justify-between items-center gap-3">
+              <span className="text-sm text-neutral-600">{point.date} (UTC)</span>
+              <strong className="text-sm font-mono text-black">{formatRawUsdc(point.amount_usdc_units)} USDC</strong>
             </div>
-            <div className="sm:text-right">
-              <div className="font-mono text-xs font-bold text-black">+29.00 USDC</div>
-              <div className="text-[10px] text-neutral-400">{t("activityPullTime")}</div>
-            </div>
-          </div>
-
-          <div className="py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-            <div className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-full bg-neutral-100 text-black flex items-center justify-center shrink-0">
-                <Send size={15} />
-              </div>
-              <div>
-                <div className="text-xs font-medium text-black">
-                  {t("activityBatch")} · <span className="font-mono text-neutral-600">batch_4401</span>
-                </div>
-                <div className="text-[11px] font-mono text-neutral-500 mt-0.5">
-                  {t("activityBatchMeta")}
-                </div>
-              </div>
-            </div>
-            <div className="sm:text-right">
-              <div className="font-mono text-xs font-bold text-black">-3,400.00 USDC</div>
-              <div className="text-[10px] text-neutral-400">{t("activityBatchTime")}</div>
-            </div>
-          </div>
-
-          <div className="py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-            <div className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-full bg-neutral-100 text-neutral-700 flex items-center justify-center shrink-0">
-                <Users size={15} />
-              </div>
-              <div>
-                <div className="text-xs font-medium text-black">
-                  {t("activityVault")} · <span className="font-mono text-neutral-600">0x49a...bc71</span>
-                </div>
-                <div className="text-[11px] font-mono text-neutral-500 mt-0.5">
-                  {t("activityVaultMeta")}
-                </div>
-              </div>
-            </div>
-            <div className="sm:text-right">
-              <div className="font-mono text-xs text-neutral-500">{t("allowanceReady")}</div>
-              <div className="text-[10px] text-neutral-400">{t("activityVaultTime")}</div>
-            </div>
-          </div>
+          ))}
         </div>
       </div>
     </div>

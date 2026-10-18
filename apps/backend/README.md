@@ -34,6 +34,12 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `API_KEY_RATE_LIMIT_MAX` | Requests per window allowed for each API key on authenticated routes (defaults to 100) | `100` |
 | `IP_RATE_LIMIT_MAX` | Requests per window allowed for each client IP on every route (defaults to 300) | `300` |
 | `TRUST_PROXY` | Express `trust proxy` setting; set when behind a load balancer so rate limiting sees the client IP | `1` |
+| `REDIS_URL` | Redis shared by all API instances for rate limits and reputation; unset keeps them in memory per process | `redis://localhost:6379` |
+| `REDIS_COMMAND_TIMEOUT_MS` | Redis command timeout before a request falls back to in-memory limits (defaults to 250) | `250` |
+| `RATE_LIMIT_REDIS_RETRY_MS` | How long to stay on the in-memory fallback after a Redis failure (defaults to 5000) | `5000` |
+| `RATE_LIMIT_REDIS_PREFIX` | Key prefix for rate limit data in Redis (defaults to `orbit:rl:`) | `orbit:rl:` |
+| `REPUTATION_IP_TRUST_AFTER_MS` | How long an IP counts as new and gets the reduced limit (defaults to 600000) | `600000` |
+| `HORIZON_URL` | Horizon server used to look up merchant wallet age for rate limits; unset disables wallet-age scoring | `https://horizon-testnet.stellar.org` |
 | `RELAYER_SECRET_KEY` | Orbit relayer account that pays sponsored pull fees (fee-bump fee source). `/relay/*` returns 503 when unset | `S...` |
 | `RELAYER_CHANNEL_SECRET_KEYS` | Optional comma-separated channel accounts used as inner transaction sources (defaults to the relayer account) | `S...,S...` |
 | `RELAYER_DAILY_FEE_LIMIT_STROOPS` | Sponsored fee budget per merchant per UTC day (defaults to 50000000 = 5 XLM) | `50000000` |
@@ -136,12 +142,30 @@ curl -X DELETE http://localhost:3001/api-keys/<key id> -H "Authorization: Bearer
 
 ### Rate limiting
 
-Two in-memory sliding-window limits apply (default window 60 seconds):
+Sliding-window-log limits apply (default window 60 seconds):
 
-- **Per client IP** on every route, including public ones and failed authentication attempts (`IP_RATE_LIMIT_MAX`, default 300).
-- **Per API key** on authenticated routes (`API_KEY_RATE_LIMIT_MAX`, default 100).
+- **Per client IP** on every route, including public ones and failed authentication attempts (base `IP_RATE_LIMIT_MAX`, default 300).
+- **Per API key** on authenticated routes (base `API_KEY_RATE_LIMIT_MAX`, default 100).
+- **Per merchant** on `/relay/*` (see below).
 
-Responses carry `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` (seconds until the oldest counted request leaves the window) and `RateLimit-Policy`. Over the limit the API returns `429 Too Many Requests` with `Retry-After`. Counters are per process; with several API instances behind a load balancer each enforces its own limit.
+With `REDIS_URL` set, every limit lives in Redis (one sorted set per client, checked and updated by a single Lua script), so all API instances behind a load balancer enforce one shared limit. If Redis becomes unreachable each instance falls back to in-memory limits, retrying Redis every `RATE_LIMIT_REDIS_RETRY_MS`. Without `REDIS_URL` limits are per process.
+
+Each base limit is scaled by the client's reputation, stored alongside the limits:
+
+| Signal | Effect |
+|--------|--------|
+| New IP (first seen less than `REPUTATION_IP_TRUST_AFTER_MS` ago, default 10 minutes) | 0.5x the IP limit |
+| IP that authenticated with a valid API key in the last 24 hours | 4x the IP limit |
+| 429s from the IP limit in the last 15 minutes (counter restarts on every new violation) | IP limit divided by `1 + 0.25 × violations`, never below 5% |
+| `live` API key | 3x the API key limit (`test` keys 1x) |
+| Merchant wallet younger than 7 days or not on the network | 0.5x the API key limit |
+| Merchant wallet older than 90 days | 1.5x the API key limit |
+
+Wallet age is the timestamp of the account's first operation on Horizon, cached for 7 days; it is only scored when `HORIZON_URL` is set, and an unknown age is neutral.
+
+Responses carry `RateLimit-Limit` (the client's effective limit), `RateLimit-Remaining`, `RateLimit-Reset` (seconds until the oldest counted request leaves the window) and `RateLimit-Policy`. Over the limit the API returns `429 Too Many Requests` with `Retry-After`.
+
+`npm test` uses in-memory limits. To also run the Lua scripts against a real Redis, start one and run `REDIS_TEST_URL=redis://127.0.0.1:6379 npm test`.
 
 ---
 
@@ -672,6 +696,9 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
   }
   ```
 
+## Merchant verified analytics (issue #77)
+
+See [ANALYTICS.md](./ANALYTICS.md) for secure wallet login, staging migrations and metric accounting semantics.
 ## Streaming transaction CSV export (#76)
 
 Authenticated merchants can download settled on-chain payments using

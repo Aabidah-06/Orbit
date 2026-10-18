@@ -143,12 +143,34 @@ pub struct PayrollProposal {
     pub executed: bool,
 }
 
+/// A payroll deposit held in contract escrow until the recipient claims it or the
+/// sender reclaims what is left after `expiration_timestamp` (#188).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayrollEscrow {
+    pub id: u64,
+    pub sender: Address,
+    pub recipient: Address,
+    pub token: Address,
+    pub total_deposited: i128,
+    pub claimed_amount: i128,
+    pub expiration_timestamp: u64,
+    /// Set once the sender reclaims the unclaimed balance. Blocks any further
+    /// claim or reclaim, so the remaining funds can never be withdrawn twice.
+    pub reclaimed: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     /// Id the next payroll proposal will receive
     NextProposalId,
     Proposal(u64),
+    /// Id the next payroll escrow deposit will receive
+    NextPayrollEscrowId,
+    PayrollEscrow(u64),
+    /// Router a merchant has pre-approved for cross-asset subscriptions (#191)
+    TrustedSwapRouter(Address, Address),
 }
 
 /// Storage key for a metered (usage-based) vault (#46). An enum on purpose:
@@ -771,6 +793,104 @@ impl OrbitContract {
         env.storage()
             .persistent()
             .remove(&SubscriptionKey::Swap(user, merchant));
+    }
+
+    /// Merchant pre-approves a Soroban AMM router that subscribers may use to pay
+    /// in another asset (#191). Routers that are not approved here can never back
+    /// a swap subscription, so the subscriber can't pick an arbitrary router.
+    pub fn approve_swap_router(env: Env, merchant: Address, router: Address) {
+        merchant.require_auth();
+        let key = DataKey::TrustedSwapRouter(merchant, router);
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+    }
+
+    /// Withdraws a merchant's approval of a swap router. Existing swap vaults that
+    /// use the router stop settling through it on their next pull.
+    pub fn revoke_swap_router(env: Env, merchant: Address, router: Address) {
+        merchant.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TrustedSwapRouter(merchant, router));
+    }
+
+    /// Subscribe and set up a cross-asset payment in a single invocation (#191).
+    /// The subscriber pays `payment_token`, the merchant settles in
+    /// `settlement_token`, and `router` converts between them on each pull.
+    ///
+    /// Vault creation, the swap config, and the payment-token allowance all happen
+    /// here, so one subscriber signature covers them and any failure reverts the
+    /// whole call. Soroban allows one contract invocation per transaction, so
+    /// this is how the subscribe-and-swap step stays atomic.
+    pub fn create_vault_with_swap(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        payment_token: Address,
+        settlement_token: Address,
+        router: Address,
+        amount_per_interval: i128,
+        interval_seconds: u64,
+        max_input_amount: i128,
+        payment_allowance: i128,
+        allowance_live_until_ledger: u32,
+    ) {
+        user.require_auth();
+        assert!(max_input_amount > 0, "Maximum input must be positive");
+        assert!(
+            payment_token != settlement_token,
+            "Use regular billing for same-token settlement"
+        );
+        assert!(
+            payment_allowance >= max_input_amount,
+            "Allowance must cover the maximum input"
+        );
+        assert!(
+            env.storage()
+                .persistent()
+                .get(&DataKey::TrustedSwapRouter(merchant.clone(), router.clone()))
+                .unwrap_or(false),
+            "Router is not approved by this merchant"
+        );
+
+        Self::create_vault(
+            env.clone(),
+            user.clone(),
+            merchant.clone(),
+            settlement_token.clone(),
+            amount_per_interval,
+            interval_seconds,
+        );
+
+        token::Client::new(&env, &payment_token).approve(
+            &user,
+            &env.current_contract_address(),
+            &payment_allowance,
+            &allowance_live_until_ledger,
+        );
+
+        let key = SubscriptionKey::Swap(user.clone(), merchant.clone());
+        env.storage().persistent().set(
+            &key,
+            &SwapConfig {
+                payment_token: payment_token.clone(),
+                settlement_token: settlement_token.clone(),
+                router,
+                max_input_amount,
+            },
+        );
+        extend_key(&env, &key, interval_seconds);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "vault_swap_configured"),
+                user,
+                merchant,
+            ),
+            (payment_token, settlement_token, max_input_amount),
+        );
     }
 
     /// Opt into dispute-protected settlement with a pre-agreed arbitrator.
@@ -1717,6 +1837,143 @@ impl OrbitContract {
     }
 
     // --------------------------------------------------------------------
+    // PAYROLL ESCROW & UNCLAIMED RECLAMATION (#188)
+    // --------------------------------------------------------------------
+
+    /// Deposit `amount` of `token` into contract escrow for `recipient`. The
+    /// recipient may claim until `expiration_timestamp`; after that the sender can
+    /// reclaim whatever was never claimed. Returns the new payroll id.
+    pub fn create_payroll_escrow(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        amount: i128,
+        expiration_timestamp: u64,
+    ) -> u64 {
+        sender.require_auth();
+        assert!(amount > 0, "amount must be positive");
+        let now = env.ledger().timestamp();
+        assert!(
+            expiration_timestamp > now,
+            "expiration_timestamp must be in the future"
+        );
+
+        let counter_key = DataKey::NextPayrollEscrowId;
+        let id: u64 = env.storage().instance().get(&counter_key).unwrap_or(0);
+        env.storage().instance().set(
+            &counter_key,
+            &id.checked_add(1).expect("Payroll escrow ID exhausted"),
+        );
+
+        // Pull the deposit into the contract before recording it, so a failed
+        // transfer reverts the whole call and leaves no record behind.
+        token::Client::new(&env, &token).transfer_from(
+            &env.current_contract_address(),
+            &sender,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let escrow = PayrollEscrow {
+            id,
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            token: token.clone(),
+            total_deposited: amount,
+            claimed_amount: 0,
+            expiration_timestamp,
+            reclaimed: false,
+        };
+        save_payroll_escrow(&env, &escrow);
+
+        env.events().publish(
+            (Symbol::new(&env, "payroll_escrow_created"), sender, id),
+            (recipient, token, amount, expiration_timestamp),
+        );
+        id
+    }
+
+    /// Recipient withdraws up to the unclaimed balance. Claims are only accepted
+    /// while `now <= expiration_timestamp`.
+    pub fn claim_payroll_escrow(env: Env, recipient: Address, payroll_id: u64, amount: i128) {
+        recipient.require_auth();
+        assert!(amount > 0, "amount must be positive");
+
+        let mut escrow = load_payroll_escrow(&env, payroll_id);
+        assert!(escrow.recipient == recipient, "Not the payroll recipient");
+        assert!(!escrow.reclaimed, "Payroll escrow already reclaimed");
+        assert!(
+            env.ledger().timestamp() <= escrow.expiration_timestamp,
+            "Claim window has expired"
+        );
+        let unclaimed = escrow.total_deposited - escrow.claimed_amount;
+        assert!(amount <= unclaimed, "amount exceeds unclaimed balance");
+
+        escrow.claimed_amount += amount;
+        save_payroll_escrow(&env, &escrow);
+
+        token::Client::new(&env, &escrow.token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "payroll_escrow_claimed"),
+                recipient,
+                payroll_id,
+            ),
+            (escrow.token, amount),
+        );
+    }
+
+    /// Returns the unclaimed balance of a payroll escrow to its sender once the
+    /// claim window has closed (`now > expiration_timestamp`). The escrow is marked
+    /// reclaimed before any transfer, so it can only ever be reclaimed once.
+    pub fn reclaim_unclaimed_payroll(env: Env, sender: Address, payroll_id: u64) -> i128 {
+        sender.require_auth();
+
+        let mut escrow = load_payroll_escrow(&env, payroll_id);
+        assert!(escrow.sender == sender, "Not the payroll sender");
+        assert!(!escrow.reclaimed, "Payroll escrow already reclaimed");
+        assert!(
+            env.ledger().timestamp() > escrow.expiration_timestamp,
+            "Expiration timestamp has not passed"
+        );
+
+        let unclaimed = escrow.total_deposited - escrow.claimed_amount;
+        assert!(unclaimed > 0, "No unclaimed balance to reclaim");
+
+        escrow.reclaimed = true;
+        save_payroll_escrow(&env, &escrow);
+
+        token::Client::new(&env, &escrow.token).transfer(
+            &env.current_contract_address(),
+            &sender,
+            &unclaimed,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "payroll_escrow_reclaimed"),
+                sender,
+                payroll_id,
+            ),
+            (escrow.token, unclaimed),
+        );
+        unclaimed
+    }
+
+    /// Read a payroll escrow record. Requires no authorization.
+    pub fn get_payroll_escrow(env: Env, payroll_id: u64) -> Option<PayrollEscrow> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PayrollEscrow(payroll_id))
+    }
+
+    // --------------------------------------------------------------------
     // ON-CHAIN PLAN CATALOG (#95)
     // --------------------------------------------------------------------
 
@@ -1877,6 +2134,27 @@ fn load_proposal(env: &Env, proposal_id: u64) -> PayrollProposal {
         .persistent()
         .get(&DataKey::Proposal(proposal_id))
         .expect("Proposal does not exist")
+}
+
+fn load_payroll_escrow(env: &Env, payroll_id: u64) -> PayrollEscrow {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PayrollEscrow(payroll_id))
+        .expect("Payroll escrow does not exist")
+}
+
+/// Persists a payroll escrow and keeps it alive until its expiration (plus the
+/// standard margin), so a recipient can still claim right up to the deadline.
+fn save_payroll_escrow(env: &Env, escrow: &PayrollEscrow) {
+    let key = DataKey::PayrollEscrow(escrow.id);
+    env.storage().persistent().set(&key, escrow);
+    let remaining = escrow
+        .expiration_timestamp
+        .saturating_sub(env.ledger().timestamp());
+    let (threshold, extend_to) = calculate_ttl_params(remaining);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, threshold, extend_to);
 }
 
 fn save_proposal(env: &Env, proposal: &PayrollProposal) {

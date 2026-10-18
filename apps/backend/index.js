@@ -6,16 +6,21 @@ const { z } = require('zod');
 const { StrKey, Keypair, rpc, Networks, TransactionBuilder, Contract, Address } = require('@stellar/stellar-sdk');
 const { executeIdempotently, withBillingLock, sendResult } = require('./idempotency');
 const { API_KEY_ENVIRONMENTS, issueApiKey, requireApiKey } = require('./apiKeys');
-const { createRateLimiter } = require('./rateLimit');
+const { createRateLimiter, createStoreFromEnv } = require('./rateLimit');
+const { createReputationScorer, createHorizonWalletLookup } = require('./reputation');
 const { isRelayerError, createRelayerFromEnv } = require('./relayer');
 const { getAuditLogsQuerySchema, getClientIp, getActorAddress, writeAuditLog } = require('./audit');
 const {
     createWebhookSchema,
     updateWebhookSchema,
+    backfillWebhookSchema,
     generateSigningSecret,
     dispatchWebhookEvent,
     resendWebhookDelivery,
+    replayWebhookEvents,
+    setDeliveryObserver,
 } = require('./webhooks');
+const { createDeliveryAlertObserver, registerWebhookAlertRoutes } = require('./webhook-alerts');
 const {
     DUNNING_INTERVAL_DAYS,
     MAX_DUNNING_RETRIES,
@@ -25,10 +30,12 @@ const {
     processDunningRetries,
 } = require('./dunning');
 const { registerComplianceRoutes } = require('./compliance');
+const { registerDunningWorkflowRoutes, loadDunningWorkflow } = require('./dunning-workflow');
 const { registerSigningSessionRoutes } = require('./signing-sessions');
-const { registerTransactionExportRoute } = require('./transaction-report');
+const { registerTransactionExportRoute, confirmedSettlementAmount } = require('./transaction-report');
 const { registerCustomerPortalRoutes } = require('./customer-portal');
 const { registerFailureRecoveryRoutes } = require('./failure-recovery');
+const { registerAnalyticsRoutes } = require('./analytics');
 const { registerCouponRoutes, normalizeCode } = require('./coupons');
 const { registerGraphql } = require('./graphql');
 const { configuredIndexer, registerIndexerRoutes } = require('./ledger-indexer');
@@ -56,6 +63,11 @@ const {
     createSnapshotExportWorker,
     registerSnapshotRoutes,
 } = require('./contract-state-snapshot');
+const { getDatabaseManager } = require('./db');
+const { registerPrivacyRoutes } = require('./privacy');
+const { createPayoutSplitDispatcher, registerPayoutSplitRoutes } = require('./payout-splits');
+const { createPriceIndexationWorker, registerPriceIndexationRoutes } = require('./price-indexation');
+const { registerProofRoutes } = require('./proofs');
 
 const app = express();
 // Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
@@ -63,37 +75,56 @@ if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY);
 app.use(cors());
 
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000;
-// Coarse per-IP limit on every route, public or not, so unauthenticated traffic
-// (including floods of invalid API keys) cannot exhaust the database
-const ipRateLimit = createRateLimiter({
-    windowMs: RATE_LIMIT_WINDOW_MS,
-    limit: Number(process.env.IP_RATE_LIMIT_MAX) || 300,
-    keyGenerator: (req) => req.ip,
+// Shared by every limiter and the reputation scorer: Redis (with an in-memory
+// fallback) when REDIS_URL is set, so limits hold across all API instances
+const rateLimitStore = createStoreFromEnv();
+// Wallet age is scored only when Horizon is configured; tests inject app.locals.walletLookup
+const horizonWalletLookup = process.env.HORIZON_URL
+    ? createHorizonWalletLookup({ horizonUrl: process.env.HORIZON_URL })
+    : null;
+const reputation = createReputationScorer({
+    store: rateLimitStore,
+    walletLookup: async (address) => {
+        const lookup = app.locals.walletLookup || horizonWalletLookup;
+        return lookup ? lookup(address) : null;
+    },
+    ipTrustAfterMs: Number(process.env.REPUTATION_IP_TRUST_AFTER_MS) || undefined,
 });
-// Per-API-key limit on authenticated merchant routes
-const apiKeyRateLimit = createRateLimiter({
+// Coarse per-IP limit on every route, public or not, so unauthenticated traffic
+// (including floods of invalid API keys) cannot exhaust the database. Scaled by the
+// IP's reputation: new IPs and repeat offenders get less, merchant IPs more.
+const ipRateLimit = createRateLimiter({
+    name: 'ip',
+    store: rateLimitStore,
     windowMs: RATE_LIMIT_WINDOW_MS,
-    limit: Number(process.env.API_KEY_RATE_LIMIT_MAX) || 100,
+    limit: reputation.ipLimit(Number(process.env.IP_RATE_LIMIT_MAX) || 300),
+    keyGenerator: (req) => req.ip,
+    onLimitReached: (req) => reputation.recordViolation(req.ip),
+});
+// Per-API-key limit on authenticated merchant routes, scaled by key tier and wallet age
+const apiKeyRateLimit = createRateLimiter({
+    name: 'key',
+    store: rateLimitStore,
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: reputation.apiKeyLimit(Number(process.env.API_KEY_RATE_LIMIT_MAX) || 100),
     keyGenerator: (req) => req.apiKey?.id,
     message: "API key rate limit exceeded, please retry later",
 });
 app.locals.rateLimiters = { ip: ipRateLimit, apiKey: apiKeyRateLimit };
+app.locals.reputation = reputation;
 
 app.use(ipRateLimit);
 app.use(express.json());
 
-// Initialize Supabase Client
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY; // Using service role for backend logic
-let defaultSupabase = null;
-if (supabaseUrl && supabaseKey) {
-    defaultSupabase = createClient(supabaseUrl, supabaseKey);
-}
-
-const getSupabase = () => app.locals.supabase || defaultSupabase;
+// Multi-region database manager with read-replica failover (#139)
+const dbManager = getDatabaseManager();
+const getPrimarySupabase = (appInstance = app) => dbManager.getPrimaryClient(appInstance);
+const getReadSupabase = (appInstance = app) => dbManager.getReadClient(appInstance);
+const getSupabase = () => getPrimarySupabase(app);
 
 // Merchant routes: authenticate the API key, then apply its rate limit
 const authenticateMerchant = [requireApiKey(getSupabase), apiKeyRateLimit];
+registerAnalyticsRoutes(app, getSupabase);
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
 const getSorobanServer = (rpcUrl) => app.locals.sorobanServer || new rpc.Server(rpcUrl);
@@ -148,6 +179,8 @@ const getPayoutSplitDispatcher = () => createPayoutSplitDispatcher({
 
 // Per-merchant throttle on relay requests, on top of the general API key limit
 const relayRateLimit = createRateLimiter({
+    name: 'relay',
+    store: rateLimitStore,
     windowMs: Number(process.env.RELAYER_RATE_LIMIT_WINDOW_MS) || 60 * 1000,
     limit: Number(process.env.RELAYER_RATE_LIMIT_MAX) || 10,
     keyGenerator: (req) => req.merchant?.id,
@@ -301,8 +334,11 @@ app.post('/plans', authenticateMerchant, async (req, res) => {
 
     const { name, currency, interval_seconds } = parseResult.data;
     const merchant_id = req.merchant.id;
-    const supabase = getSupabase();
+    const supabase = getPrimarySupabase();
     if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+    if (!dbManager.isPrimaryHealthy()) {
+        return res.status(503).json({ error: "Primary database is currently unavailable; write operations are suspended" });
+    }
 
     const result = await executeIdempotently({
         supabase,
@@ -367,8 +403,8 @@ app.get('/plans/:id', async (req, res) => {
 
     try {
         const { id } = parseResult.data;
-        const supabase = getSupabase();
-        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+        const supabase = getReadSupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
 
         const { data, error } = await supabase
             .from('plans')
@@ -427,8 +463,8 @@ app.get('/subscribers', authenticateMerchant, async (req, res) => {
 // rate, refreshed from the live feed on a cold cache (#96).
 app.get('/rates', async (req, res) => {
     try {
-        const supabase = getSupabase();
-        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+        const supabase = getReadSupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
 
         const rates = await getSupportedRates({ supabase, fetchImpl: app.locals.fetchImpl });
         res.status(200).json(rates);
@@ -478,6 +514,7 @@ const applyPullOutcome = async ({
     signedTx = null,
     extraBody = {},
 }) => {
+const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id, txHash, status, confirmation, extraBody = {} }) => {
     if (status === "SUCCESS") {
         const pullTime = new Date();
         const nextBilling = new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
@@ -511,6 +548,8 @@ const applyPullOutcome = async ({
         });
 
         if (sub.plans.merchant_id) {
+            // Fiat plans report the settled amount in raw USDC units
+            // converted at the current cached rate (#96)
             let settledAmount = sub.plans.usdc_amount;
             if (isFiatCurrency(sub.plans?.currency)) {
                 try {
@@ -553,6 +592,30 @@ const applyPullOutcome = async ({
                     if (paymentError && paymentError.code !== '23505') {
                         console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
                     }
+            // Only record amounts independently verified from the
+            // successful on-chain funds_pulled event. Plan and oracle
+            // quotes are not necessarily the vault's actual transfer.
+            const verifiedAmount = confirmedSettlementAmount(
+                confirmation,
+                { customerWallet: sub.customer_wallet_address,
+                  merchantWallet: merchant.wallet_address,
+                  contractId: process.env.ORBIT_CONTRACT_ID },
+            );
+            if (verifiedAmount === null) {
+                console.error('CRITICAL: confirmed transfer missing verified amount; reconcile transaction:', txHash);
+            } else {
+                const { error: paymentError } = await supabase.from('payment_transactions').insert([{
+                    merchant_id: sub.plans.merchant_id,
+                    subscription_id,
+                    plan_id: sub.plan_id,
+                    customer_wallet_address: sub.customer_wallet_address,
+                    amount_usdc_units: verifiedAmount,
+                    status: 'settled',
+                    tx_hash: txHash,
+                    settled_at: pullTime.toISOString(),
+                }]);
+                if (paymentError && paymentError.code !== '23505') {
+                    console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
                 }
             }
 
@@ -605,6 +668,7 @@ const applyPullOutcome = async ({
             }
             await recordPullFailure(supabase, subscription_id, failureReason, txHash);
         }
+        await recordPullFailure(supabase, subscription_id, 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.', txHash);
         await markSubscriptionPastDue(supabase, subscription_id, {
             actorAddress: merchant.wallet_address,
             ipAddress: getClientIp(req),
@@ -627,6 +691,7 @@ const applyPullOutcome = async ({
             txHash,
         );
     }
+    await recordPullFailure(supabase, subscription_id, 'RPC timeout: transaction submitted but not yet confirmed. Do not retry until its outcome is known.', txHash);
     return {
         status: 202,
         body: { message: "Transaction submitted but not yet confirmed; check back later", txHash, ...extraBody },
@@ -844,6 +909,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                     server,
                     signedTx,
                 });
+                return applyPullOutcome({ supabase, req, sub, merchant, subscription_id, txHash, status: confirmation.status, confirmation });
             });
         });
         sendResult(res, result);
@@ -971,14 +1037,6 @@ app.post('/relay/submit-pull', authenticateMerchant, relayRateLimit, async (req,
                         attempts: outcome.attempts,
                     },
                 });
-                // Still NOT_FOUND after the timeout: outcome unknown, let the caller poll later.
-                // Keep the lease until it expires so no second pull races the one still in flight.
-                await recordPullFailure(supabase, subscription_id, 'RPC timeout: transaction submitted but not yet confirmed. Do not retry until its outcome is known.', txHash);
-                return {
-                    status: 202,
-                    body: { message: "Transaction submitted but not yet confirmed; check back later", txHash },
-                    holdLock: true,
-                };
             });
         });
         if (result.status >= 500 && !result.body?.txHash) await recordPullFailure(supabase, subscription_id, result.body?.error || 'Pull submission failed');
@@ -1004,6 +1062,28 @@ app.get('/relay/budget', authenticateMerchant, async (req, res) => {
     }
 });
 
+/**
+ * POST /relay/sponsor-transaction (#169)
+ * Allows the checkout widget to submit atomic batch transactions sponsored by the relayer.
+ */
+app.post('/relay/sponsor-transaction', relayRateLimit, async (req, res) => {
+    try {
+        const { tx_xdr, network_passphrase } = req.body || {};
+        if (!tx_xdr) return res.status(400).json({ error: 'tx_xdr is required' });
+        const relayer = getRelayer();
+        if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+        const result = await relayer.sponsorTransaction({
+            txXdr: tx_xdr,
+            passphrase: network_passphrase || process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+        });
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('Error sponsoring transaction:', err);
+        return res.status(500).json({ error: err.message || 'Fee sponsorship failed' });
+    }
+});
+
 // ==========================================
 // ROUTE 5: POST /subscriptions (Create Subscription after Handshake)
 // ==========================================
@@ -1014,8 +1094,11 @@ app.post('/subscriptions', async (req, res) => {
     }
 
     const { plan_id, customer_wallet_address, metadata, coupon_code } = parseResult.data;
-    const supabase = getSupabase();
+    const supabase = getPrimarySupabase();
     if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+    if (!dbManager.isPrimaryHealthy()) {
+        return res.status(503).json({ error: "Primary database is currently unavailable; write operations are suspended" });
+    }
 
     const result = await executeIdempotently({
         supabase,
@@ -1300,9 +1383,12 @@ app.post('/dunning/process', async (req, res) => {
         const supabase = getSupabase();
         if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
         const merchant_id = req.body?.merchant_id;
+        // Use the merchant's saved dunning workflow when one exists (#190)
+        const workflow = await loadDunningWorkflow(supabase, merchant_id);
         const result = await processDunningRetries(supabase, {
             merchantId: merchant_id,
             fetchImpl: app.locals.fetchImpl,
+            workflowSteps: workflow?.steps || null,
         });
         res.status(200).json(result);
     } catch (err) {
@@ -1828,8 +1914,52 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
     res.json({ webhook: data, signing_secret: secret });
 });
 
+app.post('/webhooks/:id/backfill', async (req, res) => {
+    const parseResult = backfillWebhookSchema.safeParse(req.body || {});
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    try {
+        const { id } = req.params;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { event_types, start_date, end_date } = parseResult.data;
+        const result = await replayWebhookEvents(supabase, {
+            webhookId: id,
+            eventTypes: event_types,
+            startDate: start_date,
+            endDate: end_date,
+            fetchImpl: app.locals.fetchImpl,
+        });
+
+        res.status(200).json({
+            message: "Webhook backfill completed successfully",
+            total_events: result.total_events,
+            replayed_count: result.replayed_count,
+            deliveries: result.deliveries,
+        });
+    } catch (err) {
+        if (err.status === 404 || err.message === 'Webhook not found') {
+            return res.status(404).json({ error: "Webhook not found" });
+        }
+        console.error("Error executing webhook backfill:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
+registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
+registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
+
+// Webhook incident alerting: Slack / PagerDuty / email channels and failure telemetry (#189)
+registerWebhookAlertRoutes(app, getSupabase, authenticateMerchant);
+
+// Dunning workflow builder: saved retry cadence, email templates and recovery funnel (#190)
+registerDunningWorkflowRoutes(app, getSupabase, authenticateMerchant);
+setDeliveryObserver(createDeliveryAlertObserver(getSupabase));
 registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
 registerCouponRoutes(app, getSupabase, authenticateMerchant);
@@ -1842,17 +1972,54 @@ registerSnapshotRoutes(app, getSupabase, authenticateMerchant, getSorobanServer)
 registerIndexerRoutes(app);
 app.locals.graphqlServer = registerGraphql(app, getSupabase, authenticateMerchant);
 
+// Merchant profile & custom contract persistence (#143)
+app.get('/merchant/profile', authenticateMerchant, async (req, res) => {
+    try {
+        const supabase = getReadSupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
+        const { data, error } = await supabase
+            .from('merchants')
+            .select('id, name, wallet_address, contract_id, created_at')
+            .eq('id', req.merchant.id)
+            .single();
+        if (error) throw error;
+        res.status(200).json({ merchant: data });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.patch('/merchant/profile', authenticateMerchant, async (req, res) => {
+    try {
+        const supabase = getPrimarySupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
+        if (!dbManager.isPrimaryHealthy()) {
+            return res.status(503).json({ error: "Primary database is currently unavailable; write operations are suspended" });
+        }
+        const updates = {};
+        if (typeof req.body?.name === 'string' && req.body.name.trim()) {
+            updates.name = req.body.name.trim();
+        }
+        if (typeof req.body?.contract_id === 'string' && req.body.contract_id.trim()) {
+            updates.contract_id = req.body.contract_id.trim();
+        }
+        const { data, error } = await supabase
+            .from('merchants')
+            .update(updates)
+            .eq('id', req.merchant.id)
+            .select('id, name, wallet_address, contract_id, created_at')
+            .single();
+        if (error) throw error;
+        res.status(200).json({ merchant: data });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // PostgreSQL protocol cursor: unlike Supabase REST pagination, the cursor
 // never materializes the full transaction table in application memory.
-let reportPool;
 const getReportPool = () => {
-    if (app.locals.reportPool) return app.locals.reportPool;
-    if (!process.env.DATABASE_URL) return null;
-    if (!reportPool) {
-        const { Pool } = require('pg');
-        reportPool = new Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
-    }
-    return reportPool;
+    return dbManager.getReportPool(app, { readOnly: true });
 };
 registerTransactionExportRoute(
     app, authenticateMerchant, getReportPool,

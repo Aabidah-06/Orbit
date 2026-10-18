@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const { dispatchWebhookEvent } = require('./webhooks');
 const { writeAuditLog } = require('./audit');
+const { renderDunningTemplate } = require('./dunning-workflow');
 
 // Dunning retry intervals: Day 1, Day 3, Day 5, Day 7
 const DUNNING_INTERVAL_DAYS = [1, 3, 5, 7];
@@ -18,6 +19,32 @@ const calculateNextDunningRetry = (retryIndex, baseDate = new Date()) => {
     }
     const daysToAdd = DUNNING_INTERVAL_DAYS[retryIndex];
     return new Date(baseDate.getTime() + daysToAdd * 24 * 60 * 60 * 1000);
+};
+
+const addDays = (date, days) => new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
+
+/**
+ * Builds the email copy for a workflow step. Placeholders are filled from the
+ * subscription, plan and recovery link. The copy is returned in the webhook
+ * payload so the merchant can send it.
+ */
+const renderWorkflowStep = (step, stepIndex, sub, recoveryUrl) => {
+    const vars = {
+        plan_name: sub.plans?.name,
+        amount: sub.plans?.usdc_amount ? `${(Number(sub.plans.usdc_amount) / 10000000).toFixed(2)} USDC` : undefined,
+        customer_wallet: sub.customer_wallet_address,
+        recovery_url: recoveryUrl,
+        day: step.day,
+        discount_pct: step.grace_discount_pct,
+    };
+    return {
+        index: stepIndex,
+        day: step.day,
+        step_type: step.step_type,
+        retry_pull: step.retry_pull,
+        email_subject: renderDunningTemplate(step.email_subject, vars),
+        email_body: renderDunningTemplate(step.email_body, vars),
+    };
 };
 
 /**
@@ -45,6 +72,7 @@ const markSubscriptionPastDue = async (supabase, subscriptionId, {
     ipAddress = null,
     now = new Date(),
     fetchImpl = globalThis.fetch,
+    workflowSteps = null,
 } = {}) => {
     if (!supabase || !subscriptionId) return null;
 
@@ -57,7 +85,9 @@ const markSubscriptionPastDue = async (supabase, subscriptionId, {
 
     if (subErr || !sub) return null;
 
-    const nextRetryDate = calculateNextDunningRetry(0, now);
+    const nextRetryDate = workflowSteps?.length
+        ? addDays(now, workflowSteps[0].day)
+        : calculateNextDunningRetry(0, now);
     const merchantId = sub.plans?.merchant_id;
     const recovery = generateRecoveryLink(subscriptionId, { planId: sub.plan_id });
 
@@ -120,7 +150,13 @@ const processDunningRetries = async (supabase, {
     merchantId = null,
     now = new Date(),
     fetchImpl = globalThis.fetch,
+    workflowSteps = null,
 } = {}) => {
+    // A merchant's saved workflow sets the retry days and how many attempts run.
+    // Without one, the default Day 1 / 3 / 5 / 7 schedule applies.
+    const hasWorkflow = Array.isArray(workflowSteps) && workflowSteps.length > 0;
+    const maxRetries = hasWorkflow ? workflowSteps.length : MAX_DUNNING_RETRIES;
+
     if (!supabase) return { processed: 0, results: [] };
 
     let query = supabase
@@ -150,7 +186,7 @@ const processDunningRetries = async (supabase, {
         const currentMerchantId = sub.plans?.merchant_id;
         const recovery = generateRecoveryLink(sub.id);
 
-        if (newRetryCount >= MAX_DUNNING_RETRIES) {
+        if (newRetryCount >= maxRetries) {
             // 7 days elapsed / 4 attempts exhausted -> permanently transition to cancelled
             const changesBefore = {
                 status: sub.status,
@@ -201,7 +237,10 @@ const processDunningRetries = async (supabase, {
             });
         } else {
             // Schedule next retry (e.g. Day 3, Day 5, Day 7)
-            const nextDate = calculateNextDunningRetry(newRetryCount, now);
+            // Next attempt is spaced from this one by the workflow's day gap
+            const nextDate = hasWorkflow
+                ? addDays(now, workflowSteps[newRetryCount].day - workflowSteps[newRetryCount - 1].day)
+                : calculateNextDunningRetry(newRetryCount, now);
             const changesBefore = {
                 retry_count: sub.retry_count,
                 dunning_status: sub.dunning_status,
@@ -239,6 +278,9 @@ const processDunningRetries = async (supabase, {
                         retry_count: newRetryCount,
                         next_retry_at: changesAfter.next_dunning_retry_at,
                         recovery_url: recovery.recovery_url,
+                        ...(hasWorkflow
+                            ? { step: renderWorkflowStep(workflowSteps[newRetryCount - 1], newRetryCount - 1, sub, recovery.recovery_url) }
+                            : {}),
                     },
                     fetchImpl,
                 });
@@ -263,4 +305,5 @@ module.exports = {
     generateRecoveryLink,
     markSubscriptionPastDue,
     processDunningRetries,
+    renderWorkflowStep,
 };

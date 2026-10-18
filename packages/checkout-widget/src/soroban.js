@@ -1,7 +1,9 @@
 import {
   Address,
+  Asset,
   BASE_FEE,
   Contract,
+  Operation,
   TransactionBuilder,
   nativeToScVal,
   rpc,
@@ -33,7 +35,7 @@ export const pollTransaction = async (server, hash, { onProgress, timeoutMs = 60
   throw new PendingTransactionError(hash);
 };
 
-const signAndSubmit = async ({ server, transaction, wallet, address, networkPassphrase, stage, onSubmitted, onProgress }) => {
+export const signAndSubmit = async ({ server, transaction, wallet, address, networkPassphrase, stage, onSubmitted, onProgress }) => {
   const prepared = await server.prepareTransaction(transaction);
   const { signedTxXdr } = await wallet.signTransaction(prepared.toXDR(), {
     address,
@@ -77,6 +79,110 @@ const buildPlanTransactions = ({ account, address, merchantAddress, amount, inte
   return { approve, createVault };
 };
 
+/**
+ * Builds an atomic batch transaction bundling token trustline (if needed), allowance approval,
+ * and vault creation into a single transaction invocation (#169).
+ */
+export const buildAtomicPlanTransaction = ({
+  account,
+  address,
+  merchantAddress,
+  amount,
+  intervalSeconds,
+  orbitContractId,
+  tokenContractId,
+  networkPassphrase,
+  ledgerSequence,
+  billingCycles = 12,
+  includeTrustline = false,
+  assetCode = 'USDC',
+  assetIssuer = null,
+}) => {
+  const allowance = BigInt(amount) * BigInt(billingCycles);
+  const ledgersPerCycle = Math.ceil(Number(intervalSeconds) / 5);
+  const liveUntilLedger = Number(ledgerSequence) + Math.max(120960, ledgersPerCycle * billingCycles + 120960);
+
+  const token = new Contract(tokenContractId);
+  const orbit = new Contract(orbitContractId);
+
+  const builder = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase });
+
+  // 1. Optional token trustline creation for classic/SAC asset
+  if (includeTrustline && assetIssuer) {
+    builder.addOperation(
+      Operation.changeTrust({
+        asset: new Asset(assetCode, assetIssuer),
+        limit: '922337203685.4775807',
+      })
+    );
+  }
+
+  // 2. Token allowance approval
+  builder.addOperation(
+    token.call(
+      'approve',
+      Address.fromString(address).toScVal(),
+      Address.fromString(orbitContractId).toScVal(),
+      nativeToScVal(allowance, { type: 'i128' }),
+      nativeToScVal(liveUntilLedger, { type: 'u32' })
+    )
+  );
+
+  // 3. Vault creation invocation
+  builder.addOperation(
+    orbit.call(
+      'create_vault',
+      Address.fromString(address).toScVal(),
+      Address.fromString(merchantAddress).toScVal(),
+      Address.fromString(tokenContractId).toScVal(),
+      nativeToScVal(BigInt(amount), { type: 'i128' }),
+      nativeToScVal(BigInt(intervalSeconds), { type: 'u64' })
+    )
+  );
+
+  return builder.setTimeout(60).build();
+};
+
+/**
+ * Submits a transaction through the backend gas relayer for fee sponsorship (#169).
+ */
+export async function submitSponsoredTransaction({
+  server,
+  transaction,
+  apiUrl,
+  networkPassphrase,
+}) {
+  if (apiUrl) {
+    try {
+      const res = await fetch(`${apiUrl}/relay/sponsor-transaction`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tx_xdr: transaction.toXDR(),
+          network_passphrase: networkPassphrase,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const txHash = data.txHash || data.tx_hash || data.hash;
+        if (txHash) {
+          return { hash: txHash, sponsored: true };
+        }
+      }
+    } catch (e) {
+      console.warn('Relayer sponsorship service unavailable, falling back to direct RPC submission:', e);
+    }
+  }
+
+  // Fallback to direct RPC submission if relayer is unavailable
+  const submission = await server.sendTransaction(transaction);
+  if (!['PENDING', 'SUCCESS'].includes(submission.status)) {
+    throw new Error(`Transaction submission was rejected (${submission.status}).`);
+  }
+  return { hash: submission.hash, sponsored: false };
+}
+
 export async function preflightPlan({ address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles = 12, minimumXlmBalanceStroops = 1_000_000 }) {
   if (!orbitContractId || !tokenContractId) throw new Error('Missing Orbit or token contract configuration.');
   const server = new rpc.Server(rpcUrl);
@@ -92,6 +198,80 @@ export async function preflightPlan({ address, merchantAddress, amount, interval
   if (usdcBalance < BigInt(amount)) throw new Error(`Insufficient USDC balance. You need ${(Number(amount) / 10_000_000).toFixed(2)} USDC plus network fees. Top up this wallet and try again.`);
   if (xlmBalance < estimatedFeeStroops + BigInt(minimumXlmBalanceStroops)) throw new Error(`Insufficient XLM for network fees. Keep at least ${(Number(estimatedFeeStroops + BigInt(minimumXlmBalanceStroops)) / 10_000_000).toFixed(4)} XLM in this wallet, then try again.`);
   return { server, account, transactions, usdcBalance, xlmBalance, estimatedFeeStroops, minimumXlmBalanceStroops };
+}
+
+/**
+ * Authorizes a plan atomically in a single transaction with relayer gas sponsorship support (#169).
+ */
+export async function authorizePlanAtomic({
+  wallet,
+  address,
+  merchantAddress,
+  amount,
+  intervalSeconds,
+  orbitContractId,
+  tokenContractId,
+  rpcUrl,
+  networkPassphrase,
+  billingCycles = 12,
+  apiUrl = null,
+  sponsorFees = true,
+  includeTrustline = false,
+  assetCode = 'USDC',
+  assetIssuer = null,
+  onSubmitted,
+  onProgress,
+}) {
+  const server = new rpc.Server(rpcUrl);
+  const account = await server.getAccount(address);
+  const ledger = await server.getLatestLedger();
+
+  const atomicTx = buildAtomicPlanTransaction({
+    account,
+    address,
+    merchantAddress,
+    amount,
+    intervalSeconds,
+    orbitContractId,
+    tokenContractId,
+    networkPassphrase,
+    ledgerSequence: ledger.sequence,
+    billingCycles,
+    includeTrustline,
+    assetCode,
+    assetIssuer,
+  });
+
+  const prepared = await server.prepareTransaction(atomicTx);
+  const { signedTxXdr } = await wallet.signTransaction(prepared.toXDR(), {
+    address,
+    networkPassphrase,
+  });
+
+  const signed = TransactionBuilder.fromXDR(signedTxXdr, networkPassphrase);
+
+  let txHash;
+  let isSponsored = false;
+  if (sponsorFees && apiUrl) {
+    const result = await submitSponsoredTransaction({
+      server,
+      transaction: signed,
+      apiUrl,
+      networkPassphrase,
+    });
+    txHash = result.hash;
+    isSponsored = result.sponsored;
+  } else {
+    const submission = await server.sendTransaction(signed);
+    if (!['PENDING', 'SUCCESS'].includes(submission.status)) {
+      throw new Error(`Transaction submission was rejected (${submission.status}).`);
+    }
+    txHash = submission.hash;
+  }
+
+  onSubmitted?.({ stage: 'atomic_checkout', hash: txHash, sponsored: isSponsored });
+  await pollTransaction(server, txHash, { onProgress });
+  return { vaultHash: txHash, approvalHash: txHash, atomic: true, sponsored: isSponsored };
 }
 
 export async function authorizePlan({
@@ -118,3 +298,4 @@ export async function authorizePlan({
   const vaultHash = await signAndSubmit({ server, transaction: refreshedTransactions.createVault, wallet, address, networkPassphrase, stage: 'vault', onSubmitted, onProgress });
   return { approvalHash, vaultHash };
 }
+

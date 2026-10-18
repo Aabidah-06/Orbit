@@ -35,4 +35,22 @@ export interface OrbitCheckoutProps {
   customFields?: OrbitCustomField[];
 }
 
+export interface DelegatedSessionKey {
+  address: string;
+  secret: string;
+  delegatedBy?: string;
+  createdAt: number;
+  expiresAt: number;
+  permissions?: Record<string, any>;
+}
+export function createDelegatedSessionKey(options?: any): any;
+export function getActiveSessionKey(): any;
+export function revokeSessionKey(): void;
+export class SessionWalletAdapter {
+  constructor(session: any);
+  getAddress(): Promise<{ address: string }>;
+  signTransaction(xdr: string, options?: any): Promise<{ signedTxXdr: string }>;
+  disconnect(): Promise<boolean>;
+}
+
 export default function OrbitCheckout(props: OrbitCheckoutProps): JSX.Element;
