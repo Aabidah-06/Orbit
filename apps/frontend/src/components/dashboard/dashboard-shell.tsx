@@ -29,6 +29,7 @@ import {
   Sparkles,
   FileSpreadsheet,
 } from "lucide-react";
+import { useFiatRates, type FiatCurrency } from "@/lib/fiat-rates";
 import { Brand } from "@/components/layout/brand";
 import { useAuth } from "@/lib/auth-context";
 import { useNotifications } from "@/lib/notification-context";
@@ -56,6 +57,7 @@ export function DashboardShell() {
   const router = useRouter();
   const { user, signOut, updateVault, updateBusinessName } = useAuth();
   const { unreadCount, toggleDrawer } = useNotifications();
+  const { currency, setCurrency, error: fiatError } = useFiatRates();
   const [activeTab, setActiveTab] = useState<DashboardTab>("overview");
 
   const handleSignOut = () => {
@@ -354,6 +356,7 @@ export function DashboardShell() {
                 </span>
               )}
             </button>
+            <label className="flex items-center gap-1 text-xs text-neutral-700 dark:text-neutral-200"><span className="sr-only">Display currency</span><select aria-label="Display currency" value={currency} onChange={(event) => setCurrency(event.target.value as FiatCurrency)} className="rounded-md border border-black/20 bg-white px-2 py-1 text-black focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">{["USD", "EUR", "GBP", "JPY"].map(code => <option key={code} value={code}>{code}</option>)}</select></label>
             <LocaleSwitcher className="hidden sm:inline-flex" />
             <Link
               href={`${DOCS_URL}/checkout/widget`}
@@ -396,6 +399,7 @@ export function DashboardShell() {
           </div>
         </header>
 
+        {fiatError && <p role="status" className="px-6 pt-2 text-xs text-amber-800">Fiat exchange rates may be temporarily unavailable; USDC amounts remain authoritative.</p>}
         {/* Tab Content */}
         <main className="flex-1 p-6 md:p-8 overflow-y-auto max-w-6xl w-full mx-auto">
           {activeTab === "overview" && (
