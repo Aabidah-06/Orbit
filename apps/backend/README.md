@@ -594,3 +594,7 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
     "error": "Error description message"
   }
   ```
+
+## Merchant verified analytics (issue #77)
+
+See [ANALYTICS.md](./ANALYTICS.md) for secure wallet login, staging migrations and metric accounting semantics.
