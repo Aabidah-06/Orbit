@@ -1895,4 +1895,7 @@ fn save_proposal(env: &Env, proposal: &PayrollProposal) {
 mod test;
 
 #[cfg(test)]
+mod test_fuzz;
+
+#[cfg(test)]
 mod test_storage;

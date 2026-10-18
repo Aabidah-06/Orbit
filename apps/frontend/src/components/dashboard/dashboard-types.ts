@@ -40,8 +40,10 @@ export interface SubscriptionPlan {
   intervalDays: number;
   network: NetworkId;
   activeSubscribers: number;
-  status: "active" | "archived";
+  status: "active" | "deprecated" | "archived";
   createdAt: string;
+  sunsetDate?: string;
+  migratedToPlanId?: string;
 }
 
 export interface SubscriberRecord {
@@ -258,3 +260,44 @@ export interface PayrollSimulationResult {
   warnings: string[];
   error?: string;
 }
+
+/* ------------------------------------------------------------------ *
+ * Plan migration & bulk subscriber tier transfer tool (#183)
+ * ------------------------------------------------------------------ */
+
+export type SubscriberMigrationState = "pending" | "notified" | "migrated" | "sunset_expired";
+
+export interface SubscriberMigrationRecord {
+  id: string;
+  subscriberId: string;
+  walletAddress: string;
+  email?: string;
+  legacyPlanId: string;
+  targetPlanId: string;
+  legacyAmount: number;
+  targetAmount: number;
+  effectiveAmount: number;
+  discountPercent: number;
+  migrationToken: string;
+  migrationUrl: string;
+  state: SubscriberMigrationState;
+  migratedAt?: string;
+  txHash?: string;
+}
+
+export interface PlanMigrationCampaign {
+  id: string;
+  legacyPlanId: string;
+  legacyPlanName: string;
+  legacyAmount: number;
+  targetPlanId: string;
+  targetPlanName: string;
+  targetAmount: number;
+  sunsetDate: string;
+  discountPercent: number;
+  effectiveTargetAmount: number;
+  status: "active" | "completed" | "sunset_enforced";
+  createdAt: string;
+  subscribers: SubscriberMigrationRecord[];
+}
+
