@@ -2,6 +2,10 @@
 
 These additions keep existing `create_vault` and `pull_funds` callers compatible.
 
+Revenue sharing, designated recovery, elastic metered limits, and merchant-funded
+sponsor reimbursement are documented in
+[`REVENUE_RECOVERY_ELASTICITY_SPONSORSHIP.md`](REVENUE_RECOVERY_ELASTICITY_SPONSORSHIP.md).
+
 ## Soulbound membership (#123)
 
 Creating a fixed-interval vault creates or reactivates a non-transferable

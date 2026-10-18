@@ -229,6 +229,9 @@
               "key": {
                 "vec": [
                   {
+                    "symbol": "Badge"
+                  },
+                  {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                   },
                   {
@@ -238,18 +241,213 @@
               },
               "durability": "persistent",
               "val": {
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "active"
+                    },
+                    "val": {
+                      "bool": true
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "expiration_timestamp"
+                    },
+                    "val": {
+                      "u64": "2592000"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "subscriber_id"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "tier"
+                    },
+                    "val": {
+                      "u32": 1
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 639360
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+              "key": {
                 "vec": [
                   {
-                    "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
+                    "symbol": "Bitmap"
                   },
                   {
-                    "i128": "290000000"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                   },
                   {
-                    "u64": "2592000"
+                    "u32": 0
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "bytes": "0100000000000000000000000000000000000000000000000000000000000000"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 639360
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "NextId"
                   },
                   {
-                    "u64": "0"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u32": 1
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 639360
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+              "key": {
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "merchant"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "user"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                    }
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "amount_per_interval"
+                    },
+                    "val": {
+                      "i128": "290000000"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "grace_period_seconds"
+                    },
+                    "val": {
+                      "u64": "259200"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "initial_timestamp"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "interval_seconds"
+                    },
+                    "val": {
+                      "u64": "2592000"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "is_paused"
+                    },
+                    "val": {
+                      "bool": false
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "last_pull_timestamp"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "payment_status"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "pull_sequence"
+                    },
+                    "val": {
+                      "u64": "18446744073709551615"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "token"
+                    },
+                    "val": {
+                      "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "trial_end_timestamp"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
                   }
                 ]
               }
@@ -543,6 +741,9 @@
                 },
                 {
                   "u64": "2592000"
+                },
+                {
+                  "u64": "0"
                 }
               ]
             }
