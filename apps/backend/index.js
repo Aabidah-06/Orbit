@@ -66,6 +66,7 @@ const {
 const { getDatabaseManager } = require('./db');
 const { registerPrivacyRoutes } = require('./privacy');
 const { registerProofRoutes } = require('./proofs');
+const { registerHealthMetrics } = require('./health-metrics');
 const { captureStripeRawBody, registerStripeBillingRoutes } = require('./stripe-billing');
 const { registerCredentialRoutes } = require('./credentials');
 const { checkSchemaOnStartup } = require('./migrate');
@@ -1952,6 +1953,7 @@ registerPayoutSplitRoutes(app, getSupabase, authenticateMerchant, {
 });
 registerPriceIndexationRoutes(app, getSupabase, authenticateMerchant);
 registerSnapshotRoutes(app, getSupabase, authenticateMerchant, getSorobanServer);
+registerHealthMetrics(app, { getSupabase, getSorobanServer, rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org' });
 registerIndexerRoutes(app);
 registerStripeBillingRoutes(app, getSupabase, authenticateMerchant);
 const credentialService = registerCredentialRoutes(app, getSupabase, authenticateMerchant);
