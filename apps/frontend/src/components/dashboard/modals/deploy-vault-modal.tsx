@@ -245,7 +245,7 @@ export function DeployVaultModal({ isOpen, onClose, onSuccess }: DeployVaultModa
                   className="w-full rounded-lg border border-black/10 px-3.5 py-2.5 text-xs text-black focus:outline-hidden focus:ring-1 focus:ring-black focus:border-black"
                 />
                 <p className="text-[11px] text-neutral-500 mt-1">
-                  Branded identifier displayed on subscribers' wallet approvals.
+                  Branded identifier displayed on subscribers&apos; wallet approvals.
                 </p>
               </div>
 

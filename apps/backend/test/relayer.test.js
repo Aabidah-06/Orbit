@@ -15,7 +15,7 @@ import {
 
 // relayer.js loads the SDK's CommonJS build; XDR values from its ESM build are different
 // classes and fail its type checks, so the tests must share the same copy
-const { Keypair, StrKey, Account, Networks, FeeBumpTransaction, authorizeInvocation } = createRequire(import.meta.url)('@stellar/stellar-sdk');
+const { Keypair, StrKey, Account, Networks, FeeBumpTransaction, authorizeInvocation, Asset, Operation, TransactionBuilder, BASE_FEE } = createRequire(import.meta.url)('@stellar/stellar-sdk');
 
 const CONTRACT_ID = StrKey.encodeContract(Buffer.alloc(32, 3));
 const LATEST_LEDGER = 500;
@@ -511,5 +511,36 @@ describe('Relay routes', () => {
 
     expect(res.status).toBe(503);
     expect(res.body.code).toBe('relayer_unavailable');
+  });
+
+  it('sponsors an atomic transaction on behalf of checkout widget (#169)', async () => {
+    const dummyKeypair = Keypair.random();
+    const sourceAccount = new Account(dummyKeypair.publicKey(), '100');
+    const innerTx = new TransactionBuilder(sourceAccount, { fee: BASE_FEE, networkPassphrase: Networks.TESTNET })
+      .addOperation(Operation.payment({
+        destination: Keypair.random().publicKey(),
+        asset: Asset.native(),
+        amount: '1',
+      }))
+      .setTimeout(60)
+      .build();
+    innerTx.sign(dummyKeypair);
+
+    const res = await request(app)
+      .post('/relay/sponsor-transaction')
+      .send({ tx_xdr: innerTx.toXDR(), network_passphrase: Networks.TESTNET });
+
+    expect(res.status).toBe(200);
+    expect(res.body.sponsored).toBe(true);
+    expect(res.body.sponsorAddress).toBe(app.locals.relayer.sponsorAddress);
+  });
+
+  it('rejects sponsorship request with 400 when tx_xdr is missing', async () => {
+    const res = await request(app)
+      .post('/relay/sponsor-transaction')
+      .send({});
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('tx_xdr is required');
   });
 });

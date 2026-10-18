@@ -10,6 +10,7 @@ import {
   Layers,
   Send,
   ExternalLink,
+  FileSpreadsheet,
 } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { MerchantUser, useAuth } from "@/lib/auth-context";
@@ -23,12 +24,14 @@ interface OverviewViewProps {
   user: MerchantUser;
   activeNetwork: NetworkId;
   onNavigateTab: (tab: DashboardTab) => void;
+  onOpenReportsWizard?: () => void;
 }
 
 export function OverviewView({
   user,
   activeNetwork,
   onNavigateTab,
+  onOpenReportsWizard,
 }: OverviewViewProps) {
   const t = useTranslations("Overview");
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
@@ -242,12 +245,25 @@ const session = await verifyAnalyticsSignature(
               <h3 className="text-base font-semibold text-black tracking-tight">{t("revenueTitle")}</h3>
               <p className="text-xs text-neutral-500 mt-0.5">Confirmed USDC settlements, grouped by UTC day</p>
             </div>
-            <div className="flex items-center gap-1 bg-neutral-100 p-0.5 rounded-lg">
-              {(["7D", "30D", "90D", "1Y"] as const).map(range => (
-                <button type="button" key={range} aria-pressed={timeframe === range}
-                  onClick={() => setTimeframe(range)}
-                  className={`text-xs font-mono px-2.5 py-1 rounded-md transition-colors ${timeframe === range ? "bg-white text-black font-bold shadow-2xs" : "text-neutral-500 hover:text-black"}`}>{range}</button>
-              ))}
+            <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1 bg-neutral-100 p-0.5 rounded-lg">
+                {(["7D", "30D", "90D", "1Y"] as const).map(range => (
+                  <button type="button" key={range} aria-pressed={timeframe === range}
+                    onClick={() => setTimeframe(range)}
+                    className={`text-xs font-mono px-2.5 py-1 rounded-md transition-colors ${timeframe === range ? "bg-white text-black font-bold shadow-2xs" : "text-neutral-500 hover:text-black"}`}>{range}</button>
+                ))}
+              </div>
+              {onOpenReportsWizard && (
+                <button
+                  type="button"
+                  onClick={onOpenReportsWizard}
+                  className="px-2.5 py-1 rounded-lg border border-black/10 bg-white text-xs font-medium text-black hover:bg-neutral-50 flex items-center gap-1.5 transition-colors shadow-2xs"
+                  title="Open Reports & Tax Reporting Wizard (#168)"
+                >
+                  <FileSpreadsheet size={13} />
+                  <span>Tax Wizard</span>
+                </button>
+              )}
             </div>
           </div>
           {!analytics ? (

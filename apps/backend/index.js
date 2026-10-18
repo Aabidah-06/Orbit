@@ -13,9 +13,11 @@ const { getAuditLogsQuerySchema, getClientIp, getActorAddress, writeAuditLog } =
 const {
     createWebhookSchema,
     updateWebhookSchema,
+    backfillWebhookSchema,
     generateSigningSecret,
     dispatchWebhookEvent,
     resendWebhookDelivery,
+    replayWebhookEvents,
     setDeliveryObserver,
 } = require('./webhooks');
 const { createDeliveryAlertObserver, registerWebhookAlertRoutes } = require('./webhook-alerts');
@@ -50,6 +52,9 @@ const {
 } = require('./oracle');
 const { getDatabaseManager } = require('./db');
 const { registerPrivacyRoutes } = require('./privacy');
+const { createPayoutSplitDispatcher, registerPayoutSplitRoutes } = require('./payout-splits');
+const { createPriceIndexationWorker, registerPriceIndexationRoutes } = require('./price-indexation');
+const { registerProofRoutes } = require('./proofs');
 
 const app = express();
 // Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
@@ -581,7 +586,7 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
                     merchantId: sub.plans.merchant_id,
                     subscriptionId: subscription_id,
                     primaryTxHash: txHash,
-                    amountUnits: sub.plans.usdc_amount,
+                    amountUnits: settledAmount,
                     settledAt: pullTime.toISOString(),
                     fetchImpl: app.locals.fetchImpl,
                 });
@@ -968,6 +973,28 @@ app.get('/relay/budget', authenticateMerchant, async (req, res) => {
         console.error("Error submitting pull:", err);
         if (ownedSubscriptionId) await recordPullFailure(getSupabase(), ownedSubscriptionId, err.message).catch(console.error);
         res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * POST /relay/sponsor-transaction (#169)
+ * Allows the checkout widget to submit atomic batch transactions sponsored by the relayer.
+ */
+app.post('/relay/sponsor-transaction', relayRateLimit, async (req, res) => {
+    try {
+        const { tx_xdr, network_passphrase } = req.body || {};
+        if (!tx_xdr) return res.status(400).json({ error: 'tx_xdr is required' });
+        const relayer = getRelayer();
+        if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+        const result = await relayer.sponsorTransaction({
+            txXdr: tx_xdr,
+            passphrase: network_passphrase || process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+        });
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('Error sponsoring transaction:', err);
+        return res.status(500).json({ error: err.message || 'Fee sponsorship failed' });
     }
 });
 
@@ -1801,8 +1828,44 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
     res.json({ webhook: data, signing_secret: secret });
 });
 
+app.post('/webhooks/:id/backfill', async (req, res) => {
+    const parseResult = backfillWebhookSchema.safeParse(req.body || {});
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    try {
+        const { id } = req.params;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { event_types, start_date, end_date } = parseResult.data;
+        const result = await replayWebhookEvents(supabase, {
+            webhookId: id,
+            eventTypes: event_types,
+            startDate: start_date,
+            endDate: end_date,
+            fetchImpl: app.locals.fetchImpl,
+        });
+
+        res.status(200).json({
+            message: "Webhook backfill completed successfully",
+            total_events: result.total_events,
+            replayed_count: result.replayed_count,
+            deliveries: result.deliveries,
+        });
+    } catch (err) {
+        if (err.status === 404 || err.message === 'Webhook not found') {
+            return res.status(404).json({ error: "Webhook not found" });
+        }
+        console.error("Error executing webhook backfill:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
 registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
+registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
 
 // Webhook incident alerting: Slack / PagerDuty / email channels and failure telemetry (#189)
