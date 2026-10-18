@@ -16,7 +16,9 @@ const {
     generateSigningSecret,
     dispatchWebhookEvent,
     resendWebhookDelivery,
+    setDeliveryObserver,
 } = require('./webhooks');
+const { createDeliveryAlertObserver, registerWebhookAlertRoutes } = require('./webhook-alerts');
 const {
     DUNNING_INTERVAL_DAYS,
     MAX_DUNNING_RETRIES,
@@ -1798,6 +1800,10 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
 registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
+
+// Webhook incident alerting: Slack / PagerDuty / email channels and failure telemetry (#189)
+registerWebhookAlertRoutes(app, getSupabase, authenticateMerchant);
+setDeliveryObserver(createDeliveryAlertObserver(getSupabase));
 registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
 registerCouponRoutes(app, getSupabase, authenticateMerchant);

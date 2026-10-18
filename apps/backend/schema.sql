@@ -897,3 +897,17 @@ REVOKE ALL ON TABLE plan_price_schedules FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON TABLE plan_price_reauthorizations FROM PUBLIC, anon, authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON plan_price_schedules TO service_role;
 GRANT SELECT, INSERT, UPDATE, DELETE ON plan_price_reauthorizations TO service_role;
+
+-- 11. Webhook Incident Alert Channels (#189)
+-- Per-merchant destinations for endpoint incident and recovery alerts.
+-- config holds { webhook_url } for slack, { routing_key } for pagerduty, { email } for email.
+CREATE TABLE IF NOT EXISTS webhook_alert_channels (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('slack', 'pagerduty', 'email')),
+    config JSONB NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS webhook_alert_channels_merchant_id_idx ON webhook_alert_channels (merchant_id);
