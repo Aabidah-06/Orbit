@@ -29,6 +29,7 @@ export const metadata: Metadata = {
 };
 
 import { DashboardThemeProvider } from "@/lib/dashboard-theme";
+import { FiatRatesProvider } from "@/lib/fiat-rates";
 import { AuthProvider } from "@/lib/auth-context";
 import { NotificationProvider } from "@/lib/notification-context";
 import { ToastNotificationCenter } from "@/components/ui/toast-notification-center";
@@ -53,6 +54,8 @@ export default async function RootLayout({
       <body className="min-h-screen bg-[#FAFAFB] text-[#09090B] selection:bg-black selection:text-white antialiased">
         <I18nProvider initialLocale={locale}>
           <DashboardThemeProvider><AuthProvider>
+          <FiatRatesProvider>
+          <AuthProvider>
             <NotificationProvider>
               <div className="flex flex-col min-h-screen">
                 <Navbar />
@@ -62,6 +65,8 @@ export default async function RootLayout({
               <ToastNotificationCenter />
             </NotificationProvider>
           </AuthProvider></DashboardThemeProvider>
+          </AuthProvider>
+          </FiatRatesProvider>
         </I18nProvider>
       </body>
     </html>

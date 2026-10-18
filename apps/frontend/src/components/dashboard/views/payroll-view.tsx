@@ -1,5 +1,6 @@
 "use client";
 
+import { PriceDisplay } from "@/components/ui/price-display";
 import { useState, useRef, useMemo, useEffect, useDeferredValue } from "react";
 import {
   SendHorizontal,
@@ -618,7 +619,7 @@ export function PayrollView() {
           <p className="text-neutral-500">Addresses are validated as Stellar public keys. Confirm ownership with the contractor before payment.</p>
           {contractors.length === 0 && <p>No saved contractors yet. Use “Save contractor” on a payout row.</p>}
           {contractors.map((contractor) => <div key={contractor.walletAddress} className="flex flex-wrap items-center gap-3 rounded-lg border p-3">
-            <div className="min-w-0 flex-1"><strong>{contractor.name}</strong><p className="break-all font-mono">{contractor.walletAddress}</p><p>{contractor.amount} USDC</p></div>
+            <div className="min-w-0 flex-1"><strong>{contractor.name}</strong><p className="break-all font-mono">{contractor.walletAddress}</p><p><PriceDisplay amount={contractor.amount} /></p></div>
             <button className="button button-secondary px-3 py-2" disabled={isExecuting} onClick={() => {
               setRecipients((previous) => [...previous, { ...contractor, id: crypto.randomUUID(), network: "stellar-testnet", status: "ready" }]); setDisbursedSuccess(null);
             }}>Quick add</button>
@@ -704,7 +705,7 @@ export function PayrollView() {
                     </td>
 
                     <td className="py-4 px-4 font-mono font-bold text-black text-sm">
-                      {rec.amount.toFixed(2)} USDC
+                      <PriceDisplay amount={rec.amount} />
                     </td>
 
                     <td className="py-4 px-4">
