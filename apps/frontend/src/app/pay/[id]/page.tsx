@@ -35,19 +35,26 @@ export default function HostedCheckoutPage({ params }: { params: Promise<{ id: s
 
   useEffect(() => {
     const controller = new AbortController();
-    fetch(`${ORBIT_API_URL}/payment-links/${id}`, { signal: controller.signal })
-      .then(async (response) => {
-        if (response.status === 404) { setNotFound(true); return null; }
-        if (!response.ok) throw new Error("This checkout could not be loaded.");
-        return response.json();
-      })
-      .then((data) => {
+    (async () => {
+      const response = await fetch(`${ORBIT_API_URL}/payment-links/${encodeURIComponent(id)}`, { signal: controller.signal });
+      if (response.ok) {
+        const data = await response.json();
         if (data?.link?.plans) {
           setHostedLink(data.link);
           setPlan(data.link.plans as Plan);
+          return;
         }
-      })
-      .catch((reason) => reason.name !== "AbortError" && setError(reason.message))
+      }
+      // Preserve existing direct plan checkout URLs during migration.
+      if (response.status === 404) {
+        const legacy = await fetch(`${ORBIT_API_URL}/plans/${encodeURIComponent(id)}`, { signal: controller.signal });
+        if (legacy.status === 404) { setNotFound(true); return; }
+        if (!legacy.ok) throw new Error("Checkout could not be loaded.");
+        const data = await legacy.json();
+        if (data.plan) { setPlan(data.plan); return; }
+      }
+      throw new Error("Checkout could not be loaded.");
+    })().catch(reason => { if (reason.name !== "AbortError") setError(reason.message); })
       .finally(() => setLoading(false));
     return () => controller.abort();
   }, [id]);
