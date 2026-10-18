@@ -1,0 +1,337 @@
+{
+  "contract": "orbit_soroban",
+  "wasm": "contracts/soroban/target/wasm32v1-none/release/orbit_soroban.wasm",
+  "generatedBy": "apps/backend/scripts/inspect-contract.js",
+  "sorobanSdk": "27.0.6",
+  "structs": {
+    "VaultData": {
+      "fields": [
+        { "name": "token", "type": "address" },
+        { "name": "amount_per_interval", "type": "i128" },
+        { "name": "interval_seconds", "type": "u64" },
+        { "name": "last_pull_timestamp", "type": "u64" },
+        { "name": "grace_period_seconds", "type": "u64" },
+        { "name": "payment_status", "type": "u32" }
+      ]
+    },
+    "PaymentSplit": {
+      "fields": [
+        { "name": "recipient", "type": "address" },
+        { "name": "amount", "type": "i128" }
+      ]
+    },
+    "BatchPullResult": {
+      "fields": [
+        { "name": "subscriber", "type": "address" },
+        { "name": "success", "type": "bool" },
+        { "name": "amount", "type": "i128" }
+      ]
+    },
+    "PlanData": {
+      "fields": [
+        { "name": "merchant", "type": "address" },
+        { "name": "token", "type": "address" },
+        { "name": "amount_per_interval", "type": "i128" },
+        { "name": "interval_seconds", "type": "u64" },
+        { "name": "name", "type": "string" },
+        { "name": "is_active", "type": "bool" }
+      ]
+    },
+    "MeteredVaultData": {
+      "fields": [
+        { "name": "token", "type": "address" },
+        { "name": "max_amount_per_interval", "type": "i128" },
+        { "name": "interval_seconds", "type": "u64" },
+        { "name": "current_epoch_start", "type": "u64" },
+        { "name": "epoch_spent", "type": "i128" }
+      ]
+    },
+    "BadgeData": {
+      "fields": [
+        { "name": "active", "type": "bool" },
+        { "name": "tier", "type": "u32" },
+        { "name": "expiration_timestamp", "type": "u64" },
+        { "name": "subscriber_id", "type": "u32" }
+      ]
+    }
+  },
+  "functions": [
+    {
+      "name": "create_vault",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" },
+        { "name": "token", "type": "address" },
+        { "name": "amount_per_interval", "type": "i128" },
+        { "name": "interval_seconds", "type": "u64" }
+      ],
+      "output": null
+    },
+    {
+      "name": "create_vault_with_grace_period",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" },
+        { "name": "token", "type": "address" },
+        { "name": "amount_per_interval", "type": "i128" },
+        { "name": "interval_seconds", "type": "u64" },
+        { "name": "grace_period_seconds", "type": "u64" }
+      ],
+      "output": null
+    },
+    {
+      "name": "create_vault_from_plan",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "plan_id", "type": "string" }
+      ],
+      "output": null
+    },
+    {
+      "name": "pull_funds",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" }
+      ],
+      "output": null
+    },
+    {
+      "name": "batch_pull_funds",
+      "mutating": true,
+      "inputs": [
+        { "name": "merchant", "type": "address" },
+        { "name": "subscribers", "type": "vec<address>" }
+      ],
+      "output": { "type": "vec<BatchPullResult>" }
+    },
+    {
+      "name": "cancel_vault",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" }
+      ],
+      "output": null
+    },
+    {
+      "name": "merchant_cancel_vault",
+      "mutating": true,
+      "inputs": [
+        { "name": "merchant", "type": "address" },
+        { "name": "user", "type": "address" }
+      ],
+      "output": null
+    },
+    {
+      "name": "batch_disburse",
+      "mutating": true,
+      "inputs": [
+        { "name": "sender", "type": "address" },
+        { "name": "token", "type": "address" },
+        { "name": "splits", "type": "vec<PaymentSplit>" }
+      ],
+      "output": null
+    },
+    {
+      "name": "propose_batch_disburse",
+      "mutating": true,
+      "inputs": [
+        { "name": "sender", "type": "address" },
+        { "name": "token", "type": "address" },
+        { "name": "splits", "type": "vec<PaymentSplit>" },
+        { "name": "required_approvals", "type": "u32" },
+        { "name": "approvers", "type": "vec<address>" }
+      ],
+      "output": { "type": "u64" }
+    },
+    {
+      "name": "approve_payroll_proposal",
+      "mutating": true,
+      "inputs": [
+        { "name": "approver", "type": "address" },
+        { "name": "proposal_id", "type": "u64" }
+      ],
+      "output": null
+    },
+    {
+      "name": "execute_payroll_proposal",
+      "mutating": true,
+      "inputs": [
+        { "name": "proposal_id", "type": "u64" }
+      ],
+      "output": null
+    },
+    {
+      "name": "register_plan",
+      "mutating": true,
+      "inputs": [
+        { "name": "merchant", "type": "address" },
+        { "name": "plan_id", "type": "string" },
+        { "name": "token", "type": "address" },
+        { "name": "amount_per_interval", "type": "i128" },
+        { "name": "interval_seconds", "type": "u64" },
+        { "name": "name", "type": "string" }
+      ],
+      "output": null
+    },
+    {
+      "name": "deactivate_plan",
+      "mutating": true,
+      "inputs": [
+        { "name": "merchant", "type": "address" },
+        { "name": "plan_id", "type": "string" }
+      ],
+      "output": null
+    },
+    {
+      "name": "create_metered_vault",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" },
+        { "name": "token", "type": "address" },
+        { "name": "max_amount_per_interval", "type": "i128" },
+        { "name": "interval_seconds", "type": "u64" }
+      ],
+      "output": null
+    },
+    {
+      "name": "pull_metered_funds",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" },
+        { "name": "amount", "type": "i128" }
+      ],
+      "output": null
+    },
+    {
+      "name": "pause_vault",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" }
+      ],
+      "output": null
+    },
+    {
+      "name": "resume_vault",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" }
+      ],
+      "output": null
+    },
+    {
+      "name": "update_vault_terms",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" },
+        { "name": "new_amount", "type": "i128" },
+        { "name": "new_interval_seconds", "type": "u64" }
+      ],
+      "output": null
+    },
+    {
+      "name": "refund_subscriber",
+      "mutating": true,
+      "inputs": [
+        { "name": "merchant", "type": "address" },
+        { "name": "user", "type": "address" },
+        { "name": "token", "type": "address" },
+        { "name": "refund_amount", "type": "i128" }
+      ],
+      "output": null
+    },
+    {
+      "name": "set_subscriber_tier",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" },
+        { "name": "tier", "type": "u32" }
+      ],
+      "output": null
+    },
+    {
+      "name": "create_stream",
+      "mutating": true,
+      "inputs": [
+        { "name": "sender", "type": "address" },
+        { "name": "recipient", "type": "address" },
+        { "name": "token", "type": "address" },
+        { "name": "deposit_amount", "type": "i128" },
+        { "name": "start_time", "type": "u64" },
+        { "name": "stop_time", "type": "u64" }
+      ],
+      "output": { "type": "u64" }
+    },
+    {
+      "name": "withdraw_from_stream",
+      "mutating": true,
+      "inputs": [
+        { "name": "stream_id", "type": "u64" },
+        { "name": "amount", "type": "i128" }
+      ],
+      "output": null
+    },
+    {
+      "name": "cancel_stream",
+      "mutating": true,
+      "inputs": [
+        { "name": "stream_id", "type": "u64" }
+      ],
+      "output": null
+    },
+    {
+      "name": "get_vault",
+      "mutating": false,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" }
+      ],
+      "output": { "type": "option<VaultData>" }
+    },
+    {
+      "name": "get_metered_vault",
+      "mutating": false,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" }
+      ],
+      "output": { "type": "option<MeteredVaultData>" }
+    },
+    {
+      "name": "get_subscriber_badge",
+      "mutating": false,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" }
+      ],
+      "output": { "type": "option<BadgeData>" }
+    },
+    {
+      "name": "is_subscriber_active",
+      "mutating": false,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" }
+      ],
+      "output": { "type": "bool" }
+    },
+    {
+      "name": "get_plan",
+      "mutating": false,
+      "inputs": [
+        { "name": "plan_id", "type": "string" }
+      ],
+      "output": { "type": "option<PlanData>" }
+    }
+  ]
+}

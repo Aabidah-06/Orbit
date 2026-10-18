@@ -36,6 +36,11 @@ pub const PULL_SEQUENCE_UNSET: u64 = u64::MAX;
 /// proposal storage within Soroban resource limits.
 pub const MAX_PAYROLL_APPROVERS: u32 = 20;
 
+/// Upper bound on a `batch_pull_funds` subscriber list (#92). Caps the ledger
+/// work of a single transaction so a merchant with hundreds of due subscribers
+/// can page through them in bounded batches.
+pub const MAX_BATCH_PULL_SUBSCRIBERS: u32 = 50;
+
 /// Calculates (threshold, extend_to) in ledgers for vault persistent storage
 /// and contract instance storage based on interval_seconds.
 pub fn calculate_ttl_params(interval_seconds: u64) -> (u32, u32) {
@@ -108,6 +113,18 @@ pub enum StorageKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaymentSplit {
     pub recipient: Address,
+    pub amount: i128,
+}
+
+/// Per-subscriber outcome of a `batch_pull_funds` call (#92). `success` is false
+/// when the subscriber was skipped (missing/inactive vault, not yet due, already
+/// settled this cycle, or insufficient funds) without reverting the batch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchPullResult {
+    pub subscriber: Address,
+    pub success: bool,
+    /// Amount settled for this subscriber in raw token units; 0 when skipped.
     pub amount: i128,
 }
 
@@ -1173,6 +1190,147 @@ impl OrbitContract {
             .persistent()
             .extend_ttl(&key, threshold, extend_to);
         env.storage().instance().extend_ttl(threshold, extend_to);
+    }
+
+    // --------------------------------------------------------------------
+    // BATCH PULL (#92)
+    // --------------------------------------------------------------------
+
+    /// Settle many due subscribers in one transaction. Instead of submitting a
+    /// separate `pull_funds` transaction per subscriber (which bloats ledger fees
+    /// and contends on the merchant sequence number), the merchant authorizes one
+    /// call and receives one `BatchPullResult` per subscriber.
+    ///
+    /// Fault tolerance: each subscriber is attempted independently. A subscriber
+    /// that is ineligible (missing/paused/defaulted vault, interval not elapsed,
+    /// cycle already settled) or underfunded is recorded with `success == false`
+    /// instead of reverting the transfers that already settled earlier in the same
+    /// batch.
+    pub fn batch_pull_funds(
+        env: Env,
+        merchant: Address,
+        subscribers: Vec<Address>,
+    ) -> Vec<BatchPullResult> {
+        // The merchant (or the Orbit backend acting for it) authorizes the batch.
+        merchant.require_auth();
+
+        assert!(!subscribers.is_empty(), "subscribers must not be empty");
+        assert!(
+            subscribers.len() <= MAX_BATCH_PULL_SUBSCRIBERS,
+            "batch size exceeds MAX_BATCH_PULL_SUBSCRIBERS"
+        );
+
+        let mut results = Vec::new(&env);
+        let mut success_count: u32 = 0;
+        let mut total_amount: i128 = 0;
+
+        for subscriber in subscribers.iter() {
+            let result = Self::try_batch_pull_subscriber(&env, &subscriber, &merchant);
+            if result.success {
+                success_count += 1;
+                total_amount = total_amount.saturating_add(result.amount);
+            }
+            results.push_back(result);
+        }
+
+        // One aggregate event per batch: (merchant, success_count, total_amount).
+        env.events().publish(
+            (Symbol::new(&env, "batch_funds_pulled"), merchant.clone()),
+            (success_count, total_amount),
+        );
+
+        results
+    }
+
+    /// Executes a single guarded pull for `(subscriber, merchant)` and reports the
+    /// outcome. Returns a failing `BatchPullResult` (never panics) for any expected
+    /// per-subscriber failure so the enclosing batch keeps settling.
+    fn try_batch_pull_subscriber(
+        env: &Env,
+        subscriber: &Address,
+        merchant: &Address,
+    ) -> BatchPullResult {
+        let skipped = |amount: i128| BatchPullResult {
+            subscriber: subscriber.clone(),
+            success: false,
+            amount,
+        };
+
+        let key = vault_key(subscriber, merchant);
+        let mut vault = match load_vault(env, &key) {
+            Some(vault) => vault,
+            None => return skipped(0),
+        };
+
+        // A paused subscriber is never billed (#93).
+        if vault.is_paused {
+            return skipped(0);
+        }
+        if vault.payment_status == PAYMENT_DEFAULTED {
+            return skipped(0);
+        }
+
+        let current_time = env.ledger().timestamp();
+        if vault.last_pull_timestamp != 0
+            && current_time < vault.last_pull_timestamp + vault.interval_seconds
+        {
+            return skipped(0);
+        }
+
+        // Deterministic epoch guard (#94): never settle the same billing cycle twice.
+        let cycle_index =
+            current_time.saturating_sub(vault.initial_timestamp) / vault.interval_seconds;
+        if vault.pull_sequence != PULL_SEQUENCE_UNSET && cycle_index <= vault.pull_sequence {
+            return skipped(0);
+        }
+
+        // Skip a subscriber whose balance cannot cover this interval instead of
+        // letting token.transfer_from abort the whole batch. This is the most
+        // common benign failure (a subscriber who topped up too late).
+        let token_client = token::Client::new(env, &vault.token);
+        if token_client.balance(subscriber) < vault.amount_per_interval {
+            return skipped(0);
+        }
+
+        // Routes through the vault's configured swap router when one exists;
+        // otherwise this is a direct token.transfer_from(subscriber -> merchant).
+        pull_payment(env, subscriber, merchant, &vault, merchant);
+
+        let amount = vault.amount_per_interval;
+        let interval_seconds = vault.interval_seconds;
+
+        vault.last_pull_timestamp = current_time;
+        vault.payment_status = PAYMENT_ACTIVE;
+        vault.pull_sequence = cycle_index;
+        save_vault(env, &key, vault);
+
+        let tier = env
+            .storage()
+            .persistent()
+            .get::<_, BadgeData>(&SubscriptionKey::Badge(subscriber.clone(), merchant.clone()))
+            .map(|badge| badge.tier)
+            .unwrap_or(1);
+        activate_badge(
+            env,
+            subscriber,
+            merchant,
+            tier,
+            current_time.saturating_add(interval_seconds),
+            interval_seconds,
+        );
+
+        // Keep each processed vault (and the contract instance) resident.
+        let (threshold, extend_to) = calculate_ttl_params(interval_seconds);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, extend_to);
+        env.storage().instance().extend_ttl(threshold, extend_to);
+
+        BatchPullResult {
+            subscriber: subscriber.clone(),
+            success: true,
+            amount,
+        }
     }
 
     // --------------------------------------------------------------------
