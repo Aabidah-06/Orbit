@@ -67,9 +67,13 @@ const { getDatabaseManager } = require('./db');
 const { registerPrivacyRoutes } = require('./privacy');
 const { registerProofRoutes } = require('./proofs');
 const { registerOrganizationRoutes } = require('./organizations');
+const { registerRpcProxyRoute } = require('./rpc-proxy');
+const { registerHealthMetrics } = require('./health-metrics');
 const { captureStripeRawBody, registerStripeBillingRoutes } = require('./stripe-billing');
 const { registerCredentialRoutes } = require('./credentials');
+const { registerPaymentLinkRoutes } = require('./payment-links');
 const { checkSchemaOnStartup } = require('./migrate');
+const { createInvoiceService, registerInvoiceRoutes } = require('./invoices');
 
 const app = express();
 // Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
@@ -128,6 +132,7 @@ const getSupabase = () => getPrimarySupabase(app);
 // Merchant routes: authenticate the API key, then apply its rate limit
 const authenticateMerchant = [requireApiKey(getSupabase), reputation.markAuthenticated, apiKeyRateLimit];
 registerAnalyticsRoutes(app, getSupabase);
+registerPaymentLinkRoutes(app, getSupabase, authenticateMerchant);
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
 const getSorobanServer = (rpcUrl) => app.locals.sorobanServer || new rpc.Server(rpcUrl);
@@ -570,18 +575,15 @@ const applyPullOutcome = async ({
             }
 
             if (confirmation) {
-                const verifiedAmount = require('./transaction-report').confirmedSettlementAmount(
-                    confirmation,
-                    {
-                        customerWallet: sub.customer_wallet_address,
-                        merchantWallet: merchant.wallet_address,
-                        contractId: process.env.ORBIT_CONTRACT_ID,
-                    },
-                );
+                const verifiedAmount = confirmedSettlementAmount(confirmation, {
+                    customerWallet: sub.customer_wallet_address,
+                    merchantWallet: merchant.wallet_address,
+                    contractId: process.env.ORBIT_CONTRACT_ID,
+                });
                 if (verifiedAmount === null) {
                     console.error('CRITICAL: confirmed transfer missing verified amount; reconcile transaction:', txHash);
                 } else {
-                    const { error: paymentError } = await supabase.from('payment_transactions').insert([{
+                    const paymentRecord = {
                         merchant_id: sub.plans.merchant_id,
                         subscription_id,
                         plan_id: sub.plan_id,
@@ -590,9 +592,26 @@ const applyPullOutcome = async ({
                         status: 'settled',
                         tx_hash: txHash,
                         settled_at: pullTime.toISOString(),
-                    }]);
+                    };
+                    const { data: payment, error: paymentError } = await supabase.from('payment_transactions').insert([paymentRecord]).select().single();
                     if (paymentError && paymentError.code !== '23505') {
                         console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
+                    }
+                }
+                if (payment) {
+                    try {
+                        const invoiceService = app.locals.invoiceService || createInvoiceService({ supabase });
+                        await invoiceService.createForSettledPayment({
+                            payment,
+                            merchant,
+                            plan: sub.plans,
+                            subscription: sub,
+                            ledgerSequence: confirmation?.ledger ?? confirmation?.ledgerSequence ?? null,
+                        });
+                    } catch (invoiceError) {
+                        // A receipt is retriable operational work; it must never roll
+                        // back an independently confirmed on-chain settlement.
+                        console.error('Invoice generation failed:', invoiceError);
                     }
                 }
             }
@@ -1935,6 +1954,8 @@ app.post('/webhooks/:id/backfill', async (req, res) => {
 
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
 registerOrganizationRoutes(app, getSupabase, authenticateMerchant);
+registerInvoiceRoutes(app, getSupabase, authenticateMerchant);
+registerRpcProxyRoute(app);
 registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
@@ -1954,6 +1975,7 @@ registerPayoutSplitRoutes(app, getSupabase, authenticateMerchant, {
 });
 registerPriceIndexationRoutes(app, getSupabase, authenticateMerchant);
 registerSnapshotRoutes(app, getSupabase, authenticateMerchant, getSorobanServer);
+registerHealthMetrics(app, { getSupabase, getSorobanServer, rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org' });
 registerIndexerRoutes(app);
 registerStripeBillingRoutes(app, getSupabase, authenticateMerchant);
 const credentialService = registerCredentialRoutes(app, getSupabase, authenticateMerchant);
