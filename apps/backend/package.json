@@ -6,6 +6,8 @@
   "scripts": {
     "test": "vitest run",
     "create-api-key": "node scripts/create-api-key.js",
+    "inspect-contract": "node scripts/inspect-contract.js",
+    "generate:contract-sdk": "node scripts/generate-contract-sdk.js",
     "reconcile": "node reconciliation.js"
   },
   "keywords": [],
