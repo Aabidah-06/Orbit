@@ -149,8 +149,9 @@ export function validateDunningSteps(steps: DunningStep[]): string[] {
 
 export function addDunningStep(steps: DunningStep[]): DunningStep[] {
   if (steps.length >= MAX_DUNNING_STEPS) return steps;
-  const lastDay = steps.length ? steps[steps.length - 1].day : 0;
-  const day = Math.min(MAX_DUNNING_DAY, lastDay + 1);
+  const hasFinal = steps.at(-1)?.step_type === "final_attempt";
+  const priorDay = hasFinal ? (steps.at(-2)?.day ?? 0) : (steps.at(-1)?.day ?? 0);
+  const day = Math.min(MAX_DUNNING_DAY, priorDay + 1);
   // Insert before the final attempt, so the workflow still ends with it
   const newStep: DunningStep = {
     day,

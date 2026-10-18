@@ -2,6 +2,8 @@ export type DashboardTab =
   | "overview"
   | "plans"
   | "subscribers"
+  | "retention"
+  | "templates"
   | "payroll"
   | "multisig"
   | "passes"

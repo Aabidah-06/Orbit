@@ -66,7 +66,9 @@
       "domains": "Custom Domains",
       "links": "Payment Links",
       "team": "Team & Permissions",
-      "developers": "Developer Portal"
+      "developers": "Developer Portal",
+      "retention": "Retention",
+      "templates": "Email Templates"
     },
     "badges": {
       "superpower": "Superpower",
@@ -84,7 +86,9 @@
       "domains": "Custom Domains & SSL",
       "links": "Payment Links",
       "team": "Team & Permissions",
-      "developers": "Developer Portal"
+      "developers": "Developer Portal",
+      "retention": "Cohort Retention",
+      "templates": "Email Templates"
     },
     "settlementVault": "Settlement Vault",
     "ready": "READY",

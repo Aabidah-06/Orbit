@@ -9,6 +9,7 @@ const { API_KEY_ENVIRONMENTS, issueApiKey, requireApiKey } = require('./apiKeys'
 const { createRateLimiter, createStoreFromEnv } = require('./rateLimit');
 const { createReputationScorer, createHorizonWalletLookup } = require('./reputation');
 const { isRelayerError, createRelayerFromEnv } = require('./relayer');
+const { createFeeEstimator } = require('./fee-estimator');
 const { getAuditLogsQuerySchema, getClientIp, getActorAddress, writeAuditLog } = require('./audit');
 const {
     createWebhookSchema,
@@ -65,6 +66,9 @@ const {
 } = require('./contract-state-snapshot');
 const { getDatabaseManager } = require('./db');
 const { registerPrivacyRoutes } = require('./privacy');
+const { createUsageBufferFromEnv, registerUsageRoutes, rollupUsage } = require('./usage-meter');
+const { registerCohortRoutes } = require('./cohorts');
+const { registerNotificationTemplateRoutes } = require('./notification-templates');
 const { registerProofRoutes } = require('./proofs');
 const { registerOrganizationRoutes } = require('./organizations');
 const { registerRpcProxyRoute } = require('./rpc-proxy');
@@ -76,6 +80,9 @@ const { checkSchemaOnStartup } = require('./migrate');
 const { createInvoiceService, registerInvoiceRoutes } = require('./invoices');
 
 const app = express();
+const feeEstimator = createFeeEstimator({ horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org' });
+let defaultUsageBuffer;
+const getUsageBuffer = () => app.locals.usageBuffer || (defaultUsageBuffer ??= createUsageBufferFromEnv());
 // Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
 if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY);
 app.use(cors());
@@ -146,6 +153,7 @@ const getRelayer = () => {
         defaultRelayer = createRelayerFromEnv({
             server: getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
             getSupabase,
+            feeEstimator,
         });
     }
     return defaultRelayer;
@@ -509,6 +517,7 @@ const loadPullContext = async (supabase, subscriptionId, merchant) => {
 };
 
 // Records the confirmed outcome of a pull transaction, whoever submitted it
+const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id, txHash, status, confirmation, extraBody = {} }) => {
 const applyPullOutcome = async ({
     supabase,
     req,
@@ -546,12 +555,7 @@ const applyPullOutcome = async ({
             resourceId: subscription_id,
             ipAddress: getClientIp(req),
             changesBefore: { next_billing_date: sub.next_billing_date, status: sub.status },
-            changesAfter: {
-                next_billing_date: nextBilling.toISOString(),
-                status: 'active',
-                txHash,
-                amount: String(sub.plans.usdc_amount),
-            },
+            changesAfter: { next_billing_date: nextBilling.toISOString(), status: 'active', txHash },
         });
 
         if (sub.plans.merchant_id) {
@@ -574,6 +578,30 @@ const applyPullOutcome = async ({
                 }
             }
 
+            // Only record amounts independently verified from the
+            // successful on-chain funds_pulled event. Plan and oracle
+            // quotes are not necessarily the vault's actual transfer.
+            const verifiedAmount = confirmedSettlementAmount(
+                confirmation,
+                { customerWallet: sub.customer_wallet_address,
+                  merchantWallet: merchant.wallet_address,
+                  contractId: process.env.ORBIT_CONTRACT_ID },
+            );
+            if (verifiedAmount === null) {
+                console.error('CRITICAL: confirmed transfer missing verified amount; reconcile transaction:', txHash);
+            } else {
+                const { error: paymentError } = await supabase.from('payment_transactions').insert([{
+                    merchant_id: sub.plans.merchant_id,
+                    subscription_id,
+                    plan_id: sub.plan_id,
+                    customer_wallet_address: sub.customer_wallet_address,
+                    amount_usdc_units: verifiedAmount,
+                    status: 'settled',
+                    tx_hash: txHash,
+                    settled_at: pullTime.toISOString(),
+                }]);
+                if (paymentError && paymentError.code !== '23505') {
+                    console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
             if (confirmation) {
                 const verifiedAmount = confirmedSettlementAmount(confirmation, {
                     customerWallet: sub.customer_wallet_address,
@@ -639,7 +667,7 @@ const applyPullOutcome = async ({
                     merchantId: sub.plans.merchant_id,
                     subscriptionId: subscription_id,
                     primaryTxHash: txHash,
-                    amountUnits: settledAmount,
+                    amountUnits: sub.plans.usdc_amount,
                     settledAt: pullTime.toISOString(),
                     fetchImpl: app.locals.fetchImpl,
                 });
@@ -655,6 +683,7 @@ const applyPullOutcome = async ({
     }
 
     if (status === "FAILED") {
+        await recordPullFailure(supabase, subscription_id, 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.', txHash);
         if (server && signedTx) {
             let failureReason = 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.';
             try {
@@ -679,6 +708,7 @@ const applyPullOutcome = async ({
 
     // Still NOT_FOUND after the timeout: outcome unknown, let the caller poll later.
     // Keep the lease until it expires so no second pull races the one still in flight.
+    await recordPullFailure(supabase, subscription_id, 'RPC timeout: transaction submitted but not yet confirmed. Do not retry until its outcome is known.', txHash);
     if (server && signedTx) {
         await recordPullFailure(
             supabase,
@@ -770,7 +800,7 @@ app.post('/trigger-pull', authenticateMerchant, async (req, res) => {
                 const account = await server.getAccount(merchant.wallet_address);
 
                 const tx = new TransactionBuilder(account, {
-                    fee: "1000000",
+                    fee: String(await feeEstimator.estimate({ priority: "standard" })),
                     networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET
                 })
                 .addOperation(contract.call("pull_funds",
@@ -1957,6 +1987,9 @@ registerOrganizationRoutes(app, getSupabase, authenticateMerchant);
 registerInvoiceRoutes(app, getSupabase, authenticateMerchant);
 registerRpcProxyRoute(app);
 registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
+registerUsageRoutes(app, { getSupabase, authenticateMerchant, getBuffer: getUsageBuffer });
+registerCohortRoutes(app, getSupabase, authenticateMerchant);
+registerNotificationTemplateRoutes(app, getSupabase, authenticateMerchant);
 registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
 
@@ -2079,6 +2112,12 @@ function startServer() {
     } else {
         console.warn("Oracle worker not started: Supabase client not initialized");
     }
+
+    const usageInterval = setInterval(() => {
+        const buffer = getUsageBuffer(), supabase = getSupabase();
+        if (buffer && supabase) rollupUsage({ buffer, supabase }).catch((err) => console.error('Usage rollup failed:', err));
+    }, Number(process.env.USAGE_ROLLUP_INTERVAL_MS) || 300000);
+    usageInterval.unref();
 
     app.listen(PORT, () => {
         console.log(`Orbit Merchant API running on http://localhost:${PORT}`);
