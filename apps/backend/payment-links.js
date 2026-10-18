@@ -18,6 +18,14 @@ function registerPaymentLinkRoutes(app, getSupabase, authenticateMerchant) {
     res.json({ links: data });
   });
 
+  app.get('/payment-links/plans', authenticateMerchant, async (req, res) => {
+    const db = getSupabase();
+    if (!db) return res.status(503).json({ error: 'Database unavailable' });
+    const { data, error } = await db.from('plans').select('id,name,usdc_amount,interval_seconds,currency').eq('merchant_id', req.merchant.id).order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: 'Could not list plans' });
+    res.json({ plans: data });
+  });
+
   app.post('/payment-links', authenticateMerchant, async (req, res) => {
     const parsed = createSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'Invalid payment link options', details: parsed.error.flatten() });
