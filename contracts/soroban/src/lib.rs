@@ -1,5 +1,6 @@
 #![no_std]
 #![allow(deprecated)]
+#![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, token, Address, BytesN, Env, String,
@@ -40,6 +41,18 @@ pub const MAX_PAYROLL_APPROVERS: u32 = 20;
 /// work of a single transaction so a merchant with hundreds of due subscribers
 /// can page through them in bounded batches.
 pub const MAX_BATCH_PULL_SUBSCRIBERS: u32 = 50;
+
+/// Fixed-point precision used by revenue pools when accumulating dividends.
+pub const REVENUE_ACC_SCALE: i128 = 1_000_000_000_000;
+
+/// Keeps revenue-pool creation and claim lookups within predictable resource bounds.
+pub const MAX_REVENUE_POOL_SHAREHOLDERS: u32 = 100;
+
+/// Maximum elastic allowance above a metered vault's baseline limit.
+pub const MAX_OVERDRAFT_PERCENTAGE: u32 = 20;
+
+/// Challenge period between recovery initiation and execution.
+pub const RECOVERY_TIMELOCK_SECONDS: u64 = 14 * 24 * 60 * 60;
 
 /// Calculates (threshold, extend_to) in ledgers for vault persistent storage
 /// and contract instance storage based on interval_seconds.
@@ -218,6 +231,92 @@ pub struct PlanData {
     pub interval_seconds: u64,
     pub name: String,
     pub is_active: bool,
+}
+
+// ----------------------------------------------------------------------------
+// REVENUE SHARING, RECOVERY, ELASTICITY & GAS SUBSIDY (#127-130)
+// ----------------------------------------------------------------------------
+
+/// Public revenue-pool accounting requested by #127. Shareholder membership is
+/// immutable after creation so already-accrued entitlements cannot be diluted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevenuePool {
+    pub total_shares: u32,
+    pub shareholders: Vec<(Address, u32)>,
+    /// Deposited tokens that have not yet been claimed. This includes any
+    /// sub-token-unit dividend dust retained by fixed-point accounting.
+    pub undistributed_balance: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevenuePoolState {
+    pub owner: Address,
+    pub token: Address,
+    pub pool: RevenuePool,
+    /// Accumulated token units per share, scaled by `REVENUE_ACC_SCALE`.
+    pub acc_per_share: i128,
+    /// Scaled numerator remainder carried into the next deposit.
+    pub scaled_remainder: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevenueAccount {
+    /// Whole token units already withdrawn by this shareholder.
+    pub claimed: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultRecoveryConfig {
+    pub recovery_address: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultRecoveryRequest {
+    pub recovery_address: Address,
+    pub initiated_at: u64,
+    pub execute_after: u64,
+    /// Recovery freezes billing immediately. A veto restores this prior state.
+    pub was_paused: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ElasticityData {
+    pub overdraft_percentage: u32,
+    /// Prior-epoch overdraft deducted from this epoch's baseline.
+    pub carried_overdraft: i128,
+    /// Overdraft consumed above the adjusted baseline in the current epoch.
+    pub epoch_overdraft: i128,
+}
+
+/// Merchant-funded reimbursement reserve for a configured transaction sponsor.
+/// `native_token` must be the network's canonical native-XLM SAC address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GasSubsidyPool {
+    pub native_token: Address,
+    pub sponsor: Address,
+    pub balance: i128,
+    pub max_subsidy_per_handshake: i128,
+    pub next_nonce: u64,
+    pub locked: bool,
+}
+
+/// Namespaced keys prevent collisions with legacy struct-encoded storage keys.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FeatureKey {
+    RevenuePool(u64),
+    RevenueAccount(u64, Address),
+    RecoveryConfig(Address, Address),
+    RecoveryRequest(Address, Address),
+    Elasticity(Address, Address),
+    GasSubsidy(Address),
 }
 
 // ----------------------------------------------------------------------------
@@ -490,6 +589,31 @@ fn save_vault(env: &Env, key: &VaultKey, vault: &VaultData) {
     env.storage().persistent().set(key, vault);
 }
 
+fn extend_feature_key(env: &Env, key: &FeatureKey, lifetime_seconds: u64) {
+    let (threshold, extend_to) = calculate_ttl_params(lifetime_seconds);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, threshold, extend_to);
+}
+
+fn shareholder_weight(state: &RevenuePoolState, shareholder: &Address) -> u32 {
+    for entry in state.pool.shareholders.iter() {
+        if entry.0 == *shareholder {
+            return entry.1;
+        }
+    }
+    panic!("Address is not a shareholder")
+}
+
+fn clear_recovery_state(env: &Env, user: &Address, merchant: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&FeatureKey::RecoveryConfig(user.clone(), merchant.clone()));
+    env.storage()
+        .persistent()
+        .remove(&FeatureKey::RecoveryRequest(user.clone(), merchant.clone()));
+}
+
 // ----------------------------------------------------------------------------
 // CONTRACT LOGIC
 // ----------------------------------------------------------------------------
@@ -547,6 +671,7 @@ fn write_vault(
             user.clone(),
             merchant.clone(),
         ));
+    clear_recovery_state(env, user, merchant);
     let tier = env
         .storage()
         .persistent()
@@ -567,13 +692,15 @@ fn write_vault(
     } else {
         Symbol::new(env, "vault_created")
     };
-    env.events()
-        .publish((event, user.clone(), merchant.clone()), (
+    env.events().publish(
+        (event, user.clone(), merchant.clone()),
+        (
             token.clone(),
             amount_per_interval,
             interval_seconds,
             trial_end_timestamp,
-        ));
+        ),
+    );
     // Extend vault storage TTL and contract instance TTL to prevent archival
     let (threshold, extend_to) = calculate_ttl_params(interval_seconds);
     env.storage()
@@ -587,6 +714,349 @@ pub struct OrbitContract;
 
 #[contractimpl]
 impl OrbitContract {
+    // --------------------------------------------------------------------
+    // PROPORTIONAL REVENUE POOLS (#127)
+    // --------------------------------------------------------------------
+
+    /// Create an immutable-weight revenue pool. Immutability avoids retroactive
+    /// dilution and keeps cumulative entitlement math auditable.
+    pub fn create_revenue_pool(
+        env: Env,
+        owner: Address,
+        pool_id: u64,
+        token: Address,
+        shareholders: Vec<(Address, u32)>,
+    ) {
+        owner.require_auth();
+        assert!(!shareholders.is_empty(), "Shareholders must not be empty");
+        assert!(
+            shareholders.len() <= MAX_REVENUE_POOL_SHAREHOLDERS,
+            "Too many shareholders"
+        );
+
+        let key = FeatureKey::RevenuePool(pool_id);
+        assert!(
+            !env.storage().persistent().has(&key),
+            "Revenue pool already exists"
+        );
+
+        let mut total_shares = 0u32;
+        for (index, entry) in shareholders.iter().enumerate() {
+            assert!(entry.1 > 0, "Share weight must be positive");
+            for previous_index in 0..index as u32 {
+                let previous = shareholders
+                    .get(previous_index)
+                    .expect("Shareholder index missing");
+                assert!(previous.0 != entry.0, "Duplicate shareholder");
+            }
+            total_shares = total_shares
+                .checked_add(entry.1)
+                .expect("Total shares overflow");
+        }
+
+        let state = RevenuePoolState {
+            owner: owner.clone(),
+            token: token.clone(),
+            pool: RevenuePool {
+                total_shares,
+                shareholders,
+                undistributed_balance: 0,
+            },
+            acc_per_share: 0,
+            scaled_remainder: 0,
+        };
+        env.storage().persistent().set(&key, &state);
+        extend_feature_key(&env, &key, MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER);
+        env.events().publish(
+            (Symbol::new(&env, "revenue_pool_created"), pool_id),
+            (owner, token, total_shares),
+        );
+    }
+
+    /// Deposit revenue and add it to the cumulative per-share accumulator. The
+    /// division remainder is carried into later deposits, rather than discarded.
+    pub fn deposit_to_pool(env: Env, sender: Address, pool_id: u64, token: Address, amount: i128) {
+        sender.require_auth();
+        assert!(amount > 0, "Deposit amount must be positive");
+
+        let key = FeatureKey::RevenuePool(pool_id);
+        let mut state: RevenuePoolState = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Revenue pool does not exist");
+        assert!(state.token == token, "Wrong revenue pool token");
+
+        let scaled = amount
+            .checked_mul(REVENUE_ACC_SCALE)
+            .expect("Revenue accumulator overflow")
+            .checked_add(state.scaled_remainder)
+            .expect("Revenue accumulator overflow");
+        let total_shares = i128::from(state.pool.total_shares);
+        let increment = scaled / total_shares;
+        state.scaled_remainder = scaled % total_shares;
+        state.acc_per_share = state
+            .acc_per_share
+            .checked_add(increment)
+            .expect("Revenue accumulator overflow");
+        state.pool.undistributed_balance = state
+            .pool
+            .undistributed_balance
+            .checked_add(amount)
+            .expect("Revenue balance overflow");
+
+        // Effects precede the external token call; a failed transfer reverts all.
+        env.storage().persistent().set(&key, &state);
+        token::Client::new(&env, &token).transfer_from(
+            &env.current_contract_address(),
+            &sender,
+            &env.current_contract_address(),
+            &amount,
+        );
+        extend_feature_key(&env, &key, MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER);
+        env.events().publish(
+            (Symbol::new(&env, "revenue_deposited"), pool_id),
+            (sender, token, amount, state.acc_per_share),
+        );
+    }
+
+    /// Claim all whole-token units accrued to `shareholder` and not previously
+    /// withdrawn. Fractional fixed-point entitlement remains for later deposits.
+    pub fn claim_shareholder_dividends(env: Env, shareholder: Address, pool_id: u64) -> i128 {
+        shareholder.require_auth();
+        let pool_key = FeatureKey::RevenuePool(pool_id);
+        let mut state: RevenuePoolState = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .expect("Revenue pool does not exist");
+        let weight = i128::from(shareholder_weight(&state, &shareholder));
+        let gross_entitlement = weight
+            .checked_mul(state.acc_per_share)
+            .expect("Dividend entitlement overflow")
+            / REVENUE_ACC_SCALE;
+
+        let account_key = FeatureKey::RevenueAccount(pool_id, shareholder.clone());
+        let mut account: RevenueAccount = env
+            .storage()
+            .persistent()
+            .get(&account_key)
+            .unwrap_or(RevenueAccount { claimed: 0 });
+        let amount = gross_entitlement
+            .checked_sub(account.claimed)
+            .expect("Invalid dividend account");
+        assert!(amount > 0, "No dividends available");
+        assert!(
+            amount <= state.pool.undistributed_balance,
+            "Insufficient pool balance"
+        );
+
+        account.claimed = gross_entitlement;
+        state.pool.undistributed_balance -= amount;
+        env.storage().persistent().set(&account_key, &account);
+        env.storage().persistent().set(&pool_key, &state);
+        token::Client::new(&env, &state.token).transfer(
+            &env.current_contract_address(),
+            &shareholder,
+            &amount,
+        );
+        extend_feature_key(&env, &pool_key, MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER);
+        extend_feature_key(
+            &env,
+            &account_key,
+            MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "revenue_claimed"), pool_id),
+            (shareholder, amount),
+        );
+        amount
+    }
+
+    pub fn get_revenue_pool(env: Env, pool_id: u64) -> Option<RevenuePoolState> {
+        env.storage()
+            .persistent()
+            .get(&FeatureKey::RevenuePool(pool_id))
+    }
+
+    // --------------------------------------------------------------------
+    // MERCHANT-FUNDED SPONSOR REIMBURSEMENT (#130)
+    // --------------------------------------------------------------------
+
+    /// Configure a reimbursement reserve. The merchant must provide the
+    /// canonical native-XLM SAC address for the deployment network and a
+    /// trusted off-chain transaction sponsor.
+    pub fn configure_gas_subsidy(
+        env: Env,
+        merchant: Address,
+        native_token: Address,
+        sponsor: Address,
+        max_subsidy_per_handshake: i128,
+    ) {
+        merchant.require_auth();
+        assert!(
+            max_subsidy_per_handshake > 0,
+            "Maximum subsidy must be positive"
+        );
+        let key = FeatureKey::GasSubsidy(merchant.clone());
+        let pool = if let Some(existing) = env.storage().persistent().get::<_, GasSubsidyPool>(&key)
+        {
+            assert!(!existing.locked, "Gas subsidy pool is locked");
+            assert!(
+                existing.native_token == native_token,
+                "Cannot change funded subsidy token"
+            );
+            assert!(
+                existing.sponsor == sponsor,
+                "Cannot change configured sponsor"
+            );
+            GasSubsidyPool {
+                max_subsidy_per_handshake,
+                ..existing
+            }
+        } else {
+            GasSubsidyPool {
+                native_token,
+                sponsor,
+                balance: 0,
+                max_subsidy_per_handshake,
+                next_nonce: 0,
+                locked: false,
+            }
+        };
+        env.storage().persistent().set(&key, &pool);
+        extend_feature_key(&env, &key, MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER);
+    }
+
+    pub fn deposit_gas_subsidy(env: Env, merchant: Address, amount: i128) {
+        merchant.require_auth();
+        assert!(amount > 0, "Subsidy deposit must be positive");
+        let key = FeatureKey::GasSubsidy(merchant.clone());
+        let mut pool: GasSubsidyPool = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Gas subsidy pool is not configured");
+        assert!(!pool.locked, "Gas subsidy pool is locked");
+        pool.balance = pool
+            .balance
+            .checked_add(amount)
+            .expect("Gas subsidy balance overflow");
+        pool.locked = true;
+        env.storage().persistent().set(&key, &pool);
+        token::Client::new(&env, &pool.native_token).transfer_from(
+            &env.current_contract_address(),
+            &merchant,
+            &env.current_contract_address(),
+            &amount,
+        );
+        pool.locked = false;
+        env.storage().persistent().set(&key, &pool);
+        extend_feature_key(&env, &key, MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER);
+        env.events().publish(
+            (Symbol::new(&env, "gas_subsidy_deposited"), merchant),
+            (amount, pool.balance),
+        );
+    }
+
+    pub fn withdraw_gas_subsidy(env: Env, merchant: Address, amount: i128) {
+        merchant.require_auth();
+        assert!(amount > 0, "Subsidy withdrawal must be positive");
+        let key = FeatureKey::GasSubsidy(merchant.clone());
+        let mut pool: GasSubsidyPool = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Gas subsidy pool is not configured");
+        assert!(!pool.locked, "Gas subsidy pool is locked");
+        assert!(amount <= pool.balance, "Insufficient subsidy balance");
+        pool.balance -= amount;
+        pool.locked = true;
+        env.storage().persistent().set(&key, &pool);
+        token::Client::new(&env, &pool.native_token).transfer(
+            &env.current_contract_address(),
+            &merchant,
+            &amount,
+        );
+        pool.locked = false;
+        env.storage().persistent().set(&key, &pool);
+        env.events().publish(
+            (Symbol::new(&env, "gas_subsidy_withdrawn"), merchant),
+            (amount, pool.balance),
+        );
+    }
+
+    /// Create a vault while reimbursing a configured transaction sponsor from
+    /// the merchant reserve. The sponsor must still submit/pay the transaction;
+    /// Soroban contracts cannot pay their own invocation fee.
+    pub fn create_sponsored_vault(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        token: Address,
+        amount_per_interval: i128,
+        interval_seconds: u64,
+        subsidy_amount: i128,
+        nonce: u64,
+    ) {
+        user.require_auth();
+        assert!(subsidy_amount > 0, "Subsidy amount must be positive");
+        let subsidy_key = FeatureKey::GasSubsidy(merchant.clone());
+        let mut pool: GasSubsidyPool = env
+            .storage()
+            .persistent()
+            .get(&subsidy_key)
+            .expect("Gas subsidy pool is not configured");
+        pool.sponsor.require_auth();
+        assert!(!pool.locked, "Gas subsidy pool is locked");
+        assert!(
+            subsidy_amount <= pool.max_subsidy_per_handshake,
+            "Subsidy exceeds per-handshake cap"
+        );
+        assert!(
+            subsidy_amount <= pool.balance,
+            "Insufficient subsidy balance"
+        );
+        assert!(nonce == pool.next_nonce, "Invalid subsidy nonce");
+
+        pool.balance -= subsidy_amount;
+        pool.next_nonce = pool
+            .next_nonce
+            .checked_add(1)
+            .expect("Subsidy nonce exhausted");
+        pool.locked = true;
+        env.storage().persistent().set(&subsidy_key, &pool);
+
+        write_vault(
+            &env,
+            &user,
+            &merchant,
+            &token,
+            amount_per_interval,
+            interval_seconds,
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            0,
+        );
+        token::Client::new(&env, &pool.native_token).transfer(
+            &env.current_contract_address(),
+            &pool.sponsor,
+            &subsidy_amount,
+        );
+
+        pool.locked = false;
+        env.storage().persistent().set(&subsidy_key, &pool);
+        env.events().publish(
+            (Symbol::new(&env, "vault_sponsored"), user, merchant),
+            (pool.sponsor, subsidy_amount, nonce),
+        );
+    }
+
+    pub fn get_gas_subsidy_pool(env: Env, merchant: Address) -> Option<GasSubsidyPool> {
+        env.storage()
+            .persistent()
+            .get(&FeatureKey::GasSubsidy(merchant))
+    }
+
     /// 1. THE HANDSHAKE (Create Allowance)
     /// The user calls this to set up a recurring subscription for a merchant.
     pub fn create_vault(
@@ -668,6 +1138,231 @@ impl OrbitContract {
             interval_seconds,
             DEFAULT_GRACE_PERIOD_SECONDS,
             trial_end_timestamp,
+        );
+    }
+
+    /// Create a fixed-interval vault with a separately designated recovery
+    /// address. Existing creation entrypoints remain recovery-disabled.
+    pub fn create_vault_with_recovery(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        token: Address,
+        amount_per_interval: i128,
+        interval_seconds: u64,
+        recovery_address: Address,
+    ) {
+        user.require_auth();
+        assert!(
+            recovery_address != user,
+            "Recovery address must differ from user"
+        );
+        write_vault(
+            &env,
+            &user,
+            &merchant,
+            &token,
+            amount_per_interval,
+            interval_seconds,
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            0,
+        );
+
+        let recovery_key = FeatureKey::RecoveryConfig(user.clone(), merchant.clone());
+        env.storage().persistent().set(
+            &recovery_key,
+            &VaultRecoveryConfig {
+                recovery_address: recovery_address.clone(),
+            },
+        );
+        extend_feature_key(&env, &recovery_key, interval_seconds);
+        env.events().publish(
+            (Symbol::new(&env, "recovery_configured"), user, merchant),
+            recovery_address,
+        );
+    }
+
+    pub fn get_vault_recovery(
+        env: Env,
+        user: Address,
+        merchant: Address,
+    ) -> Option<VaultRecoveryRequest> {
+        env.storage()
+            .persistent()
+            .get(&FeatureKey::RecoveryRequest(user, merchant))
+    }
+
+    /// The designated address starts the challenge window and immediately
+    /// freezes merchant pulls so a lost-key vault cannot keep draining.
+    pub fn initiate_vault_recovery(
+        env: Env,
+        recovery_address: Address,
+        user: Address,
+        merchant: Address,
+    ) {
+        recovery_address.require_auth();
+        let config_key = FeatureKey::RecoveryConfig(user.clone(), merchant.clone());
+        let config: VaultRecoveryConfig = env
+            .storage()
+            .persistent()
+            .get(&config_key)
+            .expect("Vault recovery is not configured");
+        assert!(
+            config.recovery_address == recovery_address,
+            "Not the designated recovery address"
+        );
+        let request_key = FeatureKey::RecoveryRequest(user.clone(), merchant.clone());
+        assert!(
+            !env.storage().persistent().has(&request_key),
+            "Recovery already pending"
+        );
+
+        let vault_key = vault_key(&user, &merchant);
+        let mut vault = load_vault(&env, &vault_key).expect("Vault does not exist");
+        let now = env.ledger().timestamp();
+        let execute_after = now
+            .checked_add(RECOVERY_TIMELOCK_SECONDS)
+            .expect("Recovery deadline overflow");
+        let request = VaultRecoveryRequest {
+            recovery_address: recovery_address.clone(),
+            initiated_at: now,
+            execute_after,
+            was_paused: vault.is_paused,
+        };
+        vault.is_paused = true;
+        save_vault(&env, &vault_key, &vault);
+        deactivate_badge(&env, &user, &merchant, vault.interval_seconds);
+        env.storage().persistent().set(&request_key, &request);
+        extend_feature_key(&env, &config_key, RECOVERY_TIMELOCK_SECONDS);
+        extend_feature_key(&env, &request_key, RECOVERY_TIMELOCK_SECONDS);
+        env.events().publish(
+            (Symbol::new(&env, "recovery_initiated"), user, merchant),
+            (recovery_address, execute_after),
+        );
+    }
+
+    /// The original key can veto a pending request at any point before it is
+    /// executed and restores the vault's prior pause state.
+    pub fn cancel_recovery(env: Env, user: Address, merchant: Address) {
+        user.require_auth();
+        let request_key = FeatureKey::RecoveryRequest(user.clone(), merchant.clone());
+        let request: VaultRecoveryRequest = env
+            .storage()
+            .persistent()
+            .get(&request_key)
+            .expect("Recovery request does not exist");
+        let vault_key = vault_key(&user, &merchant);
+        let mut vault = load_vault(&env, &vault_key).expect("Vault does not exist");
+        vault.is_paused = request.was_paused;
+        save_vault(&env, &vault_key, &vault);
+        if !vault.is_paused {
+            let tier = env
+                .storage()
+                .persistent()
+                .get::<_, BadgeData>(&SubscriptionKey::Badge(user.clone(), merchant.clone()))
+                .map(|badge| badge.tier)
+                .unwrap_or(1);
+            activate_badge(
+                &env,
+                &user,
+                &merchant,
+                tier,
+                env.ledger()
+                    .timestamp()
+                    .saturating_add(vault.interval_seconds),
+                vault.interval_seconds,
+            );
+        }
+        env.storage().persistent().remove(&request_key);
+        env.events().publish(
+            (Symbol::new(&env, "recovery_cancelled"), user, merchant),
+            (),
+        );
+    }
+
+    /// After the challenge window, replace the old vault with a paused vault
+    /// owned by the recovery address. The recovered account must approve the
+    /// token allowance and call `resume_vault` before billing can restart.
+    pub fn execute_vault_recovery(
+        env: Env,
+        recovery_address: Address,
+        user: Address,
+        merchant: Address,
+    ) {
+        recovery_address.require_auth();
+        let request_key = FeatureKey::RecoveryRequest(user.clone(), merchant.clone());
+        let request: VaultRecoveryRequest = env
+            .storage()
+            .persistent()
+            .get(&request_key)
+            .expect("Recovery request does not exist");
+        assert!(
+            request.recovery_address == recovery_address,
+            "Not the designated recovery address"
+        );
+        assert!(
+            env.ledger().timestamp() >= request.execute_after,
+            "Recovery timelock has not elapsed"
+        );
+
+        let old_key = vault_key(&user, &merchant);
+        let old_vault = load_vault(&env, &old_key).expect("Vault does not exist");
+        let new_key = vault_key(&recovery_address, &merchant);
+        assert!(
+            !env.storage().persistent().has(&new_key),
+            "Recovery destination vault already exists"
+        );
+
+        let now = env.ledger().timestamp();
+        let replacement = VaultData {
+            token: old_vault.token.clone(),
+            amount_per_interval: old_vault.amount_per_interval,
+            interval_seconds: old_vault.interval_seconds,
+            last_pull_timestamp: now,
+            grace_period_seconds: old_vault.grace_period_seconds,
+            payment_status: PAYMENT_ACTIVE,
+            initial_timestamp: now,
+            pull_sequence: PULL_SEQUENCE_UNSET,
+            is_paused: true,
+            trial_end_timestamp: 0,
+        };
+
+        // Remove the old contract-level connection before creating the new one.
+        deactivate_badge(&env, &user, &merchant, old_vault.interval_seconds);
+        env.storage().persistent().remove(&old_key);
+        env.storage()
+            .persistent()
+            .remove(&SubscriptionKey::Swap(user.clone(), merchant.clone()));
+        env.storage()
+            .persistent()
+            .remove(&SubscriptionKey::EscrowPolicy(
+                user.clone(),
+                merchant.clone(),
+            ));
+        clear_recovery_state(&env, &user, &merchant);
+
+        save_vault(&env, &new_key, &replacement);
+        activate_badge(
+            &env,
+            &recovery_address,
+            &merchant,
+            1,
+            now.saturating_add(old_vault.interval_seconds),
+            old_vault.interval_seconds,
+        );
+        deactivate_badge(
+            &env,
+            &recovery_address,
+            &merchant,
+            old_vault.interval_seconds,
+        );
+        let (threshold, extend_to) = calculate_ttl_params(old_vault.interval_seconds);
+        env.storage()
+            .persistent()
+            .extend_ttl(&new_key, threshold, extend_to);
+        env.events().publish(
+            (Symbol::new(&env, "vault_recovered"), user, merchant),
+            recovery_address,
         );
     }
 
@@ -850,18 +1545,26 @@ impl OrbitContract {
         assert!(
             env.storage()
                 .persistent()
-                .get(&DataKey::TrustedSwapRouter(merchant.clone(), router.clone()))
+                .get(&DataKey::TrustedSwapRouter(
+                    merchant.clone(),
+                    router.clone()
+                ))
                 .unwrap_or(false),
             "Router is not approved by this merchant"
         );
 
-        Self::create_vault(
-            env.clone(),
-            user.clone(),
-            merchant.clone(),
-            settlement_token.clone(),
+        // The user already authorized this entrypoint. Calling the public
+        // `create_vault` entrypoint here would request the same auth frame a
+        // second time and Soroban rejects that duplicate authorization.
+        write_vault(
+            &env,
+            &user,
+            &merchant,
+            &settlement_token,
             amount_per_interval,
             interval_seconds,
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            0,
         );
 
         token::Client::new(&env, &payment_token).approve(
@@ -884,11 +1587,7 @@ impl OrbitContract {
         extend_key(&env, &key, interval_seconds);
 
         env.events().publish(
-            (
-                Symbol::new(&env, "vault_swap_configured"),
-                user,
-                merchant,
-            ),
+            (Symbol::new(&env, "vault_swap_configured"), user, merchant),
             (payment_token, settlement_token, max_input_amount),
         );
     }
@@ -1041,7 +1740,11 @@ impl OrbitContract {
         }
         if has_metered {
             env.storage().persistent().remove(&metered_key);
+            env.storage()
+                .persistent()
+                .remove(&FeatureKey::Elasticity(user.clone(), merchant.clone()));
         }
+        clear_recovery_state(&env, &user, &merchant);
 
         // Emit contract event
         env.events()
@@ -1056,8 +1759,13 @@ impl OrbitContract {
         };
         assert!(env.storage().persistent().has(&key), "Vault does not exist");
         env.storage().persistent().remove(&key);
+        clear_recovery_state(&env, &user, &merchant);
         env.events().publish(
-            (Symbol::new(&env, "merchant_vault_cancelled"), user, merchant),
+            (
+                Symbol::new(&env, "merchant_vault_cancelled"),
+                user,
+                merchant,
+            ),
             (),
         );
     }
@@ -1422,12 +2130,15 @@ impl OrbitContract {
         vault.last_pull_timestamp = current_time;
         vault.payment_status = PAYMENT_ACTIVE;
         vault.pull_sequence = cycle_index;
-        save_vault(env, &key, vault);
+        save_vault(env, &key, &vault);
 
         let tier = env
             .storage()
             .persistent()
-            .get::<_, BadgeData>(&SubscriptionKey::Badge(subscriber.clone(), merchant.clone()))
+            .get::<_, BadgeData>(&SubscriptionKey::Badge(
+                subscriber.clone(),
+                merchant.clone(),
+            ))
             .map(|badge| badge.tier)
             .unwrap_or(1);
         activate_badge(
@@ -1480,6 +2191,9 @@ impl OrbitContract {
         );
 
         let key = MeteredVaultKey::Vault(user.clone(), merchant.clone());
+        env.storage()
+            .persistent()
+            .remove(&FeatureKey::Elasticity(user.clone(), merchant.clone()));
         let vault = MeteredVaultData {
             token: token.clone(),
             max_amount_per_interval,
@@ -1499,6 +2213,55 @@ impl OrbitContract {
             .persistent()
             .extend_ttl(&key, threshold, extend_to);
         env.storage().instance().extend_ttl(threshold, extend_to);
+    }
+
+    /// Create a usage-based vault with an overdraft buffer capped at 20%.
+    /// The existing `create_metered_vault` remains a strict, non-elastic path.
+    pub fn create_elastic_metered_vault(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        token: Address,
+        max_amount_per_interval: i128,
+        interval_seconds: u64,
+        overdraft_percentage: u32,
+    ) {
+        assert!(
+            overdraft_percentage <= MAX_OVERDRAFT_PERCENTAGE,
+            "Overdraft percentage exceeds 20%"
+        );
+        Self::create_metered_vault(
+            env.clone(),
+            user.clone(),
+            merchant.clone(),
+            token,
+            max_amount_per_interval,
+            interval_seconds,
+        );
+        let key = FeatureKey::Elasticity(user.clone(), merchant.clone());
+        env.storage().persistent().set(
+            &key,
+            &ElasticityData {
+                overdraft_percentage,
+                carried_overdraft: 0,
+                epoch_overdraft: 0,
+            },
+        );
+        extend_feature_key(&env, &key, interval_seconds);
+        env.events().publish(
+            (Symbol::new(&env, "elasticity_configured"), user, merchant),
+            overdraft_percentage,
+        );
+    }
+
+    pub fn get_metered_elasticity(
+        env: Env,
+        user: Address,
+        merchant: Address,
+    ) -> Option<ElasticityData> {
+        env.storage()
+            .persistent()
+            .get(&FeatureKey::Elasticity(user, merchant))
     }
 
     /// Read a metered vault. No authorization and no storage mutation.
@@ -1526,14 +2289,31 @@ impl OrbitContract {
             .persistent()
             .get(&key)
             .expect("Metered vault does not exist");
+        let elasticity_key = FeatureKey::Elasticity(user.clone(), merchant.clone());
+        let mut elasticity: Option<ElasticityData> =
+            env.storage().persistent().get(&elasticity_key);
 
-        // Epoch rollover: a new interval resets the allowance.
+        // Epoch rollover: strict vaults reset to their baseline. Elastic vaults
+        // carry only the overdraft used in the completed epoch into the next
+        // epoch's adjusted baseline.
         let now = env.ledger().timestamp();
         if now
             >= vault
                 .current_epoch_start
                 .saturating_add(vault.interval_seconds)
         {
+            if let Some(config) = elasticity.as_mut() {
+                let elapsed =
+                    now.saturating_sub(vault.current_epoch_start) / vault.interval_seconds;
+                config.carried_overdraft = if elapsed > 1 {
+                    // At least one full, zero-spend epoch followed the debt
+                    // repayment epoch, so no overdraft remains outstanding.
+                    0
+                } else {
+                    config.epoch_overdraft
+                };
+                config.epoch_overdraft = 0;
+            }
             vault.current_epoch_start = now;
             vault.epoch_spent = 0;
         }
@@ -1542,14 +2322,42 @@ impl OrbitContract {
             .epoch_spent
             .checked_add(amount)
             .expect("Interval spending limit exceeded");
-        assert!(
-            new_spent <= vault.max_amount_per_interval,
-            "Interval spending limit exceeded"
-        );
+        if let Some(config) = elasticity.as_mut() {
+            let overdraft_limit = vault
+                .max_amount_per_interval
+                .checked_mul(i128::from(config.overdraft_percentage))
+                .expect("Overdraft limit overflow")
+                / 100;
+            let adjusted_baseline = vault
+                .max_amount_per_interval
+                .checked_sub(config.carried_overdraft)
+                .expect("Invalid carried overdraft");
+            let combined_cap = adjusted_baseline
+                .checked_add(overdraft_limit)
+                .expect("Interval spending limit overflow");
+            assert!(
+                new_spent <= combined_cap,
+                "Interval spending limit exceeded"
+            );
+            config.epoch_overdraft = new_spent.saturating_sub(adjusted_baseline);
+            assert!(
+                config.epoch_overdraft <= overdraft_limit,
+                "Overdraft limit exceeded"
+            );
+        } else {
+            assert!(
+                new_spent <= vault.max_amount_per_interval,
+                "Interval spending limit exceeded"
+            );
+        }
 
         // Record the spend before moving funds (checks-effects-interactions).
         vault.epoch_spent = new_spent;
         env.storage().persistent().set(&key, &vault);
+        if let Some(config) = elasticity {
+            env.storage().persistent().set(&elasticity_key, &config);
+            extend_feature_key(&env, &elasticity_key, vault.interval_seconds);
+        }
 
         let token_client = token::Client::new(&env, &vault.token);
         token_client.transfer_from(&env.current_contract_address(), &user, &merchant, &amount);
