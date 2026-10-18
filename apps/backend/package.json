@@ -10,7 +10,10 @@
     "inspect-contract": "node scripts/inspect-contract.js",
     "generate:contract-sdk": "node scripts/generate-contract-sdk.js",
     "reconcile": "node reconciliation.js",
-    "db:restore-from-ledger": "node scripts/restore-from-ledger.js"
+    "db:restore-from-ledger": "node scripts/restore-from-ledger.js",
+    "migrate:up": "node scripts/migrate.js up",
+    "migrate:down": "node scripts/migrate.js down",
+    "migrate:status": "node scripts/migrate.js status"
   },
   "keywords": [],
   "author": "",

@@ -487,25 +487,18 @@ fn test_compact_layout_round_trips_vault_data() {
     f.env.ledger().set_timestamp(4242);
     f.client.pull_funds(&f.user, &merchant);
 
-    assert_eq!(
-        f.client.get_vault(&f.user, &merchant),
-        Some(VaultData {
-            token: f.token_address.clone(),
-            amount_per_interval: AMOUNT,
-            interval_seconds: INTERVAL,
-            last_pull_timestamp: 4242,
-        })
-    );
-    // The stored value is the positional StoredVault, not the named VaultData
-    let stored: StoredVault = f.env.as_contract(&f.contract_id, || {
+    let vault = f.client.get_vault(&f.user, &merchant).unwrap();
+    assert_eq!(vault.token, f.token_address);
+    assert_eq!(vault.amount_per_interval, AMOUNT);
+    assert_eq!(vault.interval_seconds, INTERVAL);
+    assert_eq!(vault.last_pull_timestamp, 4242);
+    // The raw persistent entry decodes back to the same VaultData
+    let stored: VaultData = f.env.as_contract(&f.contract_id, || {
         f.env
             .storage()
             .persistent()
             .get(&vault_key(&f.user, &merchant))
             .unwrap()
     });
-    assert_eq!(
-        stored,
-        StoredVault(f.token_address.clone(), AMOUNT, INTERVAL, 4242)
-    );
+    assert_eq!(stored, vault);
 }

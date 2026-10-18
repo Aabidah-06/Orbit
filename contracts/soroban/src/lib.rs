@@ -2,8 +2,8 @@
 #![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, token, Address, BytesN, Env, String,
-    Symbol, Vec,
+    contract, contractclient, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
+    String, Symbol, Vec,
 };
 
 // ----------------------------------------------------------------------------
@@ -160,6 +160,21 @@ pub struct PayrollEscrow {
     pub reclaimed: bool,
 }
 
+/// A Merkle payroll distribution (#156): the sender escrows the full payroll
+/// once and publishes only the Merkle root of every `(recipient, amount)`
+/// allocation. Recipients then claim individually with a proof, so payroll for
+/// thousands of contractors never has to fit in a single transaction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerklePayrollData {
+    pub sender: Address,
+    pub token: Address,
+    pub merkle_root: BytesN<32>,
+    pub total_deposited: i128,
+    pub claimed_amount: i128,
+    pub expiration_timestamp: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -169,6 +184,11 @@ pub enum DataKey {
     /// Id the next payroll escrow deposit will receive
     NextPayrollEscrowId,
     PayrollEscrow(u64),
+    /// Id the next Merkle payroll distribution will receive (#156)
+    NextMerklePayrollId,
+    MerklePayroll(u64),
+    /// Claimed flag for one leaf of a Merkle payroll: (claim_id, leaf hash)
+    MerkleClaimed(u64, BytesN<32>),
     /// Router a merchant has pre-approved for cross-asset subscriptions (#191)
     TrustedSwapRouter(Address, Address),
 }
@@ -855,13 +875,17 @@ impl OrbitContract {
             "Router is not approved by this merchant"
         );
 
-        Self::create_vault(
-            env.clone(),
-            user.clone(),
-            merchant.clone(),
-            settlement_token.clone(),
+        // Write the vault directly: `create_vault` would require `user` auth a
+        // second time in this frame, which the host rejects.
+        write_vault(
+            &env,
+            &user,
+            &merchant,
+            &settlement_token,
             amount_per_interval,
             interval_seconds,
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            0,
         );
 
         token::Client::new(&env, &payment_token).approve(
@@ -1422,7 +1446,7 @@ impl OrbitContract {
         vault.last_pull_timestamp = current_time;
         vault.payment_status = PAYMENT_ACTIVE;
         vault.pull_sequence = cycle_index;
-        save_vault(env, &key, vault);
+        save_vault(env, &key, &vault);
 
         let tier = env
             .storage()
@@ -1974,6 +1998,184 @@ impl OrbitContract {
     }
 
     // --------------------------------------------------------------------
+    // MERKLE PAYROLL DISTRIBUTION (#156)
+    // --------------------------------------------------------------------
+
+    /// Escrow `total_amount` of `token` for a payroll described by
+    /// `merkle_root`, whose leaves are `SHA256(recipient_xdr || amount_be)`.
+    /// Recipients claim until `now + duration_seconds`. Returns the claim id.
+    pub fn create_merkle_payroll(
+        env: Env,
+        sender: Address,
+        token: Address,
+        merkle_root: BytesN<32>,
+        total_amount: i128,
+        duration_seconds: u64,
+    ) -> u64 {
+        sender.require_auth();
+        assert!(total_amount > 0, "amount must be positive");
+        assert!(duration_seconds > 0, "duration must be positive");
+        let expiration_timestamp = env
+            .ledger()
+            .timestamp()
+            .checked_add(duration_seconds)
+            .expect("expiration overflow");
+
+        let counter_key = DataKey::NextMerklePayrollId;
+        let id: u64 = env.storage().instance().get(&counter_key).unwrap_or(0);
+        env.storage().instance().set(
+            &counter_key,
+            &id.checked_add(1).expect("Merkle payroll ID exhausted"),
+        );
+
+        // Lock the whole payroll before publishing the root, so a failed
+        // transfer reverts the call and leaves no claimable distribution.
+        token::Client::new(&env, &token).transfer_from(
+            &env.current_contract_address(),
+            &sender,
+            &env.current_contract_address(),
+            &total_amount,
+        );
+
+        let payroll = MerklePayrollData {
+            sender: sender.clone(),
+            token: token.clone(),
+            merkle_root: merkle_root.clone(),
+            total_deposited: total_amount,
+            claimed_amount: 0,
+            expiration_timestamp,
+        };
+        save_merkle_payroll(&env, id, &payroll);
+
+        env.events().publish(
+            (Symbol::new(&env, "merkle_payroll_created"), sender, id),
+            (token, merkle_root, total_amount, expiration_timestamp),
+        );
+        id
+    }
+
+    /// Pay `amount` to `recipient` if `proof` shows `(recipient, amount)` is a
+    /// leaf of the payroll's root. Permissionless: funds only ever go to the
+    /// proven recipient, so a relayer may submit the claim on their behalf.
+    /// Each leaf can be claimed once.
+    pub fn claim_merkle_payroll(
+        env: Env,
+        claim_id: u64,
+        recipient: Address,
+        amount: i128,
+        proof: Vec<BytesN<32>>,
+    ) {
+        assert!(amount > 0, "amount must be positive");
+        let mut payroll = load_merkle_payroll(&env, claim_id);
+        assert!(
+            env.ledger().timestamp() <= payroll.expiration_timestamp,
+            "Claim window has expired"
+        );
+
+        let leaf = merkle_leaf(&env, &recipient, amount);
+        assert!(
+            verify_merkle_proof(&env, &proof, &payroll.merkle_root, &leaf),
+            "Invalid Merkle proof"
+        );
+
+        let claimed_key = DataKey::MerkleClaimed(claim_id, leaf);
+        assert!(
+            !env.storage().persistent().has(&claimed_key),
+            "Leaf already claimed"
+        );
+        let claimed_amount = payroll
+            .claimed_amount
+            .checked_add(amount)
+            .expect("claimed amount overflow");
+        assert!(
+            claimed_amount <= payroll.total_deposited,
+            "amount exceeds unclaimed balance"
+        );
+
+        // Record the claim before transferring, so the leaf can never pay twice
+        payroll.claimed_amount = claimed_amount;
+        save_merkle_payroll(&env, claim_id, &payroll);
+        env.storage().persistent().set(&claimed_key, &true);
+        let (threshold, extend_to) = calculate_ttl_params(
+            payroll
+                .expiration_timestamp
+                .saturating_sub(env.ledger().timestamp()),
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&claimed_key, threshold, extend_to);
+
+        token::Client::new(&env, &payroll.token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "merkle_payroll_claimed"),
+                recipient,
+                claim_id,
+            ),
+            (payroll.token, amount),
+        );
+    }
+
+    /// Returns the unclaimed remainder of a Merkle payroll to its sender once
+    /// the claim window has closed. Marks the payroll fully settled first, so
+    /// it can only be reclaimed once.
+    pub fn reclaim_merkle_payroll(env: Env, sender: Address, claim_id: u64) -> i128 {
+        sender.require_auth();
+        let mut payroll = load_merkle_payroll(&env, claim_id);
+        assert!(payroll.sender == sender, "Not the payroll sender");
+        assert!(
+            env.ledger().timestamp() > payroll.expiration_timestamp,
+            "Expiration timestamp has not passed"
+        );
+        let unclaimed = payroll.total_deposited - payroll.claimed_amount;
+        assert!(unclaimed > 0, "No unclaimed balance to reclaim");
+
+        payroll.claimed_amount = payroll.total_deposited;
+        save_merkle_payroll(&env, claim_id, &payroll);
+
+        token::Client::new(&env, &payroll.token).transfer(
+            &env.current_contract_address(),
+            &sender,
+            &unclaimed,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "merkle_payroll_reclaimed"),
+                sender,
+                claim_id,
+            ),
+            (payroll.token, unclaimed),
+        );
+        unclaimed
+    }
+
+    /// Read a Merkle payroll distribution. Requires no authorization.
+    pub fn get_merkle_payroll(env: Env, claim_id: u64) -> Option<MerklePayrollData> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerklePayroll(claim_id))
+    }
+
+    /// Whether the `(recipient, amount)` leaf of a Merkle payroll was claimed.
+    pub fn is_merkle_leaf_claimed(
+        env: Env,
+        claim_id: u64,
+        recipient: Address,
+        amount: i128,
+    ) -> bool {
+        let leaf = merkle_leaf(&env, &recipient, amount);
+        env.storage()
+            .persistent()
+            .has(&DataKey::MerkleClaimed(claim_id, leaf))
+    }
+
+    // --------------------------------------------------------------------
     // ON-CHAIN PLAN CATALOG (#95)
     // --------------------------------------------------------------------
 
@@ -2155,6 +2357,62 @@ fn save_payroll_escrow(env: &Env, escrow: &PayrollEscrow) {
     env.storage()
         .persistent()
         .extend_ttl(&key, threshold, extend_to);
+}
+
+fn load_merkle_payroll(env: &Env, claim_id: u64) -> MerklePayrollData {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MerklePayroll(claim_id))
+        .expect("Merkle payroll does not exist")
+}
+
+/// Persists a Merkle payroll and keeps it alive until its claim window closes.
+fn save_merkle_payroll(env: &Env, claim_id: u64, payroll: &MerklePayrollData) {
+    let key = DataKey::MerklePayroll(claim_id);
+    env.storage().persistent().set(&key, payroll);
+    let remaining = payroll
+        .expiration_timestamp
+        .saturating_sub(env.ledger().timestamp());
+    let (threshold, extend_to) = calculate_ttl_params(remaining);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, threshold, extend_to);
+}
+
+/// Merkle payroll leaf: `SHA256(recipient_xdr || amount as 16 big-endian bytes)`.
+/// The XDR address encoding is never 64 bytes long, so a leaf preimage can't be
+/// mistaken for an inner node (`left || right`).
+pub fn merkle_leaf(env: &Env, recipient: &Address, amount: i128) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let mut data = recipient.clone().to_xdr(env);
+    data.extend_from_array(&amount.to_be_bytes());
+    env.crypto().sha256(&data).to_bytes()
+}
+
+/// Inner Merkle node: SHA256 of the two children in ascending byte order, so a
+/// proof only needs the sibling hashes and not their left/right positions.
+pub fn merkle_hash_pair(env: &Env, a: &BytesN<32>, b: &BytesN<32>) -> BytesN<32> {
+    let (first, second) = if a.to_array() <= b.to_array() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let mut data = Bytes::from_array(env, &first.to_array());
+    data.extend_from_array(&second.to_array());
+    env.crypto().sha256(&data).to_bytes()
+}
+
+fn verify_merkle_proof(
+    env: &Env,
+    proof: &Vec<BytesN<32>>,
+    root: &BytesN<32>,
+    leaf: &BytesN<32>,
+) -> bool {
+    let mut computed = leaf.clone();
+    for sibling in proof.iter() {
+        computed = merkle_hash_pair(env, &computed, &sibling);
+    }
+    computed == *root
 }
 
 fn save_proposal(env: &Env, proposal: &PayrollProposal) {
