@@ -1,5 +1,6 @@
 "use client";
 
+import { PriceDisplay } from "@/components/ui/price-display";
 import { useTranslations } from "next-intl";
 import { useState } from "react";
 import {
@@ -317,7 +318,7 @@ export function PlansView() {
 
                       <td className="py-4 px-4">
                         <div className="font-mono font-bold text-black text-xs">
-                          {plan.amount.toFixed(2)} USDC
+                          <PriceDisplay amount={plan.amount} />
                         </div>
                         <div className="text-[11px] text-neutral-400">
                           Every {plan.intervalDays} Days
@@ -508,7 +509,7 @@ export function PlansView() {
                             }
                           >
                             {stats.netMrrDelta >= 0 ? "+" : ""}
-                            {stats.netMrrDelta.toFixed(2)} USDC/mo
+                            <PriceDisplay amount={stats.netMrrDelta} /> /mo
                           </strong>
                         </span>
                       </div>
@@ -605,7 +606,7 @@ export function PlansView() {
                             <td className="py-2.5 px-3.5 font-mono text-[11px]">
                               {sub.legacyAmount.toFixed(2)} →{" "}
                               <strong className="text-black">
-                                {sub.effectiveAmount.toFixed(2)} USDC
+                                <PriceDisplay amount={sub.effectiveAmount} />
                               </strong>
                             </td>
 
