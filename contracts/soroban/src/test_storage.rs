@@ -500,6 +500,12 @@ fn test_compact_layout_round_trips_vault_data() {
             trial_end_timestamp: 0,
         })
     );
+    let vault = f.client.get_vault(&f.user, &merchant).unwrap();
+    assert_eq!(vault.token, f.token_address);
+    assert_eq!(vault.amount_per_interval, AMOUNT);
+    assert_eq!(vault.interval_seconds, INTERVAL);
+    assert_eq!(vault.last_pull_timestamp, 4242);
+    // The raw persistent entry decodes back to the same VaultData
     let stored: VaultData = f.env.as_contract(&f.contract_id, || {
         f.env
             .storage()
@@ -508,4 +514,5 @@ fn test_compact_layout_round_trips_vault_data() {
             .unwrap()
     });
     assert_eq!(stored, f.client.get_vault(&f.user, &merchant).unwrap());
+    assert_eq!(stored, vault);
 }

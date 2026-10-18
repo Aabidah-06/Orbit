@@ -27,7 +27,12 @@ import {
   UsersRound,
   Gift,
   Sparkles,
+  BarChart3,
+  Mail,
+  FileSpreadsheet,
 } from "lucide-react";
+import { useDashboardTheme, type ThemePreference } from "@/lib/dashboard-theme";
+import { useFiatRates, type FiatCurrency } from "@/lib/fiat-rates";
 import { Brand } from "@/components/layout/brand";
 import { useAuth } from "@/lib/auth-context";
 import { useNotifications } from "@/lib/notification-context";
@@ -41,10 +46,13 @@ import { GiftPassesView } from "./views/gift-passes-view";
 import { DomainsView } from "./views/domains-view";
 import { PaymentLinksView } from "./views/payment-links-view";
 import { DevelopersView } from "./views/developers-view";
+import { RetentionView } from "./views/retention-view";
+import { NotificationTemplatesView } from "./views/notification-templates-view";
 import { TeamView } from "./views/team-view";
 import { LocaleSwitcher } from "@/components/layout/locale-switcher";
 import { VaultModal } from "./modals/vault-modal";
 import { DeployVaultModal } from "./modals/deploy-vault-modal";
+import { ReportsTaxWizardModal } from "./modals/reports-tax-wizard-modal";
 import { NotificationDrawer } from "./drawers/notification-drawer";
 import { DOCS_URL } from "@/lib/links";
 
@@ -52,8 +60,10 @@ export function DashboardShell() {
   const t = useTranslations("Dashboard");
   const tc = useTranslations("Common");
   const router = useRouter();
-  const { user, signOut, updateVault, updateBusinessName } = useAuth();
+  const { user, signOut, updateVault, updateBusinessName, walletNetworkWarning, disconnectWallet } = useAuth();
   const { unreadCount, toggleDrawer } = useNotifications();
+  const { theme, setTheme } = useDashboardTheme();
+  const { currency, setCurrency, error: fiatError } = useFiatRates();
   const [activeTab, setActiveTab] = useState<DashboardTab>("overview");
 
   const handleSignOut = () => {
@@ -65,6 +75,7 @@ export function DashboardShell() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isVaultModalOpen, setIsVaultModalOpen] = useState(false);
   const [isDeployModalOpen, setIsDeployModalOpen] = useState(false);
+  const [isReportsWizardOpen, setIsReportsWizardOpen] = useState(false);
   const [copiedId, setCopiedId] = useState(false);
   const [isEditingBusinessName, setIsEditingBusinessName] = useState(false);
   const [businessNameInput, setBusinessNameInput] = useState("");
@@ -103,6 +114,12 @@ export function DashboardShell() {
       label: t("nav.subscribers"),
       icon: Users,
       badge: "148",
+    },
+    {
+      id: "retention" as DashboardTab, label: t("nav.retention"), icon: BarChart3, badge: null,
+    },
+    {
+      id: "templates" as DashboardTab, label: t("nav.templates"), icon: Mail, badge: null,
     },
     {
       id: "payroll" as DashboardTab,
@@ -149,7 +166,7 @@ export function DashboardShell() {
   ];
 
   return (
-    <div className="min-h-screen bg-[#fafafb] flex text-[#09090b]">
+    <div className="orbit-dashboard min-h-screen bg-[#fafafb] flex text-[#09090b]">
       {/* Mobile Backdrop */}
       {isMobileMenuOpen && (
         <div
@@ -303,6 +320,7 @@ export function DashboardShell() {
             </div>
           </button>
 
+          {user.walletAddress && <button type="button" onClick={disconnectWallet} className="w-full rounded border border-black/10 px-3 py-2 text-left text-xs text-neutral-700 hover:bg-neutral-100 focus-visible:outline-2" aria-label="Disconnect Freighter wallet">Disconnect wallet</button>}
           {/* User Sign Out */}
           <div className="flex items-center justify-between pt-1 text-xs text-neutral-500">
             <span className="truncate max-w-[140px] font-semibold text-black" title={user.businessName}>
@@ -351,6 +369,8 @@ export function DashboardShell() {
                 </span>
               )}
             </button>
+            <label className="inline-flex items-center gap-1"><span className="sr-only">Dashboard color theme</span><select aria-label="Dashboard color theme" value={theme} onChange={e => setTheme(e.target.value as ThemePreference)} className="rounded border border-black/20 bg-white px-2 py-1 text-xs text-black focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+            <label className="flex items-center gap-1 text-xs text-neutral-700 dark:text-neutral-200"><span className="sr-only">Display currency</span><select aria-label="Display currency" value={currency} onChange={(event) => setCurrency(event.target.value as FiatCurrency)} className="rounded-md border border-black/20 bg-white px-2 py-1 text-black focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">{["USD", "EUR", "GBP", "JPY"].map(code => <option key={code} value={code}>{code}</option>)}</select></label>
             <LocaleSwitcher className="hidden sm:inline-flex" />
             <Link
               href={`${DOCS_URL}/checkout/widget`}
@@ -359,6 +379,14 @@ export function DashboardShell() {
               <span>{t("sdkDocs")}</span>
               <ArrowUpRight size={12} />
             </Link>
+            <button
+              onClick={() => setIsReportsWizardOpen(true)}
+              className="button button-secondary text-xs h-8 px-3 flex items-center gap-1.5"
+              title="Interactive Subscription Analytics & Tax Reporting Wizard (#168)"
+            >
+              <FileSpreadsheet size={13} className="text-black" />
+              <span className="hidden sm:inline">Reports & Taxes</span>
+            </button>
             {user.customContractId ? (
               <button
                 onClick={() => setIsDeployModalOpen(true)}
@@ -385,6 +413,8 @@ export function DashboardShell() {
           </div>
         </header>
 
+        {walletNetworkWarning && <div role="alert" className="mx-6 mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">{walletNetworkWarning}</div>}
+        {fiatError && <p role="status" className="px-6 pt-2 text-xs text-amber-800">Fiat exchange rates may be temporarily unavailable; USDC amounts remain authoritative.</p>}
         {/* Tab Content */}
         <main className="flex-1 p-6 md:p-8 overflow-y-auto max-w-6xl w-full mx-auto">
           {activeTab === "overview" && (
@@ -392,12 +422,16 @@ export function DashboardShell() {
               user={user}
               activeNetwork={activeNetwork}
               onNavigateTab={(tab) => setActiveTab(tab)}
+              onOpenReportsWizard={() => setIsReportsWizardOpen(true)}
             />
           )}
 
           {activeTab === "plans" && <PlansView />}
 
           {activeTab === "subscribers" && <SubscribersView />}
+          {activeTab === "retention" && <RetentionView />}
+
+          {activeTab === "templates" && <NotificationTemplatesView />}
 
           {activeTab === "payroll" && <PayrollView />}
 
@@ -429,6 +463,15 @@ export function DashboardShell() {
       <DeployVaultModal
         isOpen={isDeployModalOpen}
         onClose={() => setIsDeployModalOpen(false)}
+      />
+
+      {/* Interactive Subscription Analytics Export & Tax Reporting Wizard Modal (#168) */}
+      <ReportsTaxWizardModal
+        isOpen={isReportsWizardOpen}
+        onClose={() => setIsReportsWizardOpen(false)}
+        merchantId={user.id}
+        merchantName={user.businessName}
+        walletAddress={user.walletAddress}
       />
 
       {/* Real-time Notifications Drawer */}

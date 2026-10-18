@@ -66,7 +66,9 @@
       "domains": "Domínios personalizados",
       "links": "Links de pagamento",
       "team": "Equipe e permissões",
-      "developers": "Portal do desenvolvedor"
+      "developers": "Portal do desenvolvedor",
+      "retention": "Retention",
+      "templates": "Email Templates"
     },
     "badges": {
       "superpower": "Superpoder",
@@ -84,7 +86,9 @@
       "domains": "Domínios personalizados e SSL",
       "links": "Links de pagamento",
       "team": "Equipe e permissões",
-      "developers": "Portal do desenvolvedor"
+      "developers": "Portal do desenvolvedor",
+      "retention": "Cohort Retention",
+      "templates": "Email Templates"
     },
     "settlementVault": "Cofre de liquidação",
     "ready": "PRONTO",

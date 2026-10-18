@@ -9,13 +9,16 @@ const { API_KEY_ENVIRONMENTS, issueApiKey, requireApiKey } = require('./apiKeys'
 const { createRateLimiter, createStoreFromEnv } = require('./rateLimit');
 const { createReputationScorer, createHorizonWalletLookup } = require('./reputation');
 const { isRelayerError, createRelayerFromEnv } = require('./relayer');
+const { createFeeEstimator } = require('./fee-estimator');
 const { getAuditLogsQuerySchema, getClientIp, getActorAddress, writeAuditLog } = require('./audit');
 const {
     createWebhookSchema,
     updateWebhookSchema,
+    backfillWebhookSchema,
     generateSigningSecret,
     dispatchWebhookEvent,
     resendWebhookDelivery,
+    replayWebhookEvents,
     setDeliveryObserver,
 } = require('./webhooks');
 const { createDeliveryAlertObserver, registerWebhookAlertRoutes } = require('./webhook-alerts');
@@ -48,10 +51,38 @@ const {
     SlippageError,
     RateUnavailableError,
 } = require('./oracle');
+const {
+    createPayoutSplitDispatcher,
+    createStellarSplitForwarder,
+    registerPayoutSplitRoutes,
+} = require('./payout-splits');
+const {
+    createPriceIndexationWorker,
+    registerPriceIndexationRoutes,
+} = require('./price-indexation');
+const {
+    createSnapshotExportWorker,
+    registerSnapshotRoutes,
+} = require('./contract-state-snapshot');
 const { getDatabaseManager } = require('./db');
 const { registerPrivacyRoutes } = require('./privacy');
+const { createUsageBufferFromEnv, registerUsageRoutes, rollupUsage } = require('./usage-meter');
+const { registerCohortRoutes } = require('./cohorts');
+const { registerNotificationTemplateRoutes } = require('./notification-templates');
+const { registerProofRoutes } = require('./proofs');
+const { registerOrganizationRoutes } = require('./organizations');
+const { registerRpcProxyRoute } = require('./rpc-proxy');
+const { registerHealthMetrics } = require('./health-metrics');
+const { captureStripeRawBody, registerStripeBillingRoutes } = require('./stripe-billing');
+const { registerCredentialRoutes } = require('./credentials');
+const { registerPaymentLinkRoutes } = require('./payment-links');
+const { checkSchemaOnStartup } = require('./migrate');
+const { createInvoiceService, registerInvoiceRoutes } = require('./invoices');
 
 const app = express();
+const feeEstimator = createFeeEstimator({ horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org' });
+let defaultUsageBuffer;
+const getUsageBuffer = () => app.locals.usageBuffer || (defaultUsageBuffer ??= createUsageBufferFromEnv());
 // Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
 if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY);
 app.use(cors());
@@ -96,7 +127,8 @@ app.locals.rateLimiters = { ip: ipRateLimit, apiKey: apiKeyRateLimit };
 app.locals.reputation = reputation;
 
 app.use(ipRateLimit);
-app.use(express.json());
+// Keeps the raw bytes of Stripe webhooks, which are signed over the exact body (#131)
+app.use(express.json({ verify: captureStripeRawBody }));
 
 // Multi-region database manager with read-replica failover (#139)
 const dbManager = getDatabaseManager();
@@ -105,8 +137,9 @@ const getReadSupabase = (appInstance = app) => dbManager.getReadClient(appInstan
 const getSupabase = () => getPrimarySupabase(app);
 
 // Merchant routes: authenticate the API key, then apply its rate limit
-const authenticateMerchant = [requireApiKey(getSupabase), apiKeyRateLimit];
+const authenticateMerchant = [requireApiKey(getSupabase), reputation.markAuthenticated, apiKeyRateLimit];
 registerAnalyticsRoutes(app, getSupabase);
+registerPaymentLinkRoutes(app, getSupabase, authenticateMerchant);
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
 const getSorobanServer = (rpcUrl) => app.locals.sorobanServer || new rpc.Server(rpcUrl);
@@ -120,6 +153,7 @@ const getRelayer = () => {
         defaultRelayer = createRelayerFromEnv({
             server: getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
             getSupabase,
+            feeEstimator,
         });
     }
     return defaultRelayer;
@@ -484,6 +518,19 @@ const loadPullContext = async (supabase, subscriptionId, merchant) => {
 
 // Records the confirmed outcome of a pull transaction, whoever submitted it
 const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id, txHash, status, confirmation, extraBody = {} }) => {
+const applyPullOutcome = async ({
+    supabase,
+    req,
+    sub,
+    merchant,
+    subscription_id,
+    txHash,
+    status,
+    confirmation = null,
+    server = null,
+    signedTx = null,
+    extraBody = {},
+}) => {
     if (status === "SUCCESS") {
         const pullTime = new Date();
         const nextBilling = new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
@@ -555,6 +602,45 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
                 }]);
                 if (paymentError && paymentError.code !== '23505') {
                     console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
+            if (confirmation) {
+                const verifiedAmount = confirmedSettlementAmount(confirmation, {
+                    customerWallet: sub.customer_wallet_address,
+                    merchantWallet: merchant.wallet_address,
+                    contractId: process.env.ORBIT_CONTRACT_ID,
+                });
+                if (verifiedAmount === null) {
+                    console.error('CRITICAL: confirmed transfer missing verified amount; reconcile transaction:', txHash);
+                } else {
+                    const paymentRecord = {
+                        merchant_id: sub.plans.merchant_id,
+                        subscription_id,
+                        plan_id: sub.plan_id,
+                        customer_wallet_address: sub.customer_wallet_address,
+                        amount_usdc_units: verifiedAmount,
+                        status: 'settled',
+                        tx_hash: txHash,
+                        settled_at: pullTime.toISOString(),
+                    };
+                    const { data: payment, error: paymentError } = await supabase.from('payment_transactions').insert([paymentRecord]).select().single();
+                    if (paymentError && paymentError.code !== '23505') {
+                        console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
+                    }
+                }
+                if (payment) {
+                    try {
+                        const invoiceService = app.locals.invoiceService || createInvoiceService({ supabase });
+                        await invoiceService.createForSettledPayment({
+                            payment,
+                            merchant,
+                            plan: sub.plans,
+                            subscription: sub,
+                            ledgerSequence: confirmation?.ledger ?? confirmation?.ledgerSequence ?? null,
+                        });
+                    } catch (invoiceError) {
+                        // A receipt is retriable operational work; it must never roll
+                        // back an independently confirmed on-chain settlement.
+                        console.error('Invoice generation failed:', invoiceError);
+                    }
                 }
             }
 
@@ -598,6 +684,16 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
 
     if (status === "FAILED") {
         await recordPullFailure(supabase, subscription_id, 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.', txHash);
+        if (server && signedTx) {
+            let failureReason = 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.';
+            try {
+                const simulation = await server.simulateTransaction(signedTx);
+                if (simulation?.error) failureReason = simulation.error;
+            } catch {
+                // Keep the original failure when RPC diagnostics are unavailable
+            }
+            await recordPullFailure(supabase, subscription_id, failureReason, txHash);
+        }
         await markSubscriptionPastDue(supabase, subscription_id, {
             actorAddress: merchant.wallet_address,
             ipAddress: getClientIp(req),
@@ -613,6 +709,14 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
     // Still NOT_FOUND after the timeout: outcome unknown, let the caller poll later.
     // Keep the lease until it expires so no second pull races the one still in flight.
     await recordPullFailure(supabase, subscription_id, 'RPC timeout: transaction submitted but not yet confirmed. Do not retry until its outcome is known.', txHash);
+    if (server && signedTx) {
+        await recordPullFailure(
+            supabase,
+            subscription_id,
+            'Transaction submitted, but Soroban RPC confirmation timed out (NOT_FOUND)',
+            txHash,
+        );
+    }
     return {
         status: 202,
         body: { message: "Transaction submitted but not yet confirmed; check back later", txHash, ...extraBody },
@@ -696,7 +800,7 @@ app.post('/trigger-pull', authenticateMerchant, async (req, res) => {
                 const account = await server.getAccount(merchant.wallet_address);
 
                 const tx = new TransactionBuilder(account, {
-                    fee: "1000000",
+                    fee: String(await feeEstimator.estimate({ priority: "standard" })),
                     networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET
                 })
                 .addOperation(contract.call("pull_funds",
@@ -818,7 +922,18 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                     intervalMs: app.locals.txPollIntervalMs ?? TX_POLL_INTERVAL_MS,
                 });
 
-                return applyPullOutcome({ supabase, req, sub, merchant, subscription_id, txHash, status: confirmation.status, confirmation });
+                return applyPullOutcome({
+                    supabase,
+                    req,
+                    sub,
+                    merchant,
+                    subscription_id,
+                    txHash,
+                    status: confirmation.status,
+                    confirmation,
+                    server,
+                    signedTx,
+                });
             });
         });
         sendResult(res, result);
@@ -968,6 +1083,28 @@ app.get('/relay/budget', authenticateMerchant, async (req, res) => {
         console.error("Error submitting pull:", err);
         if (ownedSubscriptionId) await recordPullFailure(getSupabase(), ownedSubscriptionId, err.message).catch(console.error);
         res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * POST /relay/sponsor-transaction (#169)
+ * Allows the checkout widget to submit atomic batch transactions sponsored by the relayer.
+ */
+app.post('/relay/sponsor-transaction', relayRateLimit, async (req, res) => {
+    try {
+        const { tx_xdr, network_passphrase } = req.body || {};
+        if (!tx_xdr) return res.status(400).json({ error: 'tx_xdr is required' });
+        const relayer = getRelayer();
+        if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+        const result = await relayer.sponsorTransaction({
+            txXdr: tx_xdr,
+            passphrase: network_passphrase || process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+        });
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('Error sponsoring transaction:', err);
+        return res.status(500).json({ error: err.message || 'Fee sponsorship failed' });
     }
 });
 
@@ -1345,6 +1482,15 @@ app.post('/subscriptions/:id/cancel', authenticateMerchant, async (req, res) => 
             .single();
 
         if (updateErr) throw updateErr;
+
+        // Cancelled subscribers lose their verifiable credentials immediately (#132).
+        // Verification also re-checks subscription status, so a failure here only
+        // delays the revocation record, never access.
+        try {
+            await credentialService.revocations.revokeSubscription(supabase, id, 'subscription_cancelled');
+        } catch (revokeErr) {
+            console.error("Error revoking credentials for cancelled subscription:", id, revokeErr);
+        }
 
         const merchantId = sub.plans?.merchant_id;
         await writeAuditLog(supabase, {
@@ -1801,8 +1947,50 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
     res.json({ webhook: data, signing_secret: secret });
 });
 
+app.post('/webhooks/:id/backfill', async (req, res) => {
+    const parseResult = backfillWebhookSchema.safeParse(req.body || {});
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    try {
+        const { id } = req.params;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { event_types, start_date, end_date } = parseResult.data;
+        const result = await replayWebhookEvents(supabase, {
+            webhookId: id,
+            eventTypes: event_types,
+            startDate: start_date,
+            endDate: end_date,
+            fetchImpl: app.locals.fetchImpl,
+        });
+
+        res.status(200).json({
+            message: "Webhook backfill completed successfully",
+            total_events: result.total_events,
+            replayed_count: result.replayed_count,
+            deliveries: result.deliveries,
+        });
+    } catch (err) {
+        if (err.status === 404 || err.message === 'Webhook not found') {
+            return res.status(404).json({ error: "Webhook not found" });
+        }
+        console.error("Error executing webhook backfill:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
+registerOrganizationRoutes(app, getSupabase, authenticateMerchant);
+registerInvoiceRoutes(app, getSupabase, authenticateMerchant);
+registerRpcProxyRoute(app);
 registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
+registerUsageRoutes(app, { getSupabase, authenticateMerchant, getBuffer: getUsageBuffer });
+registerCohortRoutes(app, getSupabase, authenticateMerchant);
+registerNotificationTemplateRoutes(app, getSupabase, authenticateMerchant);
+registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
 
 // Webhook incident alerting: Slack / PagerDuty / email channels and failure telemetry (#189)
@@ -1819,7 +2007,11 @@ registerPayoutSplitRoutes(app, getSupabase, authenticateMerchant, {
     resolveDispatcher: () => getPayoutSplitDispatcher(),
 });
 registerPriceIndexationRoutes(app, getSupabase, authenticateMerchant);
+registerSnapshotRoutes(app, getSupabase, authenticateMerchant, getSorobanServer);
+registerHealthMetrics(app, { getSupabase, getSorobanServer, rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org' });
 registerIndexerRoutes(app);
+registerStripeBillingRoutes(app, getSupabase, authenticateMerchant);
+const credentialService = registerCredentialRoutes(app, getSupabase, authenticateMerchant);
 app.locals.graphqlServer = registerGraphql(app, getSupabase, authenticateMerchant);
 
 // Merchant profile & custom contract persistence (#143)
@@ -1880,7 +2072,7 @@ registerTransactionExportRoute(
 );
 
 const PORT = process.env.PORT || 3001;
-if (require.main === module) {
+function startServer() {
     if (getSupabase() && process.env.INDEXER_START_LEDGER) {
         app.locals.ledgerIndexer = configuredIndexer(getSupabase());
         app.locals.indexerWorker = app.locals.ledgerIndexer.start(Number(process.env.INDEXER_INTERVAL_MS) || 5000);
@@ -1904,14 +2096,43 @@ if (require.main === module) {
         app.locals.priceIndexationWorker.start(
             Number(process.env.PRICE_INDEXATION_INTERVAL_MS) || undefined,
         );
+
+        // Daily contract state snapshot backup worker (#185): exports Soroban
+        // vaults, plans, and admin configs with SHA-256 integrity checksums.
+        if (process.env.ORBIT_CONTRACT_ID || process.env.SOROBAN_CONTRACT_ID) {
+            app.locals.snapshotExportWorker = createSnapshotExportWorker({
+                server: getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
+                supabase: oracleSupabase,
+                contractId: process.env.ORBIT_CONTRACT_ID || process.env.SOROBAN_CONTRACT_ID,
+            });
+            app.locals.snapshotExportWorker.start(
+                Number(process.env.SNAPSHOT_EXPORT_INTERVAL_MS) || undefined,
+            );
+        }
     } else {
         console.warn("Oracle worker not started: Supabase client not initialized");
     }
+
+    const usageInterval = setInterval(() => {
+        const buffer = getUsageBuffer(), supabase = getSupabase();
+        if (buffer && supabase) rollupUsage({ buffer, supabase }).catch((err) => console.error('Usage rollup failed:', err));
+    }, Number(process.env.USAGE_ROLLUP_INTERVAL_MS) || 300000);
+    usageInterval.unref();
 
     app.listen(PORT, () => {
         console.log(`Orbit Merchant API running on http://localhost:${PORT}`);
     });
 }
 
-module.exports = app;
+// Pre-flight schema guard (#157): never serve against a database whose
+// migrations don't match this build.
+if (require.main === module) {
+    checkSchemaOnStartup()
+        .then(startServer)
+        .catch((err) => {
+            console.error(`Startup aborted: ${err.message}`);
+            process.exit(1);
+        });
+}
 
+module.exports = app;

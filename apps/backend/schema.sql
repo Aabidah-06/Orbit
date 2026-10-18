@@ -94,6 +94,27 @@ CREATE TABLE api_keys (
 CREATE UNIQUE INDEX api_keys_key_hash_idx ON api_keys (key_hash);
 CREATE INDEX api_keys_merchant_id_idx ON api_keys (merchant_id);
 
+-- Multi-tenant organization boundary and wallet-bound role membership (#68).
+CREATE TABLE organizations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL UNIQUE REFERENCES merchants(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    slug VARCHAR(80) NOT NULL UNIQUE CHECK (slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE TABLE organization_members (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    wallet_address VARCHAR(255) NOT NULL,
+    role VARCHAR(16) NOT NULL CHECK (role IN ('owner', 'admin', 'developer', 'viewer')),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    UNIQUE (organization_id, wallet_address)
+);
+CREATE INDEX organization_members_org_role_idx ON organization_members (organization_id, role);
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS organization_member_wallet VARCHAR(255);
+ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE organization_members ENABLE ROW LEVEL SECURITY;
+
 -- 7. Audit Logs Table
 -- Immutable audit records for financial mutations and administrative actions
 CREATE TABLE audit_logs (
@@ -194,6 +215,27 @@ CREATE INDEX IF NOT EXISTS payment_transactions_merchant_date_idx
 CREATE INDEX IF NOT EXISTS payment_transactions_merchant_plan_idx
     ON payment_transactions (merchant_id, plan_id, settled_at DESC);
 ALTER TABLE payment_transactions ENABLE ROW LEVEL SECURITY;
+
+-- Verifiable PDF receipt for each immutable payment settlement (#69).
+CREATE TABLE IF NOT EXISTS invoices (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    payment_transaction_id UUID NOT NULL UNIQUE REFERENCES payment_transactions(id) ON DELETE RESTRICT,
+    subscription_id UUID NOT NULL REFERENCES subscriptions(id) ON DELETE RESTRICT,
+    invoice_number VARCHAR(32) NOT NULL UNIQUE,
+    status VARCHAR(16) NOT NULL DEFAULT 'processing' CHECK (status IN ('processing', 'ready', 'failed')),
+    transaction_hash VARCHAR(128) NOT NULL,
+    ledger_sequence BIGINT,
+    settled_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    storage_bucket VARCHAR(128),
+    storage_path TEXT,
+    failure_reason TEXT,
+    generated_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS invoices_merchant_settled_idx ON invoices (merchant_id, settled_at DESC);
+CREATE INDEX IF NOT EXISTS invoices_subscription_settled_idx ON invoices (subscription_id, settled_at DESC);
+ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
 
 CREATE TABLE IF NOT EXISTS signing_sessions (
     id UUID PRIMARY KEY,
@@ -898,6 +940,34 @@ REVOKE ALL ON TABLE plan_price_reauthorizations FROM PUBLIC, anon, authenticated
 GRANT SELECT, INSERT, UPDATE, DELETE ON plan_price_schedules TO service_role;
 GRANT SELECT, INSERT, UPDATE, DELETE ON plan_price_reauthorizations TO service_role;
 
+-- 185-contract-state-snapshots.sql
+-- Automated smart contract state snapshot backup and disaster recovery sync (#185).
+CREATE TABLE IF NOT EXISTS contract_state_snapshots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    snapshot_id VARCHAR(128) NOT NULL UNIQUE,
+    contract_id VARCHAR(128) NOT NULL,
+    ledger_sequence BIGINT NOT NULL CHECK (ledger_sequence >= 0),
+    schema_version VARCHAR(32) NOT NULL DEFAULT '1.0.0',
+    checksum_sha256 VARCHAR(64) NOT NULL CHECK (checksum_sha256 ~ '^[0-9a-f]{64}$'),
+    vault_count INTEGER NOT NULL DEFAULT 0 CHECK (vault_count >= 0),
+    plan_count INTEGER NOT NULL DEFAULT 0 CHECK (plan_count >= 0),
+    config_count INTEGER NOT NULL DEFAULT 0 CHECK (config_count >= 0),
+    storage_location TEXT,
+    encrypted BOOLEAN NOT NULL DEFAULT FALSE,
+    snapshot_payload JSONB,
+    captured_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    restored_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS contract_state_snapshots_contract_ledger_idx
+    ON contract_state_snapshots (contract_id, ledger_sequence DESC);
+CREATE INDEX IF NOT EXISTS contract_state_snapshots_captured_at_idx
+    ON contract_state_snapshots (captured_at DESC);
+
+ALTER TABLE contract_state_snapshots ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE contract_state_snapshots FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON contract_state_snapshots TO service_role;
+
 -- 11. Webhook Incident Alert Channels (#189)
 -- Per-merchant destinations for endpoint incident and recovery alerts.
 -- config holds { webhook_url } for slack, { routing_key } for pagerduty, { email } for email.
@@ -924,3 +994,122 @@ CREATE TABLE IF NOT EXISTS dunning_workflows (
     steps JSONB NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+-- Exact metered usage, history-correct retention, and merchant notification templates.
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS notification_email TEXT;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS usage_metric VARCHAR(64);
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS usage_limit BIGINT CHECK (usage_limit IS NULL OR usage_limit >= 0);
+
+CREATE TABLE IF NOT EXISTS usage_rollup_windows (window_key TEXT PRIMARY KEY, merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE, committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS usage_rollups (
+ merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE, subscription_id UUID NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+ metric VARCHAR(64) NOT NULL, hour_start TIMESTAMPTZ NOT NULL, quantity BIGINT NOT NULL DEFAULT 0 CHECK(quantity>=0),
+ event_count BIGINT NOT NULL DEFAULT 0 CHECK(event_count>=0), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ PRIMARY KEY(merchant_id,subscription_id,metric,hour_start));
+ALTER TABLE usage_rollup_windows ENABLE ROW LEVEL SECURITY;
+ALTER TABLE usage_rollups ENABLE ROW LEVEL SECURITY;
+CREATE OR REPLACE FUNCTION commit_usage_window(p_window_key TEXT,p_merchant_id UUID,p_subscription_id UUID,p_metric TEXT,p_window_start TIMESTAMPTZ,p_quantity BIGINT,p_event_count BIGINT)
+RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+ INSERT INTO usage_rollup_windows(window_key,merchant_id) VALUES(p_window_key,p_merchant_id) ON CONFLICT DO NOTHING;
+ IF NOT FOUND THEN RETURN FALSE; END IF;
+ IF NOT EXISTS(SELECT 1 FROM subscriptions s JOIN plans p ON p.id=s.plan_id WHERE s.id=p_subscription_id AND p.merchant_id=p_merchant_id) THEN RAISE EXCEPTION 'subscription does not belong to merchant'; END IF;
+ INSERT INTO usage_rollups VALUES(p_merchant_id,p_subscription_id,p_metric,date_trunc('hour',p_window_start),p_quantity,p_event_count,NOW())
+ ON CONFLICT(merchant_id,subscription_id,metric,hour_start) DO UPDATE SET quantity=usage_rollups.quantity+EXCLUDED.quantity,event_count=usage_rollups.event_count+EXCLUDED.event_count,updated_at=NOW();
+ RETURN TRUE;
+END $$;
+REVOKE EXECUTE ON FUNCTION commit_usage_window(TEXT,UUID,UUID,TEXT,TIMESTAMPTZ,BIGINT,BIGINT) FROM PUBLIC,anon,authenticated;
+GRANT EXECUTE ON FUNCTION commit_usage_window(TEXT,UUID,UUID,TEXT,TIMESTAMPTZ,BIGINT,BIGINT) TO service_role;
+
+CREATE TABLE IF NOT EXISTS subscription_status_history(id UUID PRIMARY KEY DEFAULT gen_random_uuid(),subscription_id UUID NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,status VARCHAR(50) NOT NULL,changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE INDEX IF NOT EXISTS subscription_status_history_lookup_idx ON subscription_status_history(subscription_id,changed_at);
+ALTER TABLE subscription_status_history ENABLE ROW LEVEL SECURITY;
+INSERT INTO subscription_status_history(subscription_id,status,changed_at) SELECT id,'active',created_at FROM subscriptions s WHERE NOT EXISTS(SELECT 1 FROM subscription_status_history h WHERE h.subscription_id=s.id);
+-- Do not invent historical cancellation dates: legacy current state starts now.
+INSERT INTO subscription_status_history(subscription_id,status,changed_at) SELECT id,status,NOW() FROM subscriptions s WHERE status<>'active' AND NOT EXISTS(SELECT 1 FROM subscription_status_history h WHERE h.subscription_id=s.id AND h.status=s.status);
+CREATE OR REPLACE FUNCTION record_subscription_status() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN IF TG_OP='INSERT' OR OLD.status IS DISTINCT FROM NEW.status THEN INSERT INTO subscription_status_history(subscription_id,status,changed_at) VALUES(NEW.id,NEW.status,CASE WHEN TG_OP='INSERT' THEN COALESCE(NEW.created_at,NOW()) ELSE NOW() END); END IF; RETURN NEW; END $$;
+DROP TRIGGER IF EXISTS subscription_status_history_trigger ON subscriptions;
+CREATE TRIGGER subscription_status_history_trigger AFTER INSERT OR UPDATE OF status ON subscriptions FOR EACH ROW EXECUTE FUNCTION record_subscription_status();
+
+CREATE TABLE IF NOT EXISTS notification_templates(merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,type VARCHAR(48) NOT NULL CHECK(type IN('payment_receipt','subscription_activated','payment_failed','subscription_cancelled')),subject VARCHAR(200) NOT NULL,markdown TEXT NOT NULL CHECK(length(markdown)<=20000),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(merchant_id,type));
+ALTER TABLE notification_templates ENABLE ROW LEVEL SECURITY;
+
+-- 13. Stripe fiat billing bridge (#131)
+-- Also shipped as migrations/20261018000000_stripe_fiat_billing.sql for existing databases.
+-- Stripe Connect account linked to a merchant, used to route Connect events
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS stripe_account_id VARCHAR(255) UNIQUE;
+
+-- Idempotency guard: one row per Stripe event id ever processed
+CREATE TABLE IF NOT EXISTS stripe_webhook_events (
+    event_id VARCHAR(255) PRIMARY KEY,
+    event_type VARCHAR(100) NOT NULL,
+    merchant_id UUID REFERENCES merchants(id) ON DELETE SET NULL,
+    status VARCHAR(20) NOT NULL CHECK (status IN ('processing', 'processed', 'ignored')),
+    outcome VARCHAR(50),
+    received_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    processed_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TABLE IF NOT EXISTS fiat_subscriptions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    stripe_subscription_id VARCHAR(255) NOT NULL UNIQUE,
+    stripe_customer_id VARCHAR(255),
+    status VARCHAR(50) NOT NULL,
+    currency VARCHAR(3) NOT NULL,
+    -- Monthly recurring revenue in the currency's minor units (e.g. cents)
+    mrr_minor BIGINT NOT NULL DEFAULT 0 CHECK (mrr_minor >= 0),
+    current_period_end TIMESTAMP WITH TIME ZONE,
+    canceled_at TIMESTAMP WITH TIME ZONE,
+    -- Stripe event.created of the newest applied event; older events are skipped
+    last_event_created BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS fiat_subscriptions_merchant_status_idx ON fiat_subscriptions (merchant_id, status);
+
+CREATE TABLE IF NOT EXISTS fiat_payments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    stripe_invoice_id VARCHAR(255) NOT NULL UNIQUE,
+    stripe_subscription_id VARCHAR(255),
+    stripe_customer_id VARCHAR(255),
+    amount_minor BIGINT NOT NULL CHECK (amount_minor >= 0),
+    currency VARCHAR(3) NOT NULL,
+    paid_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS fiat_payments_merchant_paid_at_idx ON fiat_payments (merchant_id, paid_at DESC);
+
+ALTER TABLE stripe_webhook_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fiat_subscriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fiat_payments ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE stripe_webhook_events, fiat_subscriptions, fiat_payments FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON stripe_webhook_events, fiat_subscriptions, fiat_payments TO service_role;
+
+
+-- 14. Subscription verifiable credentials (#132)
+-- Also shipped as migrations/20261018000100_subscription_credentials.sql for existing databases.
+CREATE TABLE IF NOT EXISTS subscription_credentials (
+    jti UUID PRIMARY KEY,
+    subscription_id UUID NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    -- Pairwise pseudonym of the subscriber wallet; the raw address is never stored here
+    subject_hash VARCHAR(64) NOT NULL,
+    plan_tier VARCHAR(255) NOT NULL,
+    valid_until TIMESTAMP WITH TIME ZONE NOT NULL,
+    issued_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS subscription_credentials_subscription_idx ON subscription_credentials (subscription_id);
+
+CREATE TABLE IF NOT EXISTS credential_revocations (
+    jti UUID PRIMARY KEY,
+    subscription_id UUID,
+    reason VARCHAR(200) NOT NULL,
+    revoked_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE subscription_credentials ENABLE ROW LEVEL SECURITY;
+ALTER TABLE credential_revocations ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE subscription_credentials, credential_revocations FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON subscription_credentials, credential_revocations TO service_role;
+

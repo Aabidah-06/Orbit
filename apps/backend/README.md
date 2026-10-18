@@ -75,6 +75,11 @@ The service runs at `http://localhost:3001`.
 | `POST` | `/plans` | API key | Create a new recurring pricing plan |
 | `GET` | `/plans/:id` | Public | Fetch plan and merchant details |
 | `GET` | `/subscribers` | API key | List active subscribers for a merchant |
+| `POST` | `/usage-records` | API key | Atomically ingest exact metered usage |
+| `GET` | `/usage-reconciliation/:subscriptionId` | API key | Compare rolled-up usage with the plan limit |
+| `GET` | `/analytics/cohorts` | API key | History-correct retention cohorts and churn drilldown |
+| `GET/PUT` | `/notification-templates/:type` | API key | Manage transactional templates |
+| `POST` | `/notification-templates/:type/test` | API key | Send a real test email to the merchant address |
 | `GET` | `/rates` | Public | Supported fiat → USDC pairs with their newest cached rate |
 | `POST` | `/trigger-pull` | API key | Prepare an unsigned merchant pull transaction |
 | `POST` | `/submit-pull` | API key | Verify and submit a wallet-signed pull transaction |
@@ -867,3 +872,86 @@ having been announced. Applying a schedule is idempotent and audited.
 
 Migration: run `apps/backend/migrations/164-plan-price-indexation.sql` on
 existing databases (also appended to `schema.sql`).
+
+## Database migrations and schema guard (#157)
+
+Schema changes ship as versioned files in `migrations/` named
+`YYYYMMDDHHMMSS_description.sql` (or `.js`). SQL files hold both directions:
+
+```sql
+-- migrate:up
+CREATE TABLE widgets (id INT PRIMARY KEY);
+-- migrate:down
+DROP TABLE widgets;
+```
+
+JS files export `async up(db)` / `async down(db)` (`db.query(text, params)`).
+
+| Command | Effect |
+|---|---|
+| `npm run migrate:up` | Apply every pending migration (`-- --steps N` for the next N). |
+| `npm run migrate:down` | Roll back the last applied migration (`-- --steps N` for more). |
+| `npm run migrate:status` | List applied/pending migrations and flag checksum drift. |
+
+Each migration runs in its own `BEGIN ... COMMIT`; any error rolls the whole
+migration back and stops the run. Applied versions are recorded in
+`schema_migrations` with execution time and the file's SHA-256, and an advisory
+lock keeps two deploys from migrating at once. Add `-- migrate:no-transaction`
+to a file for statements Postgres can't run in a transaction (e.g.
+`CREATE INDEX CONCURRENTLY`).
+
+When `DATABASE_URL` is set, `node index.js` checks the database before serving
+and exits if a migration is pending, was edited after being applied, or is
+unknown to the build. The older `NNN-name.sql` files predate the runner, are
+already part of `schema.sql`, and are ignored by it.
+
+## Stripe fiat billing bridge (#131)
+
+`POST /webhooks/stripe` receives Stripe events, verifies the `Stripe-Signature`
+header (HMAC-SHA256 over the raw body, 5-minute tolerance, any secret in
+`STRIPE_WEBHOOK_SECRET`) and handles:
+
+| Event | Effect |
+|---|---|
+| `customer.subscription.created` | Upserts `fiat_subscriptions` with status and normalized MRR. |
+| `invoice.paid` | Records `fiat_payments` (once per invoice) and marks the subscription active. |
+| `customer.subscription.deleted` | Marks the subscription `canceled`. |
+
+Events are mapped to a merchant through the Stripe Connect account
+(`merchants.stripe_account_id`), else an `orbit_merchant_id` metadata key on the
+Stripe subscription. Every event id is claimed in `stripe_webhook_events` before
+processing, so replays and duplicate deliveries are acknowledged without effect;
+a failed event releases its claim and returns 500 so Stripe retries it. Older
+events never overwrite newer subscription state.
+
+`GET /billing/unified-summary` (API key) returns active subscribers and MRR for
+the USDC and Stripe rails plus a combined USD total (USDC counted 1:1; non-USD
+fiat is reported per currency and listed in `unconverted_currencies`).
+
+Migration: `migrations/20261018000000_stripe_fiat_billing.sql`.
+
+## Verifiable subscription credentials (#132)
+
+Merchants can hand subscribers a signed credential that third-party services
+(Discord bots, gated downloads, private APIs) verify without database access or
+the subscriber's wallet address.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/credentials` | API key | Issue a credential for an active subscription (`subscription_id`, optional `ttl_seconds`, max 30 days). |
+| `POST` | `/credentials/verify` | Public | `{ token }` → `{ valid, claims }` or `{ valid: false, reason }`. |
+| `GET` | `/credentials/jwks` | Public | Ed25519 public key(s) for offline verification. |
+| `POST` | `/credentials/:jti/revoke` | API key | Revoke one credential. |
+
+Credentials are EdDSA (Ed25519) JWTs with claims `sub` (an HMAC pseudonym of the
+wallet, different per merchant), `merchant_id`, `plan_tier` and `valid_until`
+(never past the next billing date). Verification checks the signature, expiry,
+the revocation list (`credential_revocations`, cached in memory) and that the
+subscription is still active. Cancelling a subscription revokes its credentials
+immediately.
+
+`credential-verifier.js` is a dependency-free helper services can copy:
+`verifyCredentialToken(token, { jwks })` checks authenticity and expiry offline,
+and `verifyCredentialOnline(token, { baseUrl })` also checks revocation.
+
+Migration: `migrations/20261018000100_subscription_credentials.sql`.

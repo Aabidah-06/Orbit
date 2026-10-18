@@ -25,6 +25,8 @@ const DEFAULTS = {
     // How long a prepared authorization stays signable (~5s per ledger)
     authValidityLedgers: 100,
     txTimeoutSeconds: 60,
+    pendingLedgersBeforeBump: 2,
+    maxFeeBumps: 2,
 };
 
 class RelayerError extends Error {
@@ -189,6 +191,7 @@ const createRelayer = ({
     budget,
     logger = console,
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    feeEstimator = null,
     options = {},
 }) => {
     const opts = { ...DEFAULTS, ...options };
@@ -281,9 +284,11 @@ const createRelayer = ({
                 }
                 prepared.sign(channel);
 
-                const feeBump = TransactionBuilder.buildFeeBumpTransaction(sponsor, String(opts.baseFee), prepared, networkPassphrase);
+                const initialBaseFee = feeEstimator ? await feeEstimator.estimate({ priority: 'high' }) : opts.baseFee;
+                const feeBump = TransactionBuilder.buildFeeBumpTransaction(sponsor, String(initialBaseFee), prepared, networkPassphrase);
                 feeBump.sign(sponsor);
-                const fee = Number(feeBump.fee);
+                let activeFeeBump = feeBump;
+                let fee = Number(activeFeeBump.fee);
                 if (fee > opts.maxFeeStroops) {
                     throw new RelayerError('fee_cap_exceeded', 422, `Pull fee of ${fee} stroops exceeds the relayer cap of ${opts.maxFeeStroops}`);
                 }
@@ -300,7 +305,7 @@ const createRelayer = ({
 
                 let response;
                 try {
-                    response = await server.sendTransaction(feeBump);
+                    response = await server.sendTransaction(activeFeeBump);
                 } catch (err) {
                     // Unknown whether it was accepted: re-read the sequence next time and keep the booking
                     sequences.invalidate(channel.publicKey());
@@ -310,7 +315,7 @@ const createRelayer = ({
 
                 if (response.status === 'PENDING' || response.status === 'DUPLICATE') {
                     sequences.commit(channel.publicKey(), prepared.sequence);
-                    submitted = { hash: response.hash, attempts: attempt };
+                    submitted = { hash: response.hash, attempts: attempt, innerTransaction: prepared, fee };
                     break;
                 }
 
@@ -327,7 +332,35 @@ const createRelayer = ({
                 await sleep(opts.retryDelayMs * attempt);
             }
 
-            const confirmation = await confirm(server, submitted.hash);
+            const firstLedger = (await server.getLatestLedger()).sequence;
+            let confirmation = await confirm(server, submitted.hash);
+            // Fee escalation replaces only the outer fee-paying envelope. The exact signed
+            // inner source/sequence is reused, so Stellar can settle the pull at most once.
+            let bumps = 0;
+            while (confirmation.status === 'NOT_FOUND' && bumps < opts.maxFeeBumps) {
+                const currentLedger = (await server.getLatestLedger()).sequence;
+                const pendingLedgers = currentLedger - firstLedger;
+                if (pendingLedgers < opts.pendingLedgersBeforeBump) break;
+                bumps += 1;
+                const baseFee = feeEstimator ? await feeEstimator.estimate({ priority: 'high', pendingLedgers }) : Math.min(opts.maxFeeStroops, opts.baseFee * (2 ** bumps));
+                const replacement = TransactionBuilder.buildFeeBumpTransaction(sponsor, String(baseFee), submitted.innerTransaction, networkPassphrase);
+                replacement.sign(sponsor);
+                const replacementFee = Number(replacement.fee);
+                if (replacementFee <= submitted.fee || replacementFee > opts.maxFeeStroops) break;
+                const shortfall = replacementFee - reservation.amount;
+                if (shortfall > 0) {
+                    const usageDate = await budget.reserve(merchantId, shortfall);
+                    if (!usageDate) throw new RelayerError('daily_budget_exceeded', 429, 'Daily gas sponsorship budget exceeded for this merchant', { retryAfter: 3600 });
+                    reservation.amount = replacementFee;
+                }
+                const bumped = await server.sendTransaction(replacement);
+                if (!['PENDING', 'DUPLICATE', 'SUCCESS'].includes(bumped.status)) break;
+                submitted.fee = replacementFee;
+                fee = replacementFee;
+                submitted.hash = bumped.hash || submitted.hash;
+                submitted.attempts += 1;
+                confirmation = await confirm(server, submitted.hash);
+            }
             const charged = confirmation.resultXdr?.feeCharged;
             const feeCharged = charged === undefined || charged === null ? null : Number(charged);
             // Settle the booking to the actual fee; an unconfirmed transaction keeps the maximum
@@ -353,19 +386,34 @@ const createRelayer = ({
         };
     };
 
+    const sponsorTransaction = async ({ txXdr, passphrase = networkPassphrase }) => {
+        const innerTx = TransactionBuilder.fromXDR(txXdr, passphrase);
+        const feeBump = TransactionBuilder.buildFeeBumpTransaction(sponsor, String(opts.baseFee * 2), innerTx, passphrase);
+        feeBump.sign(sponsor);
+        const submission = await server.sendTransaction(feeBump);
+        return {
+            txHash: submission.hash,
+            status: submission.status,
+            sponsored: true,
+            sponsorAddress: sponsor.publicKey(),
+        };
+    };
+
     return {
         sponsorAddress: sponsor.publicKey(),
+        sponsorKeypair: sponsor,
         pool,
         sequences,
         preparePullAuthorization,
         verifyPullAuthorization,
         relayPull,
         budgetStatus,
+        sponsorTransaction,
     };
 };
 
 // Builds the relayer from RELAYER_* env vars; returns null when no relayer key is configured
-const createRelayerFromEnv = ({ server, getSupabase, env = process.env }) => {
+const createRelayerFromEnv = ({ server, getSupabase, feeEstimator, env = process.env }) => {
     if (!env.RELAYER_SECRET_KEY || !env.ORBIT_CONTRACT_ID) return null;
 
     const envNumber = (name) => (env[name] ? Number(env[name]) : undefined);
@@ -389,6 +437,7 @@ const createRelayerFromEnv = ({ server, getSupabase, env = process.env }) => {
         budget: createSupabaseFeeBudget(getSupabase, {
             dailyLimitStroops: envNumber('RELAYER_DAILY_FEE_LIMIT_STROOPS') ?? DEFAULTS.dailyFeeLimitStroops,
         }),
+        feeEstimator,
         options,
     });
 };

@@ -1,290 +1,81 @@
 "use client";
+import { useEffect, useState, type FormEvent } from "react";
+import { ORBIT_API_URL, merchantRequestHeaders } from "@/lib/api";
 
-import { useState } from "react";
-import { X, Link2, Check, Copy, ArrowRight, Sparkles } from "lucide-react";
-import { PaymentLink } from "../dashboard-types";
+interface Plan { id: string; name: string; usdc_amount: number; interval_seconds: number; currency?: string }
+export interface HostedLink { id: string; plan_id: string; title: string; cta_text: string; accent_color: string; redirect_url: string | null; collect_email: boolean; collect_discord: boolean; active: boolean; plans?: Plan }
+interface Props { isOpen: boolean; onClose: () => void; onCreateLink: (link: HostedLink) => void; }
 
-interface CreatePaymentLinkModalProps {
-  isOpen: boolean;
-  onClose: () => void;
-  onCreateLink: (link: PaymentLink) => void;
-}
-
-export function CreatePaymentLinkModal({
-  isOpen,
-  onClose,
-  onCreateLink,
-}: CreatePaymentLinkModalProps) {
-  const [step, setStep] = useState<1 | 2>(1);
+export function CreatePaymentLinkModal({ isOpen, onClose, onCreateLink }: Props) {
+  const [plans, setPlans] = useState<Plan[]>([]);
+  const [planId, setPlanId] = useState("");
   const [title, setTitle] = useState("");
-  const [amount, setAmount] = useState("500");
-  const [type, setType] = useState<"recurring" | "one_time">("recurring");
-  const [intervalDays, setIntervalDays] = useState("30");
-  const [description, setDescription] = useState("");
-  const [createdLink, setCreatedLink] = useState<PaymentLink | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [cta, setCta] = useState("Pay with USDC");
+  const [accent, setAccent] = useState("#111827");
+  const [redirect, setRedirect] = useState("");
+  const [email, setEmail] = useState(false);
+  const [discord, setDiscord] = useState(false);
+  const [mode, setMode] = useState<"desktop" | "mobile">("desktop");
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState("");
+  const [created, setCreated] = useState<HostedLink | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const controller = new AbortController();
+    fetch(`${ORBIT_API_URL}/payment-links/plans`, { headers: merchantRequestHeaders(), signal: controller.signal })
+      .then(async response => { if (!response.ok) throw new Error("Unable to load merchant plans. Connect a valid merchant API key."); return response.json(); })
+      .then((data: { plans: Plan[] }) => { setPlans(data.plans); setPlanId(previous => previous || data.plans[0]?.id || ""); })
+      .catch(reason => { if (reason.name !== "AbortError") setError(reason.message); });
+    return () => controller.abort();
+  }, [isOpen]);
 
   if (!isOpen) return null;
-
-  const handleCreate = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!title.trim() || !amount) return;
-
-    const linkId = `plink_${title.toLowerCase().replace(/[^a-z0-9]/g, "_").slice(0, 10)}_${Math.random().toString(36).substring(2, 6)}`;
-    const newLink: PaymentLink = {
-      id: linkId,
-      title: title.trim(),
-      amount: parseFloat(amount) || 500,
-      currency: "USDC",
-      type,
-      intervalDays: type === "recurring" ? parseInt(intervalDays, 10) || 30 : undefined,
-      url: `https://orbit.network/pay/${linkId}`,
-      clicks: 0,
-      conversions: 0,
-      network: "stellar-testnet",
-      status: "active",
-    };
-
-    onCreateLink(newLink);
-    setCreatedLink(newLink);
-    setStep(2);
+  const currentPlan = plans.find(p => p.id === planId);
+  const url = created && typeof window !== "undefined" ? `${window.location.origin}/pay/${created.id}` : "";
+  const submit = async (event: FormEvent) => {
+    event.preventDefault(); setError("");
+    if (!currentPlan) { setError("Select a valid existing plan."); return; }
+    setWorking(true);
+    try {
+      const response = await fetch(`${ORBIT_API_URL}/payment-links`, { method: "POST", headers: merchantRequestHeaders(), body: JSON.stringify({
+        plan_id: planId, title: title.trim(), cta_text: cta.trim(), accent_color: accent,
+        redirect_url: redirect || null, collect_email: email, collect_discord: discord,
+      }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Unable to save payment link");
+      const link: HostedLink = { ...result.link, plans: currentPlan };
+      onCreateLink(link); setCreated(link);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to save link"); }
+    finally { setWorking(false); }
   };
 
-  const resetAndClose = () => {
-    setStep(1);
-    setTitle("");
-    setAmount("500");
-    setType("recurring");
-    setIntervalDays("30");
-    setDescription("");
-    setCreatedLink(null);
-    setCopied(false);
-    onClose();
-  };
-
-  const copyUrl = (url: string) => {
-    navigator.clipboard.writeText(url);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs animate-in fade-in duration-150">
-      <div className="w-full max-w-lg rounded-xl bg-white border border-black/10 shadow-2xl overflow-hidden">
-        {/* Modal Header */}
-        <div className="px-6 py-5 border-b border-black/10 flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-black/5 flex items-center justify-center text-black">
-              <Link2 size={16} />
-            </div>
-            <div>
-              <h3 className="text-base font-bold text-black tracking-tight">
-                {step === 1 ? "Create Hosted Payment Link" : "Payment Link Generated"}
-              </h3>
-              <p className="text-xs text-neutral-500">
-                {step === 1
-                  ? "100% no-code checkout URL for B2B retainers and services."
-                  : "Share this URL directly with your client or community."}
-              </p>
-            </div>
-          </div>
-          <button
-            onClick={resetAndClose}
-            className="p-1.5 rounded-lg text-neutral-400 hover:text-black hover:bg-neutral-100 transition-colors"
-          >
-            <X size={18} />
-          </button>
-        </div>
-
-        {step === 1 && (
-          <form onSubmit={handleCreate} className="p-6 space-y-4">
-            <div>
-              <label className="block text-xs font-semibold text-black uppercase tracking-wider mb-1.5">
-                Service / Retainer Title
-              </label>
-              <input
-                type="text"
-                required
-                placeholder="e.g. Monthly Advisory Retainer, Studio Design Pass"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                className="w-full rounded-lg border border-black/10 px-3.5 py-2.5 text-xs text-black focus:outline-hidden focus:ring-1 focus:ring-black"
-                autoFocus
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-black uppercase tracking-wider mb-1.5">
-                Billing Model
-              </label>
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  type="button"
-                  onClick={() => setType("recurring")}
-                  className={`p-3 rounded-lg border text-left transition-all ${
-                    type === "recurring"
-                      ? "border-black bg-neutral-50 ring-1 ring-black/5"
-                      : "border-black/10 hover:bg-neutral-50"
-                  }`}
-                >
-                  <div className="font-bold text-xs text-black">Recurring Retainer</div>
-                  <div className="text-[11px] text-neutral-500 mt-0.5">
-                    Automated pull every 30 days
-                  </div>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setType("one_time")}
-                  className={`p-3 rounded-lg border text-left transition-all ${
-                    type === "one_time"
-                      ? "border-black bg-neutral-50 ring-1 ring-black/5"
-                      : "border-black/10 hover:bg-neutral-50"
-                  }`}
-                >
-                  <div className="font-bold text-xs text-black">One-Time Payment</div>
-                  <div className="text-[11px] text-neutral-500 mt-0.5">
-                    Fixed digital dollar invoice
-                  </div>
-                </button>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs font-semibold text-black uppercase tracking-wider mb-1.5">
-                  Amount (USDC)
-                </label>
-                <div className="relative">
-                  <input
-                    type="number"
-                    min="1"
-                    step="any"
-                    required
-                    value={amount}
-                    onChange={(e) => setAmount(e.target.value)}
-                    className="w-full rounded-lg border border-black/10 pl-3.5 pr-16 py-2.5 text-xs font-mono text-black focus:outline-hidden focus:ring-1 focus:ring-black"
-                  />
-                  <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-mono font-semibold text-neutral-400">
-                    USDC
-                  </span>
-                </div>
-              </div>
-
-              {type === "recurring" && (
-                <div>
-                  <label className="block text-xs font-semibold text-black uppercase tracking-wider mb-1.5">
-                    Frequency
-                  </label>
-                  <select
-                    value={intervalDays}
-                    onChange={(e) => setIntervalDays(e.target.value)}
-                    className="w-full rounded-lg border border-black/10 px-3.5 py-2.5 text-xs text-black bg-white focus:outline-hidden focus:ring-1 focus:ring-black"
-                  >
-                    <option value="7">Every 7 Days (Weekly)</option>
-                    <option value="30">Every 30 Days (Monthly)</option>
-                    <option value="90">Every 90 Days (Quarterly)</option>
-                  </select>
-                </div>
-              )}
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-black uppercase tracking-wider mb-1.5">
-                Note to Client (Optional)
-              </label>
-              <input
-                type="text"
-                placeholder="e.g. Includes weekly deliverables and async Slack support"
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                className="w-full rounded-lg border border-black/10 px-3.5 py-2.5 text-xs text-black focus:outline-hidden focus:ring-1 focus:ring-black"
-              />
-            </div>
-
-            <div className="p-3.5 rounded-lg bg-neutral-50 border border-black/5 text-xs text-neutral-600 flex items-start gap-2.5">
-              <Sparkles size={16} className="text-black shrink-0 mt-0.5" />
-              <div>
-                <span className="font-semibold text-black">No developer required:</span>{" "}
-                Clients open this URL in any browser, connect Freighter, and approve the payment in seconds.
-              </div>
-            </div>
-
-            <div className="flex items-center justify-end gap-3 pt-3 border-t border-black/10">
-              <button
-                type="button"
-                onClick={resetAndClose}
-                className="button button-secondary text-xs h-9 px-4"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                className="button button-primary text-xs h-9 px-4 flex items-center gap-1.5"
-              >
-                <span>Generate Link</span>
-                <ArrowRight size={13} />
-              </button>
-            </div>
-          </form>
-        )}
-
-        {step === 2 && createdLink && (
-          <div className="p-6 space-y-5">
-            <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-950 flex items-center justify-between">
-              <div>
-                <div className="font-bold text-sm text-black">{createdLink.title}</div>
-                <div className="font-mono text-xs text-emerald-800 mt-0.5">
-                  {createdLink.amount} USDC {createdLink.type === "recurring" ? `/ Every ${createdLink.intervalDays} Days` : "(One-Time)"}
-                </div>
-              </div>
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-600 text-white font-bold">
-                LIVE URL
-              </span>
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-1.5">
-                Shareable Checkout URL
-              </label>
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  readOnly
-                  value={createdLink.url}
-                  className="w-full rounded-lg border border-black/10 px-3.5 py-2.5 text-xs font-mono bg-neutral-50 text-black"
-                />
-                <button
-                  onClick={() => copyUrl(createdLink.url)}
-                  className="button button-primary text-xs h-10 px-4 shrink-0 flex items-center gap-1.5"
-                >
-                  {copied ? (
-                    <>
-                      <Check size={13} className="text-emerald-400" />
-                      <span>Copied!</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy size={13} />
-                      <span>Copy</span>
-                    </>
-                  )}
-                </button>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-end gap-3 pt-3 border-t border-black/10">
-              <button
-                type="button"
-                onClick={resetAndClose}
-                className="button button-primary text-xs h-9 px-5"
-              >
-                Done
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
+  const qrImage = (format: "png" | "svg") => `https://api.qrserver.com/v1/create-qr-code/?size=600x600&format=${format}&data=${encodeURIComponent(url)}`;
+  const copy = (text: string) => void navigator.clipboard.writeText(text);
+  return <div role="presentation" className="fixed inset-0 z-50 overflow-y-auto bg-black/70 p-4">
+    <div role="dialog" aria-modal="true" aria-labelledby="payment-link-title" className="mx-auto my-8 w-full max-w-4xl rounded-xl bg-white p-6 text-black shadow-xl" onKeyDown={e => { if (e.key === "Escape") onClose(); }}>
+      <div className="mb-5 flex justify-between gap-4"><h2 id="payment-link-title" className="text-xl font-bold">{created ? "Share payment link" : "Create branded checkout"}</h2><button type="button" onClick={onClose} aria-label="Close payment link wizard" className="rounded border px-3 py-1">Close</button></div>
+      {created ? <div className="space-y-4">
+        <p className="text-sm">Your link is saved on Orbit and ready to share.</p>
+        <input readOnly value={url} aria-label="Hosted checkout URL" className="w-full rounded border p-3 font-mono text-xs" />
+        <div className="flex flex-wrap gap-2"><button className="rounded bg-black px-4 py-2 text-white" onClick={() => copy(url)}>Copy URL</button><button className="rounded border px-4 py-2" onClick={() => copy(`<a href="${url}">Pay with Orbit</a>`)}>Copy embed snippet</button><a className="rounded border px-4 py-2" href={qrImage("svg")} download="orbit-checkout.svg" target="_blank" rel="noreferrer">Download SVG QR</a><a className="rounded border px-4 py-2" href={qrImage("png")} download="orbit-checkout.png" target="_blank" rel="noreferrer">Download PNG QR</a></div>
+        {/* QR generation is delegated to a third party: only the publicly shareable URL is sent. */}
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={qrImage("png")} width={160} height={160} alt="QR code for hosted checkout" />
+      </div> : <div className="grid gap-6 md:grid-cols-2">
+        <form onSubmit={submit} className="space-y-4">
+          <label className="block text-sm font-semibold">Linked plan<select required value={planId} onChange={e => setPlanId(e.target.value)} className="mt-1 block w-full rounded border p-2"><option value="">Select plan</option>{plans.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
+          <label className="block text-sm font-semibold">Checkout title<input required maxLength={140} value={title} onChange={e => setTitle(e.target.value)} className="mt-1 block w-full rounded border p-2" /></label>
+          <label className="block text-sm font-semibold">Button text<input required maxLength={80} value={cta} onChange={e => setCta(e.target.value)} className="mt-1 block w-full rounded border p-2" /></label>
+          <label className="block text-sm font-semibold">Brand accent color<input type="color" value={accent} onChange={e => setAccent(e.target.value)} className="ml-3 align-middle" /></label>
+          <label className="block text-sm font-semibold">Completion redirect (HTTPS)<input type="url" pattern="https://.*" placeholder="https://example.com/thank-you" value={redirect} onChange={e => setRedirect(e.target.value)} className="mt-1 block w-full rounded border p-2" /></label>
+          <label className="flex gap-2 text-sm"><input type="checkbox" checked={email} onChange={e => setEmail(e.target.checked)} />Collect customer email</label>
+          <label className="flex gap-2 text-sm"><input type="checkbox" checked={discord} onChange={e => setDiscord(e.target.checked)} />Collect Discord handle</label>
+          <button type="submit" disabled={working || !planId} className="rounded bg-black px-4 py-2 text-white disabled:opacity-50">{working ? "Saving…" : "Create payment link"}</button>
+        </form>
+        <section aria-label="Live checkout preview" className="rounded-lg bg-slate-100 p-4"><div className="mb-3 flex gap-2"><button type="button" onClick={() => setMode("desktop")} aria-pressed={mode === "desktop"} className="rounded border px-3 py-1 text-xs">Desktop</button><button type="button" onClick={() => setMode("mobile")} aria-pressed={mode === "mobile"} className="rounded border px-3 py-1 text-xs">Mobile</button></div><div className={`mx-auto rounded-lg bg-white p-6 shadow ${mode === "mobile" ? "max-w-[280px]" : "w-full"}`}><div className="mb-5 text-xs font-medium uppercase text-slate-500">Secure Orbit checkout</div><h3 className="text-xl font-bold">{title || "Your checkout title"}</h3><p className="my-4 text-sm">{currentPlan?.name || "Select a plan"} — {currentPlan ? (Number(currentPlan.usdc_amount) / 1e7).toFixed(2) : "0.00"} USDC</p>{email && <input disabled placeholder="Customer email" className="mb-2 block w-full rounded border p-2 text-xs" />}{discord && <input disabled placeholder="Discord handle" className="mb-2 block w-full rounded border p-2 text-xs" />}<button type="button" style={{ backgroundColor: accent }} className="w-full rounded p-3 font-semibold text-white">{cta || "Pay with USDC"}</button><p className="mt-3 text-center text-xs text-slate-500">Non-custodial Stellar payment</p></div></section>
+      </div>}
+      {error && <p role="alert" className="mt-4 rounded bg-red-50 p-3 text-sm text-red-800">{error}</p>}
     </div>
-  );
+  </div>;
 }
