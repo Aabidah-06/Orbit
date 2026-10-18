@@ -75,6 +75,11 @@ The service runs at `http://localhost:3001`.
 | `POST` | `/plans` | API key | Create a new recurring pricing plan |
 | `GET` | `/plans/:id` | Public | Fetch plan and merchant details |
 | `GET` | `/subscribers` | API key | List active subscribers for a merchant |
+| `POST` | `/usage-records` | API key | Atomically ingest exact metered usage |
+| `GET` | `/usage-reconciliation/:subscriptionId` | API key | Compare rolled-up usage with the plan limit |
+| `GET` | `/analytics/cohorts` | API key | History-correct retention cohorts and churn drilldown |
+| `GET/PUT` | `/notification-templates/:type` | API key | Manage transactional templates |
+| `POST` | `/notification-templates/:type/test` | API key | Send a real test email to the merchant address |
 | `GET` | `/rates` | Public | Supported fiat → USDC pairs with their newest cached rate |
 | `POST` | `/trigger-pull` | API key | Prepare an unsigned merchant pull transaction |
 | `POST` | `/submit-pull` | API key | Verify and submit a wallet-signed pull transaction |

@@ -27,6 +27,8 @@ import {
   UsersRound,
   Gift,
   Sparkles,
+  BarChart3,
+  Mail,
   FileSpreadsheet,
 } from "lucide-react";
 import { Brand } from "@/components/layout/brand";
@@ -42,6 +44,8 @@ import { GiftPassesView } from "./views/gift-passes-view";
 import { DomainsView } from "./views/domains-view";
 import { PaymentLinksView } from "./views/payment-links-view";
 import { DevelopersView } from "./views/developers-view";
+import { RetentionView } from "./views/retention-view";
+import { NotificationTemplatesView } from "./views/notification-templates-view";
 import { TeamView } from "./views/team-view";
 import { LocaleSwitcher } from "@/components/layout/locale-switcher";
 import { VaultModal } from "./modals/vault-modal";
@@ -106,6 +110,12 @@ export function DashboardShell() {
       label: t("nav.subscribers"),
       icon: Users,
       badge: "148",
+    },
+    {
+      id: "retention" as DashboardTab, label: t("nav.retention"), icon: BarChart3, badge: null,
+    },
+    {
+      id: "templates" as DashboardTab, label: t("nav.templates"), icon: Mail, badge: null,
     },
     {
       id: "payroll" as DashboardTab,
@@ -410,6 +420,9 @@ export function DashboardShell() {
           {activeTab === "plans" && <PlansView />}
 
           {activeTab === "subscribers" && <SubscribersView />}
+          {activeTab === "retention" && <RetentionView />}
+
+          {activeTab === "templates" && <NotificationTemplatesView />}
 
           {activeTab === "payroll" && <PayrollView />}
 
