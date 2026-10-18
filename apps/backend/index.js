@@ -30,6 +30,7 @@ const { registerSigningSessionRoutes } = require('./signing-sessions');
 const { registerTransactionExportRoute, confirmedSettlementAmount } = require('./transaction-report');
 const { registerCustomerPortalRoutes } = require('./customer-portal');
 const { registerFailureRecoveryRoutes } = require('./failure-recovery');
+const { registerAnalyticsRoutes } = require('./analytics');
 const { registerCouponRoutes, normalizeCode } = require('./coupons');
 const { registerGraphql } = require('./graphql');
 const { configuredIndexer, registerIndexerRoutes } = require('./ledger-indexer');
@@ -44,6 +45,8 @@ const {
     SlippageError,
     RateUnavailableError,
 } = require('./oracle');
+const { getDatabaseManager } = require('./db');
+const { registerPrivacyRoutes } = require('./privacy');
 
 const app = express();
 // Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
@@ -92,18 +95,15 @@ app.locals.reputation = reputation;
 app.use(ipRateLimit);
 app.use(express.json());
 
-// Initialize Supabase Client
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY; // Using service role for backend logic
-let defaultSupabase = null;
-if (supabaseUrl && supabaseKey) {
-    defaultSupabase = createClient(supabaseUrl, supabaseKey);
-}
+// Multi-region database manager with read-replica failover (#139)
+const dbManager = getDatabaseManager();
+const getPrimarySupabase = (appInstance = app) => dbManager.getPrimaryClient(appInstance);
+const getReadSupabase = (appInstance = app) => dbManager.getReadClient(appInstance);
+const getSupabase = () => getPrimarySupabase(app);
 
-const getSupabase = () => app.locals.supabase || defaultSupabase;
-
-// Merchant routes: authenticate the API key, mark the IP as a merchant's, then apply the key's rate limit
-const authenticateMerchant = [requireApiKey(getSupabase), reputation.markAuthenticated, apiKeyRateLimit];
+// Merchant routes: authenticate the API key, then apply its rate limit
+const authenticateMerchant = [requireApiKey(getSupabase), apiKeyRateLimit];
+registerAnalyticsRoutes(app, getSupabase);
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
 const getSorobanServer = (rpcUrl) => app.locals.sorobanServer || new rpc.Server(rpcUrl);
@@ -121,6 +121,40 @@ const getRelayer = () => {
     }
     return defaultRelayer;
 };
+
+// Forward transfers for merchant payout splits (#160). The merchant treasury (or a
+// dedicated split relayer) signs and pays; when no key is configured, splits are
+// still recorded as pending so an operator can reconcile them later.
+let defaultSplitForwarder;
+const getSplitForwarder = () => {
+    if (app.locals.splitForwarder !== undefined) return app.locals.splitForwarder;
+    if (defaultSplitForwarder === undefined) {
+        const secret = process.env.SPLIT_RELAYER_SECRET_KEY || process.env.RELAYER_SECRET_KEY;
+        const tokenContractId = process.env.SPLIT_TOKEN_CONTRACT_ID || process.env.USDC_CONTRACT_ID;
+        if (!secret || !tokenContractId) {
+            defaultSplitForwarder = null;
+        } else {
+            defaultSplitForwarder = createStellarSplitForwarder({
+                server: getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
+                sourceKeypair: Keypair.fromSecret(secret),
+                tokenContractId,
+                networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+            });
+        }
+    }
+    return defaultSplitForwarder;
+};
+
+const getPayoutSplitDispatcher = () => createPayoutSplitDispatcher({
+    supabase: getSupabase(),
+    forwarder: getSplitForwarder(),
+    getTreasuryWallet: async (merchantId) => {
+        const supabase = getSupabase();
+        if (!supabase) return null;
+        const { data } = await supabase.from('merchants').select('wallet_address').eq('id', merchantId).maybeSingle();
+        return data?.wallet_address ?? null;
+    },
+});
 
 // Per-merchant throttle on relay requests, on top of the general API key limit
 const relayRateLimit = createRateLimiter({
@@ -279,8 +313,11 @@ app.post('/plans', authenticateMerchant, async (req, res) => {
 
     const { name, currency, interval_seconds } = parseResult.data;
     const merchant_id = req.merchant.id;
-    const supabase = getSupabase();
+    const supabase = getPrimarySupabase();
     if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+    if (!dbManager.isPrimaryHealthy()) {
+        return res.status(503).json({ error: "Primary database is currently unavailable; write operations are suspended" });
+    }
 
     const result = await executeIdempotently({
         supabase,
@@ -345,8 +382,8 @@ app.get('/plans/:id', async (req, res) => {
 
     try {
         const { id } = parseResult.data;
-        const supabase = getSupabase();
-        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+        const supabase = getReadSupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
 
         const { data, error } = await supabase
             .from('plans')
@@ -405,8 +442,8 @@ app.get('/subscribers', authenticateMerchant, async (req, res) => {
 // rate, refreshed from the live feed on a cold cache (#96).
 app.get('/rates', async (req, res) => {
     try {
-        const supabase = getSupabase();
-        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+        const supabase = getReadSupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
 
         const rates = await getSupportedRates({ supabase, fetchImpl: app.locals.fetchImpl });
         res.status(200).json(rates);
@@ -531,6 +568,23 @@ const applyPullOutcome = async ({ supabase, req, sub, merchant, subscription_id,
                 },
                 fetchImpl: app.locals.fetchImpl,
             });
+
+            // Automated revenue sharing (#160): forward each configured split
+            // share from the merchant treasury, recording the primary pull hash
+            // next to every secondary split transfer hash. Failures here never
+            // fail the settlement itself.
+            try {
+                await getPayoutSplitDispatcher().handlePaymentSettled({
+                    merchantId: sub.plans.merchant_id,
+                    subscriptionId: subscription_id,
+                    primaryTxHash: txHash,
+                    amountUnits: sub.plans.usdc_amount,
+                    settledAt: pullTime.toISOString(),
+                    fetchImpl: app.locals.fetchImpl,
+                });
+            } catch (splitErr) {
+                console.error("Payout split dispatch failed:", splitErr);
+            }
         }
 
         return {
@@ -924,8 +978,11 @@ app.post('/subscriptions', async (req, res) => {
     }
 
     const { plan_id, customer_wallet_address, metadata, coupon_code } = parseResult.data;
-    const supabase = getSupabase();
+    const supabase = getPrimarySupabase();
     if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+    if (!dbManager.isPrimaryHealthy()) {
+        return res.status(503).json({ error: "Primary database is currently unavailable; write operations are suspended" });
+    }
 
     const result = await executeIdempotently({
         supabase,
@@ -1739,25 +1796,67 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
 });
 
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
+registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
 registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
 registerCouponRoutes(app, getSupabase, authenticateMerchant);
 registerBillingResolutionRoutes(app, getSupabase, authenticateMerchant, loadPullContext, getSorobanServer);
+registerPayoutSplitRoutes(app, getSupabase, authenticateMerchant, {
+    resolveDispatcher: () => getPayoutSplitDispatcher(),
+});
+registerPriceIndexationRoutes(app, getSupabase, authenticateMerchant);
 registerIndexerRoutes(app);
 app.locals.graphqlServer = registerGraphql(app, getSupabase, authenticateMerchant);
 
+// Merchant profile & custom contract persistence (#143)
+app.get('/merchant/profile', authenticateMerchant, async (req, res) => {
+    try {
+        const supabase = getReadSupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
+        const { data, error } = await supabase
+            .from('merchants')
+            .select('id, name, wallet_address, contract_id, created_at')
+            .eq('id', req.merchant.id)
+            .single();
+        if (error) throw error;
+        res.status(200).json({ merchant: data });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.patch('/merchant/profile', authenticateMerchant, async (req, res) => {
+    try {
+        const supabase = getPrimarySupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
+        if (!dbManager.isPrimaryHealthy()) {
+            return res.status(503).json({ error: "Primary database is currently unavailable; write operations are suspended" });
+        }
+        const updates = {};
+        if (typeof req.body?.name === 'string' && req.body.name.trim()) {
+            updates.name = req.body.name.trim();
+        }
+        if (typeof req.body?.contract_id === 'string' && req.body.contract_id.trim()) {
+            updates.contract_id = req.body.contract_id.trim();
+        }
+        const { data, error } = await supabase
+            .from('merchants')
+            .update(updates)
+            .eq('id', req.merchant.id)
+            .select('id, name, wallet_address, contract_id, created_at')
+            .single();
+        if (error) throw error;
+        res.status(200).json({ merchant: data });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // PostgreSQL protocol cursor: unlike Supabase REST pagination, the cursor
 // never materializes the full transaction table in application memory.
-let reportPool;
 const getReportPool = () => {
-    if (app.locals.reportPool) return app.locals.reportPool;
-    if (!process.env.DATABASE_URL) return null;
-    if (!reportPool) {
-        const { Pool } = require('pg');
-        reportPool = new Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
-    }
-    return reportPool;
+    return dbManager.getReportPool(app, { readOnly: true });
 };
 registerTransactionExportRoute(
     app, authenticateMerchant, getReportPool,
@@ -1781,6 +1880,17 @@ if (require.main === module) {
             supabase: oracleSupabase,
             fetchImpl: app.locals.fetchImpl,
         });
+
+        // Price indexation worker (#164): notifies subscribers inside the advance
+        // notice window and applies scheduled plan price changes on their
+        // effective date.
+        app.locals.priceIndexationWorker = createPriceIndexationWorker({
+            supabase: oracleSupabase,
+            fetchImpl: app.locals.fetchImpl,
+        });
+        app.locals.priceIndexationWorker.start(
+            Number(process.env.PRICE_INDEXATION_INTERVAL_MS) || undefined,
+        );
     } else {
         console.warn("Oracle worker not started: Supabase client not initialized");
     }

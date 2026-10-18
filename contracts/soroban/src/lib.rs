@@ -36,6 +36,11 @@ pub const PULL_SEQUENCE_UNSET: u64 = u64::MAX;
 /// proposal storage within Soroban resource limits.
 pub const MAX_PAYROLL_APPROVERS: u32 = 20;
 
+/// Upper bound on a `batch_pull_funds` subscriber list (#92). Caps the ledger
+/// work of a single transaction so a merchant with hundreds of due subscribers
+/// can page through them in bounded batches.
+pub const MAX_BATCH_PULL_SUBSCRIBERS: u32 = 50;
+
 /// Calculates (threshold, extend_to) in ledgers for vault persistent storage
 /// and contract instance storage based on interval_seconds.
 pub fn calculate_ttl_params(interval_seconds: u64) -> (u32, u32) {
@@ -51,8 +56,14 @@ pub fn calculate_ttl_params(interval_seconds: u64) -> (u32, u32) {
 // DATA STRUCTURES
 // ----------------------------------------------------------------------------
 
-/// Vault terms as returned by `get_vault`. On the ledger they are stored as a
-/// `StoredVault` instead; see `save_vault`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultKey {
+    pub user: Address,
+    pub merchant: Address,
+}
+
+/// Vault terms as returned by `get_vault`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultData {
@@ -62,6 +73,17 @@ pub struct VaultData {
     pub last_pull_timestamp: u64,
     pub grace_period_seconds: u64,
     pub payment_status: u32,
+    /// Ledger timestamp the vault was (last) created at; anchors the billing
+    /// cycle grid used by the monotonic pull epoch guard (#94).
+    pub initial_timestamp: u64,
+    /// Cycle index of the most recent settlement. `PULL_SEQUENCE_UNSET` until
+    /// the first successful pull (#94).
+    pub pull_sequence: u64,
+    /// Subscriber-controlled freeze flag; blocks `pull_funds` while true (#93).
+    pub is_paused: bool,
+    /// Timestamp after which merchant pulls are allowed. Zero means the vault
+    /// has no trial window and billing starts immediately.
+    pub trial_end_timestamp: u64,
 }
 
 #[contracttype]
@@ -85,20 +107,24 @@ pub struct StreamData {
 #[contracttype]
 pub enum StorageKey {
     NextStreamId,
-    /// Ledger timestamp the vault was (last) created at; anchors the billing
-    /// cycle grid used by the monotonic pull epoch guard (#94).
-    pub initial_timestamp: u64,
-    /// Cycle index of the most recent settlement. `PULL_SEQUENCE_UNSET` until
-    /// the first successful pull (#94).
-    pub pull_sequence: u64,
-    /// Subscriber-controlled freeze flag; blocks `pull_funds` while true (#93).
-    pub is_paused: bool,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaymentSplit {
     pub recipient: Address,
+    pub amount: i128,
+}
+
+/// Per-subscriber outcome of a `batch_pull_funds` call (#92). `success` is false
+/// when the subscriber was skipped (missing/inactive vault, not yet due, already
+/// settled this cycle, or insufficient funds) without reverting the batch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchPullResult {
+    pub subscriber: Address,
+    pub success: bool,
+    /// Amount settled for this subscriber in raw token units; 0 when skipped.
     pub amount: i128,
 }
 
@@ -123,6 +149,8 @@ pub enum DataKey {
     /// Id the next payroll proposal will receive
     NextProposalId,
     Proposal(u64),
+}
+
 /// Storage key for a metered (usage-based) vault (#46). An enum on purpose:
 /// `#[contracttype]` structs encode as a map of field names without the type
 /// name, so a struct with the same fields as `VaultKey` would share its storage
@@ -422,61 +450,22 @@ fn store_escrow(
 // STORAGE LAYOUT
 // ----------------------------------------------------------------------------
 //
-// Vaults are the contract's only ledger state, and they are long-lived, so they
-// stay in persistent storage. Every byte of a persistent entry is paid for on
-// each write and for every ledger of rent, so entries are encoded positionally:
-//
-//   key:   (user, merchant)                                         an ScVec
-//   value: StoredVault(token, amount, interval, last_pull)          an ScVec
-//
-// A named struct is encoded as an ScMap that repeats its field names ("user",
-// "merchant", "amount_per_interval", ...) in every entry; tuples do not. The
-// contract has no upgrade entrypoint, so every deployment starts from empty
-// storage and there is no older layout to migrate.
+// Vaults live in persistent storage for the lifetime of the subscription. The
+// key is the `VaultKey` struct and the value is the full `VaultData` record.
 
-/// On-ledger form of `VaultData`: (token, amount_per_interval, interval_seconds,
-/// last_pull_timestamp).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoredVault(pub Address, pub i128, pub u64, pub u64);
-
-impl From<StoredVault> for VaultData {
-    fn from(stored: StoredVault) -> Self {
-        VaultData {
-            token: stored.0,
-            amount_per_interval: stored.1,
-            interval_seconds: stored.2,
-            last_pull_timestamp: stored.3,
-        }
+fn vault_key(user: &Address, merchant: &Address) -> VaultKey {
+    VaultKey {
+        user: user.clone(),
+        merchant: merchant.clone(),
     }
 }
 
-impl From<VaultData> for StoredVault {
-    fn from(vault: VaultData) -> Self {
-        StoredVault(
-            vault.token,
-            vault.amount_per_interval,
-            vault.interval_seconds,
-            vault.last_pull_timestamp,
-        )
-    }
+fn load_vault(env: &Env, key: &VaultKey) -> Option<VaultData> {
+    env.storage().persistent().get(key)
 }
 
-fn vault_key(user: &Address, merchant: &Address) -> (Address, Address) {
-    (user.clone(), merchant.clone())
-}
-
-fn load_vault(env: &Env, key: &(Address, Address)) -> Option<VaultData> {
-    env.storage()
-        .persistent()
-        .get::<_, StoredVault>(key)
-        .map(VaultData::from)
-}
-
-fn save_vault(env: &Env, key: &(Address, Address), vault: VaultData) {
-    env.storage()
-        .persistent()
-        .set(key, &StoredVault::from(vault));
+fn save_vault(env: &Env, key: &VaultKey, vault: &VaultData) {
+    env.storage().persistent().set(key, vault);
 }
 
 // ----------------------------------------------------------------------------
@@ -484,8 +473,8 @@ fn save_vault(env: &Env, key: &(Address, Address), vault: VaultData) {
 // ----------------------------------------------------------------------------
 
 /// Validates the terms and writes a fresh vault for (user, merchant), emitting
-/// `vault_created` and extending storage TTLs. Shared by `create_vault` and
-/// `create_vault_from_plan` so both paths behave identically.
+/// `vault_created` (or `trial_vault_created`) and extending storage TTLs.
+/// Shared by the handshake entrypoints so every path behaves identically.
 fn write_vault(
     env: &Env,
     user: &Address,
@@ -493,6 +482,8 @@ fn write_vault(
     token: &Address,
     amount_per_interval: i128,
     interval_seconds: u64,
+    grace_period_seconds: u64,
+    trial_end_timestamp: u64,
 ) {
     assert!(
         amount_per_interval > 0,
@@ -513,9 +504,12 @@ fn write_vault(
         amount_per_interval,
         interval_seconds,
         last_pull_timestamp: 0,
+        grace_period_seconds,
+        payment_status: PAYMENT_ACTIVE,
         initial_timestamp: env.ledger().timestamp(),
         pull_sequence: PULL_SEQUENCE_UNSET,
         is_paused: false,
+        trial_end_timestamp,
     };
 
     env.storage().persistent().set(&key, &vault_data);
@@ -546,15 +540,18 @@ fn write_vault(
         interval_seconds,
     );
 
-    // Emit contract event
-    env.events().publish(
-        (
-            Symbol::new(env, "vault_created"),
-            user.clone(),
-            merchant.clone(),
-        ),
-        (token.clone(), amount_per_interval, interval_seconds),
-    );
+    let event = if trial_end_timestamp > 0 {
+        Symbol::new(env, "trial_vault_created")
+    } else {
+        Symbol::new(env, "vault_created")
+    };
+    env.events()
+        .publish((event, user.clone(), merchant.clone()), (
+            token.clone(),
+            amount_per_interval,
+            interval_seconds,
+            trial_end_timestamp,
+        ));
     // Extend vault storage TTL and contract instance TTL to prevent archival
     let (threshold, extend_to) = calculate_ttl_params(interval_seconds);
     env.storage()
@@ -599,6 +596,10 @@ impl OrbitContract {
         grace_period_seconds: u64,
     ) {
         user.require_auth();
+        assert!(
+            grace_period_seconds > 0,
+            "grace_period_seconds must be greater than zero"
+        );
 
         write_vault(
             &env,
@@ -607,10 +608,44 @@ impl OrbitContract {
             &token,
             amount_per_interval,
             interval_seconds,
+            grace_period_seconds,
+            0,
         );
+    }
+
+    /// Create a subscription that starts with a free-trial window. Merchant
+    /// pulls are blocked until `trial_end_timestamp`, and the subscriber can
+    /// cancel at any point during the trial without funds being deducted.
+    pub fn create_vault_with_trial(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        token: Address,
+        amount_per_interval: i128,
+        interval_seconds: u64,
+        trial_duration_seconds: u64,
+    ) {
+        user.require_auth();
         assert!(
-            grace_period_seconds > 0,
-            "grace_period_seconds must be greater than zero"
+            trial_duration_seconds > 0,
+            "trial_duration_seconds must be greater than zero"
+        );
+
+        let trial_end_timestamp = env
+            .ledger()
+            .timestamp()
+            .checked_add(trial_duration_seconds)
+            .expect("Trial end overflow");
+
+        write_vault(
+            &env,
+            &user,
+            &merchant,
+            &token,
+            amount_per_interval,
+            interval_seconds,
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            trial_end_timestamp,
         );
     }
 
@@ -622,7 +657,6 @@ impl OrbitContract {
             .get(&SubscriptionKey::Badge(user, merchant))
     }
 
-        let key = vault_key(&user, &merchant);
     pub fn is_subscriber_active(env: Env, user: Address, merchant: Address) -> bool {
         let key = VaultKey {
             user: user.clone(),
@@ -643,14 +677,6 @@ impl OrbitContract {
         }
     }
 
-        let vault_data = VaultData {
-            token: token.clone(),
-            amount_per_interval,
-            interval_seconds,
-            last_pull_timestamp: 0,
-            grace_period_seconds,
-            payment_status: PAYMENT_ACTIVE,
-        };
     /// Merchant-assigned tier, without allowing arbitrary minting by a user.
     pub fn set_subscriber_tier(env: Env, user: Address, merchant: Address, tier: u32) {
         merchant.require_auth();
@@ -669,7 +695,6 @@ impl OrbitContract {
         env.storage().persistent().set(&key, &badge);
     }
 
-        save_vault(&env, &key, vault_data);
     /// Permissionless keeper hook synchronizes a time-expired credential with
     /// its packed bitmap. Validity reads also enforce expiration independently.
     pub fn mark_subscription_default(env: Env, user: Address, merchant: Address) -> bool {
@@ -874,19 +899,12 @@ impl OrbitContract {
         user.require_auth();
 
         let key = vault_key(&user, &merchant);
-        let key = VaultKey {
-            user: user.clone(),
-            merchant: merchant.clone(),
-        };
         let metered_key = MeteredVaultKey::Vault(user.clone(), merchant.clone());
 
         let has_fixed = env.storage().persistent().has(&key);
         let has_metered = env.storage().persistent().has(&metered_key);
         assert!(has_fixed || has_metered, "Vault does not exist");
 
-        // The vault is the only entry kept per (user, merchant), so removing it
-        // returns all of the pair's ledger state and stops its rent
-        env.storage().persistent().remove(&key);
         if has_fixed {
             let vault: VaultData = env.storage().persistent().get(&key).expect("Vault missing");
             deactivate_badge(&env, &user, &merchant, vault.interval_seconds);
@@ -947,21 +965,8 @@ impl OrbitContract {
 
     pub fn record_failed_pull(env: Env, merchant: Address, user: Address) {
         merchant.require_auth();
-    /// Freeze a vault so the merchant cannot pull while the subscriber is away
-    /// (e.g. seasonal pause). Only the subscriber can pause; the vault record,
-    /// token allowance, and existing billing state are preserved (#93).
-    pub fn pause_vault(env: Env, user: Address, merchant: Address) {
-        user.require_auth();
-
-        let key = VaultKey {
-            user: user.clone(),
-            merchant: merchant.clone(),
-        };
-        let mut vault: VaultData = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Vault does not exist");
+        let key = vault_key(&user, &merchant);
+        let mut vault = load_vault(&env, &key).expect("Vault does not exist");
         let current_time = env.ledger().timestamp();
         let due_date = vault
             .last_pull_timestamp
@@ -980,12 +985,30 @@ impl OrbitContract {
             } else {
                 PAYMENT_GRACE_PERIOD
             };
-            env.storage().persistent().set(&key, &vault);
+            save_vault(&env, &key, &vault);
             env.events().publish(
                 (Symbol::new(&env, "payment_status_updated"), user, merchant),
                 (vault.payment_status, current_time),
             );
         }
+    }
+
+    pub fn pause_vault(env: Env, user: Address, merchant: Address) {
+        user.require_auth();
+
+        let key = vault_key(&user, &merchant);
+        let mut vault = load_vault(&env, &key).expect("Vault does not exist");
+        vault.is_paused = true;
+        save_vault(&env, &key, &vault);
+
+        env.events()
+            .publish((Symbol::new(&env, "vault_paused"), user, merchant), ());
+
+        let (threshold, extend_to) = calculate_ttl_params(vault.interval_seconds);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, extend_to);
+        env.storage().instance().extend_ttl(threshold, extend_to);
     }
 
     pub fn update_vault_terms(
@@ -1002,16 +1025,18 @@ impl OrbitContract {
             "new_interval_seconds must be greater than zero"
         );
 
-        vault.is_paused = true;
-        env.storage().persistent().set(&key, &vault);
-        deactivate_badge(&env, &user, &merchant, vault.interval_seconds);
+        let key = vault_key(&user, &merchant);
+        let mut vault = load_vault(&env, &key).expect("Vault does not exist");
+        vault.amount_per_interval = new_amount;
+        vault.interval_seconds = new_interval_seconds;
+        save_vault(&env, &key, &vault);
 
-        // Emit contract event
-        env.events()
-            .publish((Symbol::new(&env, "vault_paused"), user, merchant), ());
+        env.events().publish(
+            (Symbol::new(&env, "vault_terms_updated"), user, merchant),
+            (new_amount, new_interval_seconds),
+        );
 
-        // Keep the paused vault (and contract) resident despite the inactivity
-        let (threshold, extend_to) = calculate_ttl_params(vault.interval_seconds);
+        let (threshold, extend_to) = calculate_ttl_params(new_interval_seconds);
         env.storage()
             .persistent()
             .extend_ttl(&key, threshold, extend_to);
@@ -1024,28 +1049,12 @@ impl OrbitContract {
     pub fn resume_vault(env: Env, user: Address, merchant: Address) {
         user.require_auth();
 
-        let key = VaultKey {
-            user: user.clone(),
-            merchant: merchant.clone(),
-        };
-        let mut vault: VaultData = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Vault does not exist");
-        vault.amount_per_interval = new_amount;
-        vault.interval_seconds = new_interval_seconds;
-        env.storage().persistent().set(&key, &vault);
-        env.events().publish(
-            (Symbol::new(&env, "vault_terms_updated"), user, merchant),
-            (new_amount, new_interval_seconds),
-        );
-        let (threshold, extend_to) = calculate_ttl_params(new_interval_seconds);
-        env.storage().persistent().extend_ttl(&key, threshold, extend_to);
-
+        let key = vault_key(&user, &merchant);
+        let mut vault = load_vault(&env, &key).expect("Vault does not exist");
         vault.is_paused = false;
         vault.last_pull_timestamp = env.ledger().timestamp();
-        env.storage().persistent().set(&key, &vault);
+        save_vault(&env, &key, &vault);
+
         let tier = env
             .storage()
             .persistent()
@@ -1063,7 +1072,6 @@ impl OrbitContract {
             vault.interval_seconds,
         );
 
-        // Emit contract event
         env.events()
             .publish((Symbol::new(&env, "vault_resumed"), user, merchant), ());
 
@@ -1081,20 +1089,17 @@ impl OrbitContract {
 
         let key = vault_key(&user, &merchant);
         let mut vault = load_vault(&env, &key).expect("Vault does not exist");
-        let key = VaultKey {
-            user: user.clone(),
-            merchant: merchant.clone(),
-        };
-        let mut vault: VaultData = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Vault does not exist");
 
         // A paused subscriber is never billed (#93)
         assert!(!vault.is_paused, "Vault is paused by subscriber");
 
         let current_time = env.ledger().timestamp();
+
+        // A free trial blocks all merchant pulls until it expires (#158)
+        assert!(
+            current_time >= vault.trial_end_timestamp,
+            "Cannot pull funds during active free trial"
+        );
 
         let due_date = vault
             .last_pull_timestamp
@@ -1168,12 +1173,11 @@ impl OrbitContract {
         );
 
         vault.last_pull_timestamp = current_time;
-        let amount_per_interval = vault.amount_per_interval;
-        let interval_seconds = vault.interval_seconds;
-        save_vault(&env, &key, vault);
         vault.payment_status = PAYMENT_ACTIVE;
         vault.pull_sequence = cycle_index;
-        env.storage().persistent().set(&key, &vault);
+        let amount_per_interval = vault.amount_per_interval;
+        let interval_seconds = vault.interval_seconds;
+        save_vault(&env, &key, &vault);
 
         // Emit contract event
         env.events().publish(
@@ -1182,12 +1186,151 @@ impl OrbitContract {
         );
         // Extend TTL on each pull for both the vault entry and the contract instance
         let (threshold, extend_to) = calculate_ttl_params(interval_seconds);
-        env.storage().persistent().extend_ttl(&key, threshold, extend_to);
-        let (threshold, extend_to) = calculate_ttl_params(vault.interval_seconds);
         env.storage()
             .persistent()
             .extend_ttl(&key, threshold, extend_to);
         env.storage().instance().extend_ttl(threshold, extend_to);
+    }
+
+    // --------------------------------------------------------------------
+    // BATCH PULL (#92)
+    // --------------------------------------------------------------------
+
+    /// Settle many due subscribers in one transaction. Instead of submitting a
+    /// separate `pull_funds` transaction per subscriber (which bloats ledger fees
+    /// and contends on the merchant sequence number), the merchant authorizes one
+    /// call and receives one `BatchPullResult` per subscriber.
+    ///
+    /// Fault tolerance: each subscriber is attempted independently. A subscriber
+    /// that is ineligible (missing/paused/defaulted vault, interval not elapsed,
+    /// cycle already settled) or underfunded is recorded with `success == false`
+    /// instead of reverting the transfers that already settled earlier in the same
+    /// batch.
+    pub fn batch_pull_funds(
+        env: Env,
+        merchant: Address,
+        subscribers: Vec<Address>,
+    ) -> Vec<BatchPullResult> {
+        // The merchant (or the Orbit backend acting for it) authorizes the batch.
+        merchant.require_auth();
+
+        assert!(!subscribers.is_empty(), "subscribers must not be empty");
+        assert!(
+            subscribers.len() <= MAX_BATCH_PULL_SUBSCRIBERS,
+            "batch size exceeds MAX_BATCH_PULL_SUBSCRIBERS"
+        );
+
+        let mut results = Vec::new(&env);
+        let mut success_count: u32 = 0;
+        let mut total_amount: i128 = 0;
+
+        for subscriber in subscribers.iter() {
+            let result = Self::try_batch_pull_subscriber(&env, &subscriber, &merchant);
+            if result.success {
+                success_count += 1;
+                total_amount = total_amount.saturating_add(result.amount);
+            }
+            results.push_back(result);
+        }
+
+        // One aggregate event per batch: (merchant, success_count, total_amount).
+        env.events().publish(
+            (Symbol::new(&env, "batch_funds_pulled"), merchant.clone()),
+            (success_count, total_amount),
+        );
+
+        results
+    }
+
+    /// Executes a single guarded pull for `(subscriber, merchant)` and reports the
+    /// outcome. Returns a failing `BatchPullResult` (never panics) for any expected
+    /// per-subscriber failure so the enclosing batch keeps settling.
+    fn try_batch_pull_subscriber(
+        env: &Env,
+        subscriber: &Address,
+        merchant: &Address,
+    ) -> BatchPullResult {
+        let skipped = |amount: i128| BatchPullResult {
+            subscriber: subscriber.clone(),
+            success: false,
+            amount,
+        };
+
+        let key = vault_key(subscriber, merchant);
+        let mut vault = match load_vault(env, &key) {
+            Some(vault) => vault,
+            None => return skipped(0),
+        };
+
+        // A paused subscriber is never billed (#93).
+        if vault.is_paused {
+            return skipped(0);
+        }
+        if vault.payment_status == PAYMENT_DEFAULTED {
+            return skipped(0);
+        }
+
+        let current_time = env.ledger().timestamp();
+        if vault.last_pull_timestamp != 0
+            && current_time < vault.last_pull_timestamp + vault.interval_seconds
+        {
+            return skipped(0);
+        }
+
+        // Deterministic epoch guard (#94): never settle the same billing cycle twice.
+        let cycle_index =
+            current_time.saturating_sub(vault.initial_timestamp) / vault.interval_seconds;
+        if vault.pull_sequence != PULL_SEQUENCE_UNSET && cycle_index <= vault.pull_sequence {
+            return skipped(0);
+        }
+
+        // Skip a subscriber whose balance cannot cover this interval instead of
+        // letting token.transfer_from abort the whole batch. This is the most
+        // common benign failure (a subscriber who topped up too late).
+        let token_client = token::Client::new(env, &vault.token);
+        if token_client.balance(subscriber) < vault.amount_per_interval {
+            return skipped(0);
+        }
+
+        // Routes through the vault's configured swap router when one exists;
+        // otherwise this is a direct token.transfer_from(subscriber -> merchant).
+        pull_payment(env, subscriber, merchant, &vault, merchant);
+
+        let amount = vault.amount_per_interval;
+        let interval_seconds = vault.interval_seconds;
+
+        vault.last_pull_timestamp = current_time;
+        vault.payment_status = PAYMENT_ACTIVE;
+        vault.pull_sequence = cycle_index;
+        save_vault(env, &key, vault);
+
+        let tier = env
+            .storage()
+            .persistent()
+            .get::<_, BadgeData>(&SubscriptionKey::Badge(subscriber.clone(), merchant.clone()))
+            .map(|badge| badge.tier)
+            .unwrap_or(1);
+        activate_badge(
+            env,
+            subscriber,
+            merchant,
+            tier,
+            current_time.saturating_add(interval_seconds),
+            interval_seconds,
+        );
+
+        // Keep each processed vault (and the contract instance) resident.
+        let (threshold, extend_to) = calculate_ttl_params(interval_seconds);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, extend_to);
+        env.storage().instance().extend_ttl(threshold, extend_to);
+
+        BatchPullResult {
+            subscriber: subscriber.clone(),
+            success: true,
+            amount,
+        }
     }
 
     // --------------------------------------------------------------------
@@ -1382,12 +1525,8 @@ impl OrbitContract {
             .persistent()
             .get(&key)
             .expect("Stream does not exist");
-        let caller = env.invoker();
-        assert!(
-            caller == stream.sender || caller == stream.recipient,
-            "Sender or recipient authorization required"
-        );
-        caller.require_auth();
+        stream.sender.require_auth();
+        stream.recipient.require_auth();
         let vested = Self::vested_amount(&env, &stream);
         let recipient_amount = vested - stream.amount_withdrawn;
         let sender_amount = stream.deposit_amount - vested;
@@ -1576,6 +1715,131 @@ impl OrbitContract {
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
     }
+
+    // --------------------------------------------------------------------
+    // ON-CHAIN PLAN CATALOG (#95)
+    // --------------------------------------------------------------------
+
+    /// Register a plan in the public on-chain catalog under merchant authority.
+    /// Re-registering an existing `plan_id` is only allowed for the merchant
+    /// that already owns it (it refreshes the terms and reactivates the plan).
+    pub fn register_plan(
+        env: Env,
+        merchant: Address,
+        plan_id: String,
+        token: Address,
+        amount_per_interval: i128,
+        interval_seconds: u64,
+        name: String,
+    ) {
+        merchant.require_auth();
+
+        assert!(
+            amount_per_interval > 0,
+            "amount_per_interval must be positive"
+        );
+        assert!(
+            interval_seconds > 0,
+            "interval_seconds must be greater than zero"
+        );
+
+        let key = PlanKey {
+            plan_id: plan_id.clone(),
+        };
+        if let Some(existing) = env.storage().persistent().get::<PlanKey, PlanData>(&key) {
+            assert!(
+                existing.merchant == merchant,
+                "Plan ID is already registered by another merchant"
+            );
+        }
+
+        let plan = PlanData {
+            merchant: merchant.clone(),
+            token: token.clone(),
+            amount_per_interval,
+            interval_seconds,
+            name: name.clone(),
+            is_active: true,
+        };
+        env.storage().persistent().set(&key, &plan);
+
+        env.events().publish(
+            (Symbol::new(&env, "plan_registered"), merchant, plan_id),
+            (token, amount_per_interval, interval_seconds, name),
+        );
+
+        let (threshold, extend_to) = calculate_ttl_params(interval_seconds);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, extend_to);
+        env.storage().instance().extend_ttl(threshold, extend_to);
+    }
+
+    /// Disable new subscriptions for a plan. Existing vaults created from the
+    /// plan keep running, so in-flight subscribers are unaffected (#95).
+    pub fn deactivate_plan(env: Env, merchant: Address, plan_id: String) {
+        merchant.require_auth();
+
+        let key = PlanKey {
+            plan_id: plan_id.clone(),
+        };
+        let mut plan: PlanData = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Plan does not exist");
+        assert!(
+            plan.merchant == merchant,
+            "Only the owning merchant can deactivate this plan"
+        );
+
+        plan.is_active = false;
+        env.storage().persistent().set(&key, &plan);
+
+        env.events().publish(
+            (Symbol::new(&env, "plan_deactivated"), merchant, plan_id),
+            (),
+        );
+
+        let (threshold, extend_to) = calculate_ttl_params(plan.interval_seconds);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, extend_to);
+        env.storage().instance().extend_ttl(threshold, extend_to);
+    }
+
+    /// Public read helper for the on-chain plan catalog. No authorization and
+    /// no storage mutation.
+    pub fn get_plan(env: Env, plan_id: String) -> Option<PlanData> {
+        let key = PlanKey { plan_id };
+        env.storage().persistent().get(&key)
+    }
+
+    /// Create a vault using terms read directly from the on-chain catalog, so
+    /// the subscriber never has to trust off-chain plan metadata. Rejects
+    /// deactivated plans while leaving existing vaults untouched (#95).
+    pub fn create_vault_from_plan(env: Env, user: Address, plan_id: String) {
+        user.require_auth();
+
+        let key = PlanKey { plan_id };
+        let plan: PlanData = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Plan does not exist");
+        assert!(plan.is_active, "Plan is not active");
+
+        write_vault(
+            &env,
+            &user,
+            &plan.merchant,
+            &plan.token,
+            plan.amount_per_interval,
+            plan.interval_seconds,
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            0,
+        );
+    }
 }
 
 /// Checks every split upfront so a bad entry fails before any transfer. Returns the total.
@@ -1625,131 +1889,6 @@ fn save_proposal(env: &Env, proposal: &PayrollProposal) {
     env.storage()
         .instance()
         .extend_ttl(TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
-    // --------------------------------------------------------------------
-    // ON-CHAIN PLAN CATALOG (#95)
-    // --------------------------------------------------------------------
-
-    /// Register a plan in the public on-chain catalog under merchant authority.
-    /// Re-registering an existing `plan_id` is only allowed for the merchant
-    /// that already owns it (it refreshes the terms and reactivates the plan).
-    pub fn register_plan(
-        env: Env,
-        merchant: Address,
-        plan_id: String,
-        token: Address,
-        amount_per_interval: i128,
-        interval_seconds: u64,
-        name: String,
-    ) {
-        merchant.require_auth();
-
-        assert!(
-            amount_per_interval > 0,
-            "amount_per_interval must be positive"
-        );
-        assert!(
-            interval_seconds > 0,
-            "interval_seconds must be greater than zero"
-        );
-
-        let key = PlanKey {
-            plan_id: plan_id.clone(),
-        };
-        if let Some(existing) = env.storage().persistent().get::<PlanKey, PlanData>(&key) {
-            assert!(
-                existing.merchant == merchant,
-                "Plan ID is already registered by another merchant"
-            );
-        }
-
-        let plan = PlanData {
-            merchant: merchant.clone(),
-            token: token.clone(),
-            amount_per_interval,
-            interval_seconds,
-            name: name.clone(),
-            is_active: true,
-        };
-        env.storage().persistent().set(&key, &plan);
-
-        // Emit contract event
-        env.events().publish(
-            (Symbol::new(&env, "plan_registered"), merchant, plan_id),
-            (token, amount_per_interval, interval_seconds, name),
-        );
-
-        // Extend plan storage TTL and contract instance TTL to prevent archival
-        let (threshold, extend_to) = calculate_ttl_params(interval_seconds);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, threshold, extend_to);
-        env.storage().instance().extend_ttl(threshold, extend_to);
-    }
-
-    /// Disable new subscriptions for a plan. Existing vaults created from the
-    /// plan keep running, so in-flight subscribers are unaffected (#95).
-    pub fn deactivate_plan(env: Env, merchant: Address, plan_id: String) {
-        merchant.require_auth();
-
-        let key = PlanKey {
-            plan_id: plan_id.clone(),
-        };
-        let mut plan: PlanData = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Plan does not exist");
-        assert!(
-            plan.merchant == merchant,
-            "Only the owning merchant can deactivate this plan"
-        );
-
-        plan.is_active = false;
-        env.storage().persistent().set(&key, &plan);
-
-        // Emit contract event
-        env.events().publish(
-            (Symbol::new(&env, "plan_deactivated"), merchant, plan_id),
-            (),
-        );
-
-        let (threshold, extend_to) = calculate_ttl_params(plan.interval_seconds);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, threshold, extend_to);
-        env.storage().instance().extend_ttl(threshold, extend_to);
-    }
-
-    /// Public read helper for the on-chain plan catalog. No authorization and
-    /// no storage mutation.
-    pub fn get_plan(env: Env, plan_id: String) -> Option<PlanData> {
-        let key = PlanKey { plan_id };
-        env.storage().persistent().get(&key)
-    }
-
-    /// Create a vault using terms read directly from the on-chain catalog, so
-    /// the subscriber never has to trust off-chain plan metadata. Rejects
-    /// deactivated plans while leaving existing vaults untouched (#95).
-    pub fn create_vault_from_plan(env: Env, user: Address, plan_id: String) {
-        user.require_auth();
-
-        let key = PlanKey { plan_id };
-        let plan: PlanData = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Plan does not exist");
-        assert!(plan.is_active, "Plan is not active");
-
-        write_vault(
-            &env,
-            &user,
-            &plan.merchant,
-            &plan.token,
-            plan.amount_per_interval,
-            plan.interval_seconds,
-        );
-    }
 }
 
 #[cfg(test)]

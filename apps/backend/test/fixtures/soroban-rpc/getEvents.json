@@ -1,0 +1,28 @@
+{
+  "default_get_events": {
+    "key": "default_get_events",
+    "timestamp": "2026-10-18T00:00:00.000Z",
+    "request": "events:100:[{\"type\":\"contract\",\"contractIds\":[\"CAZBZBUWBSQYK2RZ6WHMXVDLIQHSU5WD7ANZYL6HLNSCRUOTNYCDYQNG\"],\"topics\":[\"vault_created\"]}]",
+    "response": {
+      "latestLedger": 1050,
+      "events": [
+        {
+          "type": "contract",
+          "ledger": 100,
+          "ledgerClosedAt": "2026-10-18T00:00:00Z",
+          "contractId": "CAZBZBUWBSQYK2RZ6WHMXVDLIQHSU5WD7ANZYL6HLNSCRUOTNYCDYQNG",
+          "id": "0000000100-0000000001",
+          "pagingToken": "0000000100-0000000001",
+          "inSuccessfulContractCall": true,
+          "topic": [
+            "AAAAEQAAAA12YXVsdF9jcmVhdGVkAAAA",
+            "AAAAEAAAAAsAAAAAAAAAAA=="
+          ],
+          "value": {
+            "xdr": "AAAAAwAAAA=="
+          }
+        }
+      ]
+    }
+  }
+}

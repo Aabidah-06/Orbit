@@ -52,6 +52,9 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `ORACLE_SYNC_INTERVAL_MS` | Background worker refresh interval for the fiat → USDC rate cache (defaults to 300000 = 5 min) | `300000` |
 | `ORACLE_SLIPPAGE_TOLERANCE_BPS` | Maximum rate movement from a subscription's quoted rate that a fiat pull may settle at (defaults to 200 = 2%) | `200` |
 | `ORACLE_FETCH_TIMEOUT_MS` | Price feed request timeout in milliseconds (defaults to 6000) | `6000` |
+| `SPLIT_RELAYER_SECRET_KEY` | Account that signs on-chain payout-split transfers; falls back to `RELAYER_SECRET_KEY`. Splits stay pending when unset | `S...` |
+| `SPLIT_TOKEN_CONTRACT_ID` | Stellar Asset Contract used for split payouts; falls back to `USDC_CONTRACT_ID` | `C...` |
+| `PRICE_INDEXATION_INTERVAL_MS` | Delay between price indexation worker runs (defaults to 900000 = 15 min) | `900000` |
 
 ### Running the API
 
@@ -82,6 +85,17 @@ The service runs at `http://localhost:3001`.
 | `POST` | `/api-keys` | API key | Create an API key (secret shown once) |
 | `GET` | `/api-keys` | API key | List the merchant's API keys |
 | `DELETE` | `/api-keys/:id` | API key | Revoke an API key |
+| `GET` | `/payout-splits` | API key | List the merchant's payout split rules |
+| `POST` | `/payout-splits` | API key | Create a payout split rule |
+| `PATCH` | `/payout-splits/:id` | API key | Update a payout split rule |
+| `DELETE` | `/payout-splits/:id` | API key | Deactivate a payout split rule |
+| `GET` | `/payout-distributions` | API key | List recorded split distributions |
+| `POST` | `/payout-distributions/reconcile` | API key | Retry pending split forwards |
+| `GET` | `/plans/:id/price-schedules` | API key | List a plan's scheduled price changes |
+| `POST` | `/plans/:id/price-schedules` | API key | Schedule a future plan price change |
+| `DELETE` | `/price-schedules/:id` | API key | Cancel a scheduled price change |
+| `POST` | `/price-schedules/process` | API key | Run the notice/apply pipeline once |
+| `POST` | `/price-reauthorizations/:token/authorize` | Public | Subscriber accepts updated allowance terms |
 
 ---
 
@@ -682,6 +696,9 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
   }
   ```
 
+## Merchant verified analytics (issue #77)
+
+See [ANALYTICS.md](./ANALYTICS.md) for secure wallet login, staging migrations and metric accounting semantics.
 ## Streaming transaction CSV export (#76)
 
 Authenticated merchants can download settled on-chain payments using
@@ -748,3 +765,105 @@ end-to-end promotional billing feature. Don't deploy it as finished billing.
 The public legacy subscription creation route does not itself authenticate a
 wallet; production coupon redemption must be coupled to proof of a confirmed
 vault handshake to prevent malicious consumption of finite coupon inventories.
+
+## Batched pull (`batch_pull_funds`, #92)
+
+The Soroban contract exposes `batch_pull_funds(merchant, subscribers)` so a
+merchant can settle every due subscriber in a single transaction instead of one
+`pull_funds` per vault. A batch is capped at `MAX_BATCH_PULL_SUBSCRIBERS` (50)
+subscribers, and the call returns a `Vec<BatchPullResult>` with one entry per
+subscriber **in the same order as the input**:
+
+| Field | Meaning |
+|---|---|
+| `subscriber` | The vault owner that was attempted. |
+| `success` | `true` if funds were pulled; `false` if the vault was inactive, not due, or already locked. |
+| `amount` | Raw token units pulled (`0` when `success` is `false`). |
+
+A subscriber that fails is skipped without reverting the whole batch. Sibling
+vaults, auth entries and token state are otherwise untouched. The typed client in
+`packages/contract-sdk` exposes this as
+`orbit.batchPullFunds({ merchant, subscribers })`.
+
+## Contract SDK and ABI codegen (#159)
+
+Contract calls used to be assembled by hand as `xdr.ScVal` values in several
+places. `packages/contract-sdk` (`@orbit/contract-sdk`) now owns one typed
+surface, generated from the canonical ABI at
+`apps/backend/abi/orbit_soroban.abi.json`.
+
+```bash
+cd apps/backend
+npm run inspect-contract        # optional: verify ABI against a compiled WASM
+npm run generate:contract-sdk   # rewrite packages/contract-sdk/src/generated
+```
+
+`inspect-contract` uses the `stellar` CLI to compare the ABI with the exported
+WASM functions when a compiled contract is present, and falls back to the
+checked-in ABI with a warning otherwise (so generation works without a Rust
+toolchain). `generate:contract-sdk` emits the typed `OrbitContractClient`, the
+`*Input` interfaces and the ScVal codecs, and mirrors the ABI into the package.
+Commit the regenerated file with any ABI change. See
+[`packages/contract-sdk/README.md`](../../packages/contract-sdk/README.md) for
+usage.
+
+## Merchant payout splits (#160)
+
+Merchants can route a share of each settled pull to other Stellar accounts
+(platform fees, partners, affiliates). Each active split rule claims a
+percentage of the settlement in basis points; the primary merchant keeps
+whatever the splits do not allocate. Rules must use unique recipients and their
+combined basis points may not exceed 100% (10000 bps), and a merchant may have at
+most 20 active rules.
+
+Routes (all API-key authenticated):
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/payout-splits` | List split rules for the merchant. |
+| `POST` | `/payout-splits` | Create a rule (`recipient_wallet`, `percentage_basis_points`, optional `label` and `is_active`). |
+| `PATCH` | `/payout-splits/:id` | Update a rule's `percentage_basis_points`, `label` or `is_active`. |
+| `DELETE` | `/payout-splits/:id` | Deactivate a rule. |
+| `GET` | `/payout-distributions` | List recorded distributions and their forward status. |
+| `POST` | `/payout-distributions/reconcile` | Retry `pending` forwards and settle them against the chain. |
+
+Allocation runs when a pull settles (`applyPullOutcome` SUCCESS path, shared by
+`/submit-pull` and `/relay/submit-pull`). Shares are computed with integer math
+and any rounding remainder is awarded to the largest share, so the distributions
+always sum to the settled amount and no dust is left behind. Each distribution is
+recorded before it is forwarded, so a failed transfer becomes a retryable
+`pending` row rather than a lost payout. On-chain transfers are signed by
+`SPLIT_RELAYER_SECRET_KEY` (or `RELAYER_SECRET_KEY`) using the token in
+`SPLIT_TOKEN_CONTRACT_ID` (or `USDC_CONTRACT_ID`); when neither is configured the
+distributions are still recorded as `pending` for manual reconciliation.
+
+Migration: run `apps/backend/migrations/160-payout-splits.sql` on existing
+databases (also appended to `schema.sql`).
+
+## Recurring plan price indexation (#164)
+
+Scheduled plan price changes let a merchant raise a plan's price and have it
+applied to existing subscribers on a future date, with a configurable advance
+notice. Schedules carry an `effective_date`, an `advance_notice_days` window and
+the new `new_usdc_amount` (optionally `new_price_amount`).
+
+Routes:
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/plans/:id/price-schedules` | API key | List a plan's scheduled changes. |
+| `POST` | `/plans/:id/price-schedules` | API key | Schedule a change. |
+| `DELETE` | `/price-schedules/:id` | API key | Cancel a `scheduled`/`notified` change. |
+| `POST` | `/price-schedules/process` | API key | Run the notice/apply pass once (also useful in tests). |
+| `POST` | `/price-reauthorizations/:token/authorize` | Public | Subscriber accepts the updated allowance terms. |
+
+A background worker (also started from `index.js`, interval
+`PRICE_INDEXATION_INTERVAL_MS`, default 15 min) first notifies every active
+subscriber inside the notice window by minting a one-click re-authorization link
+(`plan_price_reauthorizations`), then applies schedules whose effective date has
+arrived by updating the plan price and emitting a `plan.price_changed` webhook.
+Notices always run before applies, so a change can never take effect without
+having been announced. Applying a schedule is idempotent and audited.
+
+Migration: run `apps/backend/migrations/164-plan-price-indexation.sql` on
+existing databases (also appended to `schema.sql`).
