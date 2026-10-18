@@ -14,6 +14,7 @@ import {
   Clock,
   Sparkles,
 } from "lucide-react";
+import { PriceDisplay } from "@/components/ui/price-display";
 import { PaymentLink } from "../dashboard-types";
 import { CreatePaymentLinkModal } from "../modals/create-payment-link-modal";
 import { PreviewLinkModal } from "../modals/preview-link-modal";
@@ -138,8 +139,7 @@ export function PaymentLinksView({ businessName }: PaymentLinksViewProps) {
             Collected Volume
           </div>
           <div className="text-2xl font-bold text-emerald-600 mt-1">
-            {totalCollected.toLocaleString("en-US", { minimumFractionDigits: 2 })}{" "}
-            <span className="text-xs font-mono font-bold text-neutral-500">USDC</span>
+            <PriceDisplay amount={totalCollected} />
           </div>
           <div className="text-xs text-neutral-500 mt-0.5">
             100% direct to your treasury
