@@ -55,7 +55,7 @@ export function DashboardShell() {
   const t = useTranslations("Dashboard");
   const tc = useTranslations("Common");
   const router = useRouter();
-  const { user, signOut, updateVault, updateBusinessName } = useAuth();
+  const { user, signOut, updateVault, updateBusinessName, walletNetworkWarning, disconnectWallet } = useAuth();
   const { unreadCount, toggleDrawer } = useNotifications();
   const { currency, setCurrency, error: fiatError } = useFiatRates();
   const [activeTab, setActiveTab] = useState<DashboardTab>("overview");
@@ -308,6 +308,7 @@ export function DashboardShell() {
             </div>
           </button>
 
+          {user.walletAddress && <button type="button" onClick={disconnectWallet} className="w-full rounded border border-black/10 px-3 py-2 text-left text-xs text-neutral-700 hover:bg-neutral-100 focus-visible:outline-2" aria-label="Disconnect Freighter wallet">Disconnect wallet</button>}
           {/* User Sign Out */}
           <div className="flex items-center justify-between pt-1 text-xs text-neutral-500">
             <span className="truncate max-w-[140px] font-semibold text-black" title={user.businessName}>
@@ -399,6 +400,7 @@ export function DashboardShell() {
           </div>
         </header>
 
+        {walletNetworkWarning && <div role="alert" className="mx-6 mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">{walletNetworkWarning}</div>}
         {fiatError && <p role="status" className="px-6 pt-2 text-xs text-amber-800">Fiat exchange rates may be temporarily unavailable; USDC amounts remain authoritative.</p>}
         {/* Tab Content */}
         <main className="flex-1 p-6 md:p-8 overflow-y-auto max-w-6xl w-full mx-auto">
