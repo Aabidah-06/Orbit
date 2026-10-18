@@ -66,6 +66,7 @@ const {
 const { getDatabaseManager } = require('./db');
 const { registerPrivacyRoutes } = require('./privacy');
 const { registerProofRoutes } = require('./proofs');
+const { registerOrganizationRoutes } = require('./organizations');
 const { registerRpcProxyRoute } = require('./rpc-proxy');
 const { registerHealthMetrics } = require('./health-metrics');
 const { captureStripeRawBody, registerStripeBillingRoutes } = require('./stripe-billing');
@@ -1952,6 +1953,7 @@ app.post('/webhooks/:id/backfill', async (req, res) => {
 });
 
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
+registerOrganizationRoutes(app, getSupabase, authenticateMerchant);
 registerInvoiceRoutes(app, getSupabase, authenticateMerchant);
 registerRpcProxyRoute(app);
 registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
