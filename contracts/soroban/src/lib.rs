@@ -337,6 +337,31 @@ pub enum FeatureKey {
     RecoveryRequest(Address, Address),
     Elasticity(Address, Address),
     GasSubsidy(Address),
+    YieldStrategy,
+}
+
+// ----------------------------------------------------------------------------
+// YIELD-BEARING COLLATERAL STRATEGY (#176)
+// ----------------------------------------------------------------------------
+
+/// Configuration for the yield strategy adapter. Stores the approved lending
+/// pool where idle escrow balances are deployed to generate passive yield.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldStrategyConfig {
+    pub yield_pool: Option<Address>,
+    pub token: Address,
+    pub liquidity_buffer: i128,
+    pub total_deployed: i128,
+}
+
+/// A trusted Soroban lending market (e.g., Blend Protocol) that accepts token
+/// deposits, accrues interest, and allows atomic redemption of principal + yield.
+#[contractclient(name = "LendingPoolClient")]
+pub trait LendingPool {
+    fn supply(env: Env, token: Address, amount: i128, from: Address);
+    fn withdraw(env: Env, token: Address, amount: i128, to: Address) -> i128;
+    fn balance_of(env: Env, token: Address, account: Address) -> i128;
 }
 
 // ----------------------------------------------------------------------------
@@ -3104,6 +3129,163 @@ impl OrbitContract {
             DEFAULT_GRACE_PERIOD_SECONDS,
             0,
         );
+    }
+
+    // --------------------------------------------------------------------
+    // YIELD-BEARING COLLATERAL STRATEGY (#176)
+    // --------------------------------------------------------------------
+
+    /// Configure an automated yield strategy for idle contract escrow. When
+    /// escrow balances exceed the `liquidity_buffer`, excess tokens are
+    /// automatically deployed to the approved lending pool to generate yield.
+    pub fn configure_yield_strategy(
+        env: Env,
+        admin: Address,
+        yield_pool: Address,
+        token: Address,
+        liquidity_buffer: i128,
+    ) {
+        admin.require_auth();
+        assert!(liquidity_buffer >= 0, "Liquidity buffer must be non-negative");
+
+        let key = FeatureKey::YieldStrategy;
+        let config = YieldStrategyConfig {
+            yield_pool: Some(yield_pool.clone()),
+            token: token.clone(),
+            liquidity_buffer,
+            total_deployed: 0,
+        };
+        env.storage().persistent().set(&key, &config);
+        extend_feature_key(&env, &key, MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER);
+
+        env.events().publish(
+            (Symbol::new(&env, "yield_strategy_configured"), admin),
+            (yield_pool, token, liquidity_buffer),
+        );
+    }
+
+    /// Deploy excess idle capital to the configured yield market. This checks
+    /// the contract's token balance against the liquidity buffer and supplies
+    /// the surplus to the lending pool to earn passive interest.
+    pub fn deploy_idle_capital(env: Env, token: Address) {
+        let key = FeatureKey::YieldStrategy;
+        let mut config: YieldStrategyConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Yield strategy not configured");
+        assert!(config.token == token, "Wrong token for yield strategy");
+
+        let pool_address = config
+            .yield_pool
+            .as_ref()
+            .expect("No yield pool configured");
+        let contract_addr = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        let current_balance = token_client.balance(&contract_addr);
+
+        let deployable = current_balance
+            .checked_sub(config.liquidity_buffer)
+            .unwrap_or(0);
+        assert!(deployable > 0, "No excess capital to deploy");
+
+        // Supply tokens to the lending pool
+        let pool_client = LendingPoolClient::new(&env, pool_address);
+        pool_client.supply(&token, &deployable, &contract_addr);
+
+        config.total_deployed = config
+            .total_deployed
+            .checked_add(deployable)
+            .expect("Total deployed overflow");
+        env.storage().persistent().set(&key, &config);
+        extend_feature_key(&env, &key, MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER);
+
+        env.events().publish(
+            (Symbol::new(&env, "capital_deployed"), token),
+            (deployable, config.total_deployed),
+        );
+    }
+
+    /// Redeem principal plus accrued interest from the yield market. This is
+    /// called when merchants withdraw funds or escrow is released, ensuring
+    /// available liquidity while capturing the earned yield.
+    pub fn redeem_yield_principal(env: Env, token: Address, amount: i128) {
+        assert!(amount > 0, "Redemption amount must be positive");
+
+        let key = FeatureKey::YieldStrategy;
+        let mut config: YieldStrategyConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Yield strategy not configured");
+        assert!(config.token == token, "Wrong token for yield strategy");
+
+        let pool_address = config
+            .yield_pool
+            .as_ref()
+            .expect("No yield pool configured");
+        let contract_addr = env.current_contract_address();
+
+        // Withdraw from the lending pool (principal + interest)
+        let pool_client = LendingPoolClient::new(&env, pool_address);
+        let redeemed = pool_client.withdraw(&token, &amount, &contract_addr);
+        assert!(redeemed >= amount, "Insufficient yield pool liquidity");
+
+        config.total_deployed = config
+            .total_deployed
+            .checked_sub(amount.min(config.total_deployed))
+            .unwrap_or(0);
+        env.storage().persistent().set(&key, &config);
+        extend_feature_key(&env, &key, MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER);
+
+        let yield_earned = redeemed.saturating_sub(amount);
+        env.events().publish(
+            (Symbol::new(&env, "principal_redeemed"), token),
+            (amount, redeemed, yield_earned),
+        );
+    }
+
+    /// Emergency unwind: immediately withdraw all deployed funds from the yield
+    /// market back to the base contract. This is admin-guarded and used when
+    /// market utilization spikes or safety concerns require immediate liquidity.
+    pub fn emergency_unwind_yield(env: Env, admin: Address) {
+        admin.require_auth();
+
+        let key = FeatureKey::YieldStrategy;
+        let mut config: YieldStrategyConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Yield strategy not configured");
+
+        let pool_address = config
+            .yield_pool
+            .as_ref()
+            .expect("No yield pool configured");
+        let contract_addr = env.current_contract_address();
+        let pool_client = LendingPoolClient::new(&env, &config.token);
+
+        // Query the contract's balance in the lending pool
+        let pool_balance = pool_client.balance_of(&config.token, &contract_addr);
+        if pool_balance > 0 {
+            let pool = LendingPoolClient::new(&env, pool_address);
+            let recovered = pool.withdraw(&config.token, &pool_balance, &contract_addr);
+
+            config.total_deployed = 0;
+            env.storage().persistent().set(&key, &config);
+
+            env.events().publish(
+                (Symbol::new(&env, "emergency_yield_unwind"), admin),
+                (config.token, recovered),
+            );
+        }
+    }
+
+    /// Read the current yield strategy configuration. No authorization required.
+    pub fn get_yield_strategy(env: Env) -> Option<YieldStrategyConfig> {
+        env.storage()
+            .persistent()
+            .get(&FeatureKey::YieldStrategy)
     }
 }
 

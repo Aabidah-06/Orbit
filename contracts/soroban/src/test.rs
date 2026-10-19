@@ -3859,3 +3859,166 @@ fn test_merkle_payroll_requires_sender_auth() {
         .try_create_merkle_payroll(&sender, &token, &root, &1_0000000, &3_600)
         .is_err());
 }
+
+// ----------------------------------------------------------------------------
+// YIELD-BEARING COLLATERAL STRATEGY TESTS (#176)
+// ----------------------------------------------------------------------------
+
+// Mock lending pool contract for testing
+#[contract]
+pub struct MockLendingPool;
+
+#[contractimpl]
+impl MockLendingPool {
+    pub fn supply(_env: Env, _token: Address, _amount: i128, _from: Address) {
+        // Mock supply - funds are tracked by the contract itself
+    }
+
+    pub fn withdraw(_env: Env, _token: Address, amount: i128, _to: Address) -> i128 {
+        // Mock withdraw - return slightly more than requested (simulating yield)
+        amount + (amount / 100) // 1% yield
+    }
+
+    pub fn balance_of(_env: Env, _token: Address, _account: Address) -> i128 {
+        1000_0000000 // Mock balance
+    }
+}
+
+#[test]
+fn test_configure_yield_strategy() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    let pool_id = env.register(MockLendingPool, ());
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    orbit_client.configure_yield_strategy(
+        &admin,
+        &pool_id,
+        &token_address,
+        &10_0000000, // 10 token liquidity buffer
+    );
+
+    let config = orbit_client.get_yield_strategy();
+    assert!(config.is_some());
+    let config = config.unwrap();
+    assert_eq!(config.token, token_address);
+    assert_eq!(config.liquidity_buffer, 10_0000000);
+    assert_eq!(config.total_deployed, 0);
+}
+
+#[test]
+fn test_deploy_idle_capital() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = TokenClient::new(&env, &token_address);
+    let token_admin_client = StellarAssetClient::new(&env, &token_address);
+
+    let pool_id = env.register(MockLendingPool, ());
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    // Configure yield strategy with 10 token buffer
+    orbit_client.configure_yield_strategy(&admin, &pool_id, &token_address, &10_0000000);
+
+    // Mint 50 tokens to the contract (simulating escrow deposits)
+    token_admin_client.mint(&contract_id, &50_0000000);
+
+    // Deploy excess capital (50 - 10 = 40 should be deployed)
+    orbit_client.deploy_idle_capital(&token_address);
+
+    let config = orbit_client.get_yield_strategy().unwrap();
+    assert_eq!(config.total_deployed, 40_0000000);
+}
+
+#[test]
+fn test_redeem_yield_principal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = StellarAssetClient::new(&env, &token_address);
+
+    let pool_id = env.register(MockLendingPool, ());
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    orbit_client.configure_yield_strategy(&admin, &pool_id, &token_address, &10_0000000);
+    token_admin_client.mint(&contract_id, &50_0000000);
+    orbit_client.deploy_idle_capital(&token_address);
+
+    // Redeem 20 tokens (will get 20 + 1% = 20.2 due to mock yield)
+    orbit_client.redeem_yield_principal(&token_address, &20_0000000);
+
+    let config = orbit_client.get_yield_strategy().unwrap();
+    assert_eq!(config.total_deployed, 20_0000000); // 40 - 20 = 20 remaining deployed
+}
+
+#[test]
+fn test_emergency_unwind_yield() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = StellarAssetClient::new(&env, &token_address);
+
+    let pool_id = env.register(MockLendingPool, ());
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    orbit_client.configure_yield_strategy(&admin, &pool_id, &token_address, &10_0000000);
+    token_admin_client.mint(&contract_id, &50_0000000);
+    orbit_client.deploy_idle_capital(&token_address);
+
+    // Emergency unwind all funds
+    orbit_client.emergency_unwind_yield(&admin);
+
+    let config = orbit_client.get_yield_strategy().unwrap();
+    assert_eq!(config.total_deployed, 0);
+}
+
+#[test]
+#[should_panic(expected = "No excess capital to deploy")]
+fn test_deploy_fails_when_no_excess() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = StellarAssetClient::new(&env, &token_address);
+
+    let pool_id = env.register(MockLendingPool, ());
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+
+    orbit_client.configure_yield_strategy(&admin, &pool_id, &token_address, &50_0000000);
+    // Mint exactly the buffer amount - no excess to deploy
+    token_admin_client.mint(&contract_id, &50_0000000);
+
+    orbit_client.deploy_idle_capital(&token_address);
+}
